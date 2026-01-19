@@ -193,8 +193,8 @@ def split_counts(total: int, p_train: float, p_val: float, p_test: float) -> Tup
     return train, val, test
 
 
-def write_dataset_yaml(out_dir: Path, class_names: List[str]):
-    # Ultralytics dataset YAML
+def write_data_yaml(out_dir: Path, class_names: List[str]):
+    # Ultralytics data YAML
     # Use relative paths from yaml file location
     yaml_text = (
         f"path: {out_dir.as_posix()}\n"
@@ -206,7 +206,7 @@ def write_dataset_yaml(out_dir: Path, class_names: List[str]):
     for i, n in enumerate(class_names):
         yaml_text += f"  {i}: {n}\n"
 
-    (out_dir / "dataset.yaml").write_text(yaml_text, encoding="utf-8")
+    (out_dir / "data.yaml").write_text(yaml_text, encoding="utf-8")
 
 
 class App(tk.Tk):
@@ -443,7 +443,7 @@ class App(tk.Tk):
             else:
                 # keep existing class ids: unknown names
                 class_names = ["class0"]
-                self.log("類別模式：保留原 txt class_id（dataset.yaml 會先給 placeholder class0；你可自行修改）。")
+                self.log("類別模式：保留原 txt class_id（data.yaml 會先給 placeholder class0；你可自行修改）。")
 
             # Shuffle
             idxs = list(range(len(samples)))
@@ -526,17 +526,17 @@ class App(tk.Tk):
 
                 self.prog["value"] = i
 
-            # dataset.yaml
+            # data.yaml
             if class_mode == "folder":
-                write_dataset_yaml(out_dir, class_names)
-                self.log("已產生 dataset.yaml（類別=最上層資料夾）。")
+                write_data_yaml(out_dir, class_names)
+                self.log("已產生 data.yaml（類別=最上層資料夾）。")
             else:
                 # Placeholder; user can edit later
-                write_dataset_yaml(out_dir, class_names)
-                self.log("已產生 dataset.yaml（placeholder）。若你保留原 class_id，請自行改 names 對應。")
+                write_data_yaml(out_dir, class_names)
+                self.log("已產生 data.yaml（placeholder）。若你保留原 class_id，請自行改 names 對應。")
 
             self.log(f"完成：成功 {ok_cnt}，略過/失敗 {skip_cnt}")
-            self.log(f"請使用這個 YAML：{out_dir / 'dataset.yaml'}")
+            self.log(f"請使用這個 YAML：{out_dir / 'data.yaml'}")
 
         except Exception as e:
             self.log(f"[錯誤] {e}")
