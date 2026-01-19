@@ -136,3 +136,72 @@ def remove_dir_safe(p: Path, log_cb) -> None:
             log_cb(f"已刪除暫存資料夾：{p}\n")
     except Exception as e:
         log_cb(f"刪除暫存資料夾失敗：{e}\n")
+
+
+# --- add to dataset_prep.py (bottom) ---
+
+def rewrite_data_yaml_to_extracted_root(
+        orig_yaml: Path,
+        extracted_root: Path,
+        log_cb
+) -> Path:
+    """
+    Create a patched data.yaml under extracted_root/_patched/data.yaml
+    so that Ultralytics will read images from the extracted dataset, not the original absolute paths.
+
+    Strategy:
+    - Load yaml
+    - If it has 'path': set to extracted_root
+    - For 'train'/'val'/'test':
+        - If absolute and contains 'images\\train' style, convert to relative 'images/train'
+        - Else if absolute but doesn't contain images folder, try best-effort mapping by taking last parts
+        - If already relative, keep
+    """
+    data = load_data_yaml(orig_yaml)
+
+    patched_dir = extracted_root / "_patched"
+    safe_mkdir(patched_dir)
+    patched_yaml = patched_dir / "data.yaml"
+
+    def to_posix_rel(p: str) -> str:
+        return p.replace("\\", "/").lstrip("./")
+
+    def best_rel_from_abs(abs_path: str) -> str:
+        s = abs_path.replace("\\", "/")
+        # Common patterns:
+        # .../images/train  or .../images/val  or .../labels/train
+        for key in ["/images/train", "/images/val", "/images/test",
+                    "/images/Train", "/images/Val", "/images/Test",
+                    "/labels/train", "/labels/val", "/labels/test"]:
+            idx = s.lower().find(key.lower())
+            if idx != -1:
+                return to_posix_rel(s[idx + 1:])  # remove leading '/'
+        # If no known marker, just take last 2 segments as a weak fallback
+        parts = [x for x in s.split("/") if x]
+        if len(parts) >= 2:
+            return to_posix_rel("/".join(parts[-2:]))
+        return to_posix_rel(parts[-1]) if parts else "images/train"
+
+    # 1) force path to extracted_root (Ultralytics uses path as base)
+    data["path"] = str(extracted_root)
+
+    # 2) rewrite splits
+    for split in ("train", "val", "test"):
+        if split not in data:
+            continue
+        v = str(data[split])
+        pv = Path(v)
+        if pv.is_absolute():
+            rel = best_rel_from_abs(v)
+            data[split] = rel
+            log_cb(f"  - rewrite {split}: ABS -> REL  {v}  =>  {rel}\n")
+        else:
+            # keep relative, but normalize slashes
+            data[split] = to_posix_rel(v)
+            log_cb(f"  - normalize {split}: {v} => {data[split]}\n")
+
+    # 3) save
+    patched_yaml.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    log_cb(f"[patched] data.yaml => {patched_yaml}\n")
+    return patched_yaml
+

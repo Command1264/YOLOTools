@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional, Tuple
 
 from dataset_prep import (
     extract_zip, find_data_yaml, filter_unlabeled_yolo_dataset,
-    zip_folder, remove_dir_safe
+    zip_folder, remove_dir_safe, rewrite_data_yaml_to_extracted_root
 )
 
 def now_str() -> str:
@@ -126,7 +126,15 @@ class TrainerWorker(threading.Thread):
             data_yaml = find_data_yaml(extracted_root)
             if not data_yaml:
                 raise RuntimeError(f"找不到 data.yaml：{extracted_root}")
-            self.log(f"[{now_str()}] data.yaml：{data_yaml}\n")
+            self.log(f"[{now_str()}] 找到原始 data.yaml：{data_yaml}\n")
+
+            # ✅ NEW: rewrite yaml so it points to extracted_root
+            self.status("修正 data.yaml 路徑（指向解壓資料夾） ...")
+            patched_yaml = rewrite_data_yaml_to_extracted_root(data_yaml, extracted_root, self.log)
+            self.log(f"[{now_str()}] 使用 patched data.yaml：{patched_yaml}\n")
+
+            # 後面訓練要用 patched_yaml
+            data_yaml = patched_yaml
 
             # 3) optional filter unlabeled
             if cfg.skip_unlabeled and cfg.task in ("detect", "segment", "pose", "obb"):
