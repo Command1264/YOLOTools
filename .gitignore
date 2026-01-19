@@ -1,0 +1,12 @@
+# IntelliJ project files
+.idea
+*.iml
+out
+gen
+
+build
+dist
+install
+models
+TaichungFireYoloEnv
+tainingData
