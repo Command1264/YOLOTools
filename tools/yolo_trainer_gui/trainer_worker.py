@@ -106,6 +106,9 @@ class TrainerWorker(threading.Thread):
         self._batch_cur = 0
         self._train_start_time = 0.0
         self._epoch_start_time = 0.0
+        self._epoch_durations = []
+        self._batch_durations = []
+        self._last_batch_end_time = 0.0
         self._run_dir_hint: Optional[Path] = None
 
     # --------- UI messages ----------
@@ -121,11 +124,11 @@ class TrainerWorker(threading.Thread):
     def progress_batch(self, cur: int, total: int):
         self.q.put(("progress_batch", cur, total))
 
-    def progress_epoch_eta(self, cur: int, total: int, eta: str):
-        self.q.put(("progress_epoch", cur, total, eta))
+    def progress_epoch_eta(self, cur: int, total: int, eta_seconds: Optional[float]):
+        self.q.put(("progress_epoch", cur, total, eta_seconds))
 
-    def progress_batch_eta(self, cur: int, total: int, eta: str):
-        self.q.put(("progress_batch", cur, total, eta))
+    def progress_batch_eta(self, cur: int, total: int, eta_seconds: Optional[float]):
+        self.q.put(("progress_batch", cur, total, eta_seconds))
 
     def done(self, ok: bool, payload: Dict[str, Any]):
         self.q.put(("done", ok, payload))
@@ -139,41 +142,11 @@ class TrainerWorker(threading.Thread):
     def report_device(self, s: str):
         self.q.put(("device", s))
 
-    def _format_eta(self, seconds: Optional[float]) -> str:
-        if seconds is None:
-            return ""
-        sec = max(0, int(seconds))
-        if sec == 0:
-            return "0s"
-        mins, s = divmod(sec, 60)
-        hrs, m = divmod(mins, 60)
-        days, h = divmod(hrs, 24)
-        months, d = divmod(days, 30)
-        years, mo = divmod(months, 12)
-        parts = []
-        if years:
-            parts.append(f"{years}y")
-        if mo:
-            parts.append(f"{mo}mo")
-        if d:
-            parts.append(f"{d}d")
-        if h:
-            parts.append(f"{h}h")
-        if m:
-            parts.append(f"{m}m")
-        if s or not parts:
-            parts.append(f"{s}s")
-        return " ".join(parts)
-
-    def _estimate_eta(self, start_time: float, cur: int, total: int) -> str:
-        if cur <= 0 or total <= 0 or start_time <= 0:
-            return ""
-        elapsed = time.time() - start_time
-        if elapsed <= 0:
-            return ""
-        rate = elapsed / max(cur, 1)
-        remaining = rate * max(total - cur, 0)
-        return self._format_eta(remaining)
+    def _estimate_eta(self, avg_unit_sec: Optional[float], cur: int, total: int) -> Optional[float]:
+        if avg_unit_sec is None or cur < 0 or total <= 0:
+            return None
+        remaining = max(total - cur, 0)
+        return max(0.0, avg_unit_sec * remaining)
 
     # --------- worker ----------
     def run(self):
@@ -246,6 +219,9 @@ class TrainerWorker(threading.Thread):
             def on_train_start(trainer):
                 self._train_start_time = time.time()
                 self._epoch_start_time = self._train_start_time
+                self._epoch_durations = []
+                self._batch_durations = []
+                self._last_batch_end_time = 0.0
                 try:
                     self._run_dir_hint = Path(getattr(trainer, "save_dir", "")) if getattr(trainer, "save_dir", None) else None
                 except Exception:
@@ -263,7 +239,7 @@ class TrainerWorker(threading.Thread):
                 if dev:
                     self.report_device(dev)
                 self._epoch_cur = 0
-                self.progress_epoch_eta(0, self._epoch_total, self._estimate_eta(self._train_start_time, 0, self._epoch_total))
+                self.progress_epoch_eta(0, self._epoch_total, None)
 
             def on_train_epoch_start(trainer):
                 stop_if_needed(trainer)
@@ -274,17 +250,26 @@ class TrainerWorker(threading.Thread):
                     self._batch_total = 0
                 self._batch_cur = 0
                 self._epoch_start_time = time.time()
+                self._batch_durations = []
+                self._last_batch_end_time = 0.0
                 if self._batch_total > 0:
-                    self.progress_batch_eta(0, self._batch_total, self._estimate_eta(self._epoch_start_time, 0, self._batch_total))
+                    self.progress_batch_eta(0, self._batch_total, None)
 
             def on_train_batch_end(trainer):
                 stop_if_needed(trainer)
                 if self._batch_total > 0:
+                    now = time.time()
+                    if self._last_batch_end_time > 0:
+                        self._batch_durations.append(now - self._last_batch_end_time)
+                        if len(self._batch_durations) > 50:
+                            self._batch_durations = self._batch_durations[-50:]
+                    self._last_batch_end_time = now
                     self._batch_cur += 1
+                    avg_batch = (sum(self._batch_durations) / len(self._batch_durations)) if self._batch_durations else None
                     self.progress_batch_eta(
                         self._batch_cur,
                         self._batch_total,
-                        self._estimate_eta(self._epoch_start_time, self._batch_cur, self._batch_total),
+                        self._estimate_eta(avg_batch, self._batch_cur, self._batch_total),
                     )
 
             def on_train_epoch_end(trainer):
@@ -292,7 +277,13 @@ class TrainerWorker(threading.Thread):
                 # trainer.epoch is 0-based
                 ep = int(getattr(trainer, "epoch", 0)) + 1
                 self._epoch_cur = ep
-                self.progress_epoch_eta(ep, self._epoch_total, self._estimate_eta(self._train_start_time, ep, self._epoch_total))
+                epoch_duration = max(0.0, time.time() - self._epoch_start_time)
+                if epoch_duration > 0:
+                    self._epoch_durations.append(epoch_duration)
+                    if len(self._epoch_durations) > 5:
+                        self._epoch_durations = self._epoch_durations[-5:]
+                avg_epoch = (sum(self._epoch_durations) / len(self._epoch_durations)) if self._epoch_durations else None
+                self.progress_epoch_eta(ep, self._epoch_total, self._estimate_eta(avg_epoch, ep, self._epoch_total))
                 try:
                     run_dir = Path(getattr(trainer, "save_dir", ""))
                     prev_row = read_prev_epoch_row(run_dir) if run_dir else None
@@ -301,7 +292,7 @@ class TrainerWorker(threading.Thread):
                     pass
 
             def on_train_end(trainer):
-                self.progress_epoch_eta(self._epoch_total, self._epoch_total, "0s")
+                self.progress_epoch_eta(self._epoch_total, self._epoch_total, 0.0)
 
             # attach callbacks (best-effort)
             try:
