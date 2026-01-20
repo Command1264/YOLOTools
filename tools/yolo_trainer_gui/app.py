@@ -70,6 +70,10 @@ class App(tk.Tk):
 
         self.msg_q = queue.Queue()
         self.worker: Optional[TrainerWorker] = None
+        self._pending_msgs = []
+        self._flush_after_id = None
+        self._is_resizing = False
+        self._resize_after_id = None
 
         # remember last paths for dialog rule
         self.last_dataset_zip = ""
@@ -79,6 +83,7 @@ class App(tk.Tk):
         self.last_model_dir = ""
 
         self._build_ui()
+        self.bind("<Configure>", self._on_resize)
 
         # load model list (try online first)
         self._load_weights(try_online=True)
@@ -516,24 +521,55 @@ class App(tk.Tk):
         try:
             while True:
                 msg = self.msg_q.get_nowait()
-                kind = msg[0]
-                if kind == "log":
-                    self._log(msg[1])
-                elif kind == "status":
-                    self.var_status.set(msg[1])
-                elif kind == "progress_epoch":
-                    self._set_epoch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else "")
-                elif kind == "progress_batch":
-                    self._set_batch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else "")
-                elif kind == "device":
-                    self.var_run_device.set(f"裝置：{msg[1]}")
-                elif kind == "prev_epoch_metrics":
-                    self.var_prev_epoch_metrics.set(f"上一輪指標： {self._format_prev_row(msg[1])}")
-                elif kind == "done":
-                    self._on_done(msg[1], msg[2])
+                self._pending_msgs.append(msg)
         except queue.Empty:
             pass
+        if not self._is_resizing:
+            self._flush_pending_msgs()
         self.after(120, self._poll_queue)
+
+    def _flush_pending_msgs(self):
+        if self._flush_after_id is not None:
+            try:
+                self.after_cancel(self._flush_after_id)
+            except Exception:
+                pass
+            self._flush_after_id = None
+
+        while self._pending_msgs:
+            msg = self._pending_msgs.pop(0)
+            kind = msg[0]
+            if kind == "log":
+                self._log(msg[1])
+            elif kind == "status":
+                self.var_status.set(msg[1])
+            elif kind == "progress_epoch":
+                self._set_epoch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else "")
+            elif kind == "progress_batch":
+                self._set_batch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else "")
+            elif kind == "device":
+                self.var_run_device.set(f"裝置：{msg[1]}")
+            elif kind == "prev_epoch_metrics":
+                self.var_prev_epoch_metrics.set(f"上一輪指標：{self._format_prev_row(msg[1])}")
+            elif kind == "done":
+                self._on_done(msg[1], msg[2])
+
+    def _on_resize(self, event):
+        if event.widget is not self:
+            return
+        self._is_resizing = True
+        if self._resize_after_id is not None:
+            try:
+                self.after_cancel(self._resize_after_id)
+            except Exception:
+                pass
+        self._resize_after_id = self.after(50, self._end_resize)
+
+    def _end_resize(self):
+        self._is_resizing = False
+        self._resize_after_id = None
+        if self._pending_msgs:
+            self._flush_after_id = self.after(50, self._flush_pending_msgs)
 
     def _on_done(self, ok: bool, payload: Dict[str, Any]):
         self.btn_start.config(state="normal")
