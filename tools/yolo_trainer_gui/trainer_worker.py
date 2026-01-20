@@ -13,10 +13,13 @@ from dataset_prep import (
     zip_folder, remove_dir_safe, rewrite_data_yaml_to_extracted_root
 )
 
+class ForceStop(Exception):
+    pass
+
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def parse_results_csv(run_dir: Path) -> Dict[str, Optional[float]]:
+def parse_results_csv(run_dir: Path) -> Dict[str, Any]:
     """
     Try to parse last-row metrics from results.csv (Ultralytics standard output).
     """
@@ -32,6 +35,7 @@ def parse_results_csv(run_dir: Path) -> Dict[str, Optional[float]]:
         return {}
 
     last = rows[-1]
+    prev = rows[-2] if len(rows) > 1 else None
 
     def get_float(keys):
         for k in keys:
@@ -51,7 +55,23 @@ def parse_results_csv(run_dir: Path) -> Dict[str, Optional[float]]:
     if p is not None and r is not None and (p + r) > 0:
         f1 = 2 * p * r / (p + r)
 
-    return {"precision": p, "recall": r, "f1": f1, "mAP50": map50, "mAP50-95": map5095}
+    return {
+        "metrics": {"precision": p, "recall": r, "f1": f1, "mAP50": map50, "mAP50-95": map5095},
+        "last_row": last,
+        "prev_row": prev,
+    }
+
+def read_prev_epoch_row(run_dir: Path) -> Optional[Dict[str, Any]]:
+    csv_path = run_dir / "results.csv"
+    if not csv_path.exists():
+        return None
+    import csv
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    if len(rows) < 2:
+        return None
+    return rows[-2]
 
 
 @dataclass
@@ -60,6 +80,7 @@ class TrainConfig:
     dataset_zip: str
     work_dir: str
     model: str             # yolov8n.pt or custom path
+    model_dir: str         # where to store/download weights
     epochs: int
     imgsz: int
     batch: int
@@ -76,12 +97,16 @@ class TrainerWorker(threading.Thread):
         self.cfg = cfg
         self.q = msg_q
         self.stop_requested = False
+        self.force_stop_requested = False
 
         # internal progress
         self._epoch_total = max(1, int(cfg.epochs))
         self._epoch_cur = 0
         self._batch_total = 0
         self._batch_cur = 0
+        self._train_start_time = 0.0
+        self._epoch_start_time = 0.0
+        self._run_dir_hint: Optional[Path] = None
 
     # --------- UI messages ----------
     def log(self, s: str):
@@ -96,11 +121,59 @@ class TrainerWorker(threading.Thread):
     def progress_batch(self, cur: int, total: int):
         self.q.put(("progress_batch", cur, total))
 
+    def progress_epoch_eta(self, cur: int, total: int, eta: str):
+        self.q.put(("progress_epoch", cur, total, eta))
+
+    def progress_batch_eta(self, cur: int, total: int, eta: str):
+        self.q.put(("progress_batch", cur, total, eta))
+
     def done(self, ok: bool, payload: Dict[str, Any]):
         self.q.put(("done", ok, payload))
 
     def request_stop(self):
         self.stop_requested = True
+
+    def request_force_stop(self):
+        self.force_stop_requested = True
+
+    def report_device(self, s: str):
+        self.q.put(("device", s))
+
+    def _format_eta(self, seconds: Optional[float]) -> str:
+        if seconds is None:
+            return ""
+        sec = max(0, int(seconds))
+        if sec == 0:
+            return "0s"
+        mins, s = divmod(sec, 60)
+        hrs, m = divmod(mins, 60)
+        days, h = divmod(hrs, 24)
+        months, d = divmod(days, 30)
+        years, mo = divmod(months, 12)
+        parts = []
+        if years:
+            parts.append(f"{years}y")
+        if mo:
+            parts.append(f"{mo}mo")
+        if d:
+            parts.append(f"{d}d")
+        if h:
+            parts.append(f"{h}h")
+        if m:
+            parts.append(f"{m}m")
+        if s or not parts:
+            parts.append(f"{s}s")
+        return " ".join(parts)
+
+    def _estimate_eta(self, start_time: float, cur: int, total: int) -> str:
+        if cur <= 0 or total <= 0 or start_time <= 0:
+            return ""
+        elapsed = time.time() - start_time
+        if elapsed <= 0:
+            return ""
+        rate = elapsed / max(cur, 1)
+        remaining = rate * max(total - cur, 0)
+        return self._format_eta(remaining)
 
     # --------- worker ----------
     def run(self):
@@ -110,11 +183,18 @@ class TrainerWorker(threading.Thread):
         try:
             from ultralytics import YOLO
 
+            extracted_root = None
+            data_yaml = None
+            run_dir = None
+
             dataset_zip = Path(cfg.dataset_zip).expanduser().resolve()
             work_dir = Path(cfg.work_dir).expanduser().resolve()
             out_zip_dir = Path(cfg.out_zip_dir).expanduser().resolve()
+            model_dir = Path(cfg.model_dir).expanduser().resolve() if cfg.model_dir else None
             work_dir.mkdir(parents=True, exist_ok=True)
             out_zip_dir.mkdir(parents=True, exist_ok=True)
+            if model_dir:
+                model_dir.mkdir(parents=True, exist_ok=True)
 
             # 1) extract
             self.status("解壓縮資料集 ...")
@@ -145,19 +225,45 @@ class TrainerWorker(threading.Thread):
 
             # 4) load model
             self.status("載入模型 ...")
-            model = YOLO(cfg.model)
-            self.log(f"[{now_str()}] 模型：{cfg.model}\n")
+            model_path = cfg.model
+            try:
+                if model_dir and not Path(cfg.model).expanduser().exists():
+                    model_path = str(model_dir / Path(cfg.model).name)
+            except Exception:
+                pass
+            model = YOLO(model_path)
+            self.log(f"[{now_str()}] 模型：{model_path}\n")
 
             # 5) callbacks
             # NOTE: callback events list can be seen via get_default_callbacks() in docs. :contentReference[oaicite:6]{index=6}
             def stop_if_needed(trainer):
                 # BaseTrainer has `stop` flag concept. We'll set it to stop. :contentReference[oaicite:7]{index=7}
+                if self.force_stop_requested:
+                    raise ForceStop("強制停止")
                 if self.stop_requested:
                     setattr(trainer, "stop", True)
 
             def on_train_start(trainer):
+                self._train_start_time = time.time()
+                self._epoch_start_time = self._train_start_time
+                try:
+                    self._run_dir_hint = Path(getattr(trainer, "save_dir", "")) if getattr(trainer, "save_dir", None) else None
+                except Exception:
+                    self._run_dir_hint = None
+                dev = None
+                try:
+                    dev = str(getattr(trainer, "device", "")) or None
+                except Exception:
+                    dev = None
+                if not dev:
+                    try:
+                        dev = str(getattr(trainer, "args", None).device)
+                    except Exception:
+                        dev = None
+                if dev:
+                    self.report_device(dev)
                 self._epoch_cur = 0
-                self.progress_epoch(0, self._epoch_total)
+                self.progress_epoch_eta(0, self._epoch_total, self._estimate_eta(self._train_start_time, 0, self._epoch_total))
 
             def on_train_epoch_start(trainer):
                 stop_if_needed(trainer)
@@ -167,24 +273,35 @@ class TrainerWorker(threading.Thread):
                 except Exception:
                     self._batch_total = 0
                 self._batch_cur = 0
+                self._epoch_start_time = time.time()
                 if self._batch_total > 0:
-                    self.progress_batch(0, self._batch_total)
+                    self.progress_batch_eta(0, self._batch_total, self._estimate_eta(self._epoch_start_time, 0, self._batch_total))
 
             def on_train_batch_end(trainer):
                 stop_if_needed(trainer)
                 if self._batch_total > 0:
                     self._batch_cur += 1
-                    self.progress_batch(self._batch_cur, self._batch_total)
+                    self.progress_batch_eta(
+                        self._batch_cur,
+                        self._batch_total,
+                        self._estimate_eta(self._epoch_start_time, self._batch_cur, self._batch_total),
+                    )
 
             def on_train_epoch_end(trainer):
                 stop_if_needed(trainer)
                 # trainer.epoch is 0-based
                 ep = int(getattr(trainer, "epoch", 0)) + 1
                 self._epoch_cur = ep
-                self.progress_epoch(ep, self._epoch_total)
+                self.progress_epoch_eta(ep, self._epoch_total, self._estimate_eta(self._train_start_time, ep, self._epoch_total))
+                try:
+                    run_dir = Path(getattr(trainer, "save_dir", ""))
+                    prev_row = read_prev_epoch_row(run_dir) if run_dir else None
+                    self.q.put(("prev_epoch_metrics", prev_row))
+                except Exception:
+                    pass
 
             def on_train_end(trainer):
-                self.progress_epoch(self._epoch_total, self._epoch_total)
+                self.progress_epoch_eta(self._epoch_total, self._epoch_total, "0s")
 
             # attach callbacks (best-effort)
             try:
@@ -242,7 +359,12 @@ class TrainerWorker(threading.Thread):
             self.log(f"[{now_str()}] run_dir：{run_dir}\n")
 
             # 8) metrics
-            metrics = parse_results_csv(run_dir)
+            metrics_payload = parse_results_csv(run_dir)
+            metrics = metrics_payload.get("metrics", {}) if metrics_payload else {}
+            metrics_rows = {
+                "last": metrics_payload.get("last_row") if metrics_payload else None,
+                "prev": metrics_payload.get("prev_row") if metrics_payload else None,
+            }
 
             # 9) zip output
             self.status("打包輸出 ...")
@@ -264,6 +386,7 @@ class TrainerWorker(threading.Thread):
                 "extracted_root": str(extracted_root),
                 "data_yaml": str(data_yaml),
                 "model": cfg.model,
+                "model_dir": cfg.model_dir,
                 "epochs": cfg.epochs,
                 "imgsz": cfg.imgsz,
                 "batch": cfg.batch,
@@ -274,7 +397,58 @@ class TrainerWorker(threading.Thread):
                 "run_dir": str(run_dir),
                 "out_zip": str(out_zip_path),
                 "metrics": metrics,
-                "stopped": bool(self.stop_requested),
+                "metrics_rows": metrics_rows,
+                "stopped": bool(self.stop_requested or self.force_stop_requested),
+                "force_stopped": bool(self.force_stop_requested),
+            }
+            self.done(True, payload)
+
+        except ForceStop:
+            run_dir = self._run_dir_hint if self._run_dir_hint and self._run_dir_hint.exists() else None
+            metrics = {}
+            metrics_rows = {"last": None, "prev": None}
+            if run_dir:
+                metrics_payload = parse_results_csv(run_dir)
+                metrics = metrics_payload.get("metrics", {}) if metrics_payload else {}
+                metrics_rows = {
+                    "last": metrics_payload.get("last_row") if metrics_payload else None,
+                    "prev": metrics_payload.get("prev_row") if metrics_payload else None,
+                }
+
+            out_zip_path = ""
+            if run_dir:
+                try:
+                    out_zip_path = str((Path(cfg.out_zip_dir) / f"{Path(run_dir).name}.zip").resolve())
+                    zip_folder(Path(run_dir), Path(out_zip_path), self.log)
+                except Exception:
+                    out_zip_path = ""
+
+            if cfg.delete_temp and extracted_root:
+                remove_dir_safe(Path(extracted_root), self.log)
+
+            payload = {
+                "time": now_str(),
+                "elapsed_sec": time.time() - t0,
+                "task": cfg.task,
+                "dataset_zip": str(cfg.dataset_zip),
+                "work_dir": str(cfg.work_dir),
+                "extracted_root": str(extracted_root) if extracted_root else "",
+                "data_yaml": str(data_yaml) if data_yaml else "",
+                "model": cfg.model,
+                "model_dir": cfg.model_dir,
+                "epochs": cfg.epochs,
+                "imgsz": cfg.imgsz,
+                "batch": cfg.batch,
+                "device": cfg.device,
+                "resume": cfg.resume,
+                "skip_unlabeled": cfg.skip_unlabeled,
+                "delete_temp": cfg.delete_temp,
+                "run_dir": str(run_dir) if run_dir else "",
+                "out_zip": out_zip_path,
+                "metrics": metrics,
+                "metrics_rows": metrics_rows,
+                "stopped": True,
+                "force_stopped": True,
             }
             self.done(True, payload)
 
