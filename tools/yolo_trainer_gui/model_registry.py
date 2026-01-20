@@ -106,7 +106,7 @@ def infer_task_from_weight_name(weight: str) -> str:
 def filter_weights_by_task(weights: list[str], task: str) -> list[str]:
     task = task.lower().strip()
     if task not in {"detect", "segment", "classify", "pose", "obb"}:
-        return weights
+        return _sort_weights_small_to_large(weights)
 
     out = []
     for w in weights:
@@ -120,4 +120,20 @@ def filter_weights_by_task(weights: list[str], task: str) -> list[str]:
                 out.append(w)
 
     # fallback: if nothing matched, return original to avoid empty dropdown
-    return out if out else weights
+    return _sort_weights_small_to_large(out if out else weights)
+
+
+_SIZE_ORDER = {"n": 0, "s": 1, "m": 2, "l": 3, "x": 4}
+
+def _size_rank(name: str) -> int:
+    base = Path(name).name.lower()
+    if base.endswith(".pt"):
+        base = base[:-3]
+    base = base.split("-")[0]
+    for ch in reversed(base):
+        if ch in _SIZE_ORDER:
+            return _SIZE_ORDER[ch]
+    return 99
+
+def _sort_weights_small_to_large(weights: List[str]) -> List[str]:
+    return sorted(weights, key=lambda w: (_size_rank(w), w.lower()))
