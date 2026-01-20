@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import time
 import queue
 from pathlib import Path
 from datetime import datetime
@@ -74,6 +75,13 @@ class App(tk.Tk):
         self._flush_after_id = None
         self._is_resizing = False
         self._resize_after_id = None
+        self._eta_epoch_sec = None
+        self._eta_batch_sec = None
+        self._eta_epoch_last_update = 0.0
+        self._eta_batch_last_update = 0.0
+        self._eta_tick_after_id = None
+        self._last_epoch_progress = (0, 1)
+        self._last_batch_progress = (0, 1)
 
         # remember last paths for dialog rule
         self.last_dataset_zip = ""
@@ -96,6 +104,7 @@ class App(tk.Tk):
 
         self._load_history()
         self._poll_queue()
+        self._start_eta_tick()
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -479,25 +488,73 @@ class App(tk.Tk):
 
     def force_stop_train(self):
         if self.worker:
-            self.worker.request_force_stop()
-            self._log(f"\n[{now_str()}] 已送出強制停止，訓練將立即中止。\n")
-            self.var_status.set("強制停止中 ...")
+            if messagebox.askyesno("強制停止", "確定要強制停止嗎？"):
+                self.worker.request_force_stop()
+                self._log(f"\n[{now_str()}] 已送出強制停止，訓練將立即中止。\n")
+                self.var_status.set("強制停止中 ...")
+                messagebox.showinfo("強制停止", "強制停止成功！")
 
-    def _set_epoch_progress(self, cur: int, total: int, eta: str = ""):
+    def _set_epoch_progress(self, cur: int, total: int, eta_seconds: Optional[float] = None):
         total = max(1, int(total))
         cur = max(0, min(int(cur), total))
+        self._last_epoch_progress = (cur, total)
         self.pbar_epoch["maximum"] = total
         self.pbar_epoch["value"] = cur
-        eta_txt = f" 剩餘時間: {eta}" if eta else ""
+        if eta_seconds is not None:
+            self._eta_epoch_sec = max(0, int(eta_seconds))
+            self._eta_epoch_last_update = time.time()
+        eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_epoch_sec)}" if self._eta_epoch_sec is not None else ""
         self.var_ep_text.set(f"Epoch: {cur}/{total}{eta_txt}")
 
-    def _set_batch_progress(self, cur: int, total: int, eta: str = ""):
+    def _set_batch_progress(self, cur: int, total: int, eta_seconds: Optional[float] = None):
         total = max(1, int(total))
         cur = max(0, min(int(cur), total))
+        self._last_batch_progress = (cur, total)
         self.pbar_batch["maximum"] = total
         self.pbar_batch["value"] = cur
-        eta_txt = f" 剩餘時間: {eta}" if eta else ""
+        if eta_seconds is not None:
+            self._eta_batch_sec = max(0, int(eta_seconds))
+            self._eta_batch_last_update = time.time()
+        eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_batch_sec)}" if self._eta_batch_sec is not None else ""
         self.var_ba_text.set(f"Batch: {cur}/{total}{eta_txt}")
+
+    def _format_eta_seconds(self, seconds: Optional[int]) -> str:
+        if seconds is None:
+            return ""
+        sec = max(0, int(seconds))
+        if sec == 0:
+            return "00:00:00"
+        mins, s = divmod(sec, 60)
+        hrs, m = divmod(mins, 60)
+        days, h = divmod(hrs, 24)
+        months, d = divmod(days, 30)
+        years, mo = divmod(months, 12)
+
+        if years or mo or d: return f"{years:04d}:{mo:02d}:{d:02d} {h:02d}:{m:02d}:{s:02d}"
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def _start_eta_tick(self):
+        if self._eta_tick_after_id is not None:
+            return
+        self._eta_tick_after_id = self.after(1000, self._tick_eta)
+
+    def _tick_eta(self):
+        now = time.time()
+        if self._eta_epoch_sec is not None and self._eta_epoch_sec > 0:
+            if now - self._eta_epoch_last_update >= 1.0:
+                self._eta_epoch_sec = max(0, self._eta_epoch_sec - 1)
+                cur, total = self._last_epoch_progress
+                eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_epoch_sec)}"
+                self.var_ep_text.set(f"Epoch: {cur}/{total}{eta_txt}")
+
+        if self._eta_batch_sec is not None and self._eta_batch_sec > 0:
+            if now - self._eta_batch_last_update >= 1.0:
+                self._eta_batch_sec = max(0, self._eta_batch_sec - 1)
+                cur, total = self._last_batch_progress
+                eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_batch_sec)}"
+                self.var_ba_text.set(f"Batch: {cur}/{total}{eta_txt}")
+
+        self._eta_tick_after_id = self.after(1000, self._tick_eta)
 
     def _format_prev_row(self, row: Optional[Dict[str, Any]]) -> str:
         if not row:
