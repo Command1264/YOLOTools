@@ -63,8 +63,10 @@ def read_history(limit: int = 500):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Ultralytics YOLO GUI Trainer（dataset.zip）")
-        self.geometry("1120x800")
+        self.title("Ultralytics YOLO GUI Trainer")
+        self.geometry("1200x800")
+        self.minsize(1200, 800)
+        # self.state('zoomed')   # Windows only
 
         self.msg_q = queue.Queue()
         self.worker: Optional[TrainerWorker] = None
@@ -74,6 +76,7 @@ class App(tk.Tk):
         self.last_work_dir = ""
         self.last_out_zip_dir = ""
         self.last_custom_model = ""
+        self.last_model_dir = ""
 
         self._build_ui()
 
@@ -121,13 +124,13 @@ class App(tk.Tk):
         )
 
         r += 1
-        ttk.Label(frm, text="dataset.zip：").grid(row=r, column=0, sticky="w", pady=6)
+        ttk.Label(frm, text="資料集（zip）：").grid(row=r, column=0, sticky="w", pady=6)
         self.var_dataset_zip = tk.StringVar()
         ttk.Entry(frm, textvariable=self.var_dataset_zip).grid(row=r, column=1, sticky="we", padx=8)
         ttk.Button(frm, text="選擇...", command=self.pick_dataset_zip).grid(row=r, column=2, sticky="e")
 
         r += 1
-        ttk.Label(frm, text="訓練工作資料夾（解壓/跑 runs）：").grid(row=r, column=0, sticky="w", pady=6)
+        ttk.Label(frm, text="訓練工作資料夾（解壓縮/訓練模型）：").grid(row=r, column=0, sticky="w", pady=6)
         self.var_work_dir = tk.StringVar(value=str(APP_DIR / "workdir"))
         ttk.Entry(frm, textvariable=self.var_work_dir).grid(row=r, column=1, sticky="we", padx=8)
         ttk.Button(frm, text="選擇...", command=self.pick_work_dir).grid(row=r, column=2, sticky="e")
@@ -147,10 +150,20 @@ class App(tk.Tk):
         ttk.Label(frm, textvariable=self.var_model_source).grid(row=r, column=2, sticky="e")
 
         r += 1
+        ttk.Label(frm, text="模型存放資料夾(下載/快取)").grid(row=r, column=0, sticky="w", pady=6)
+        self.var_model_dir = tk.StringVar(value=str(APP_DIR / "models"))
+        ttk.Entry(frm, textvariable=self.var_model_dir).grid(row=r, column=1, sticky="we", padx=8)
+        ttk.Button(frm, text="選擇...", command=self.pick_model_dir).grid(row=r, column=2, sticky="e")
+
+        r += 1
         ttk.Label(frm, text="或自訂權重（.pt）：").grid(row=r, column=0, sticky="w", pady=6)
+        self.var_use_custom_model = tk.BooleanVar(value=False)
         self.var_custom_model = tk.StringVar()
         ttk.Entry(frm, textvariable=self.var_custom_model).grid(row=r, column=1, sticky="we", padx=8)
-        ttk.Button(frm, text="選擇...", command=self.pick_custom_model).grid(row=r, column=2, sticky="e")
+        ttk.Checkbutton(frm, text="使用自訂權重", variable=self.var_use_custom_model).grid(row=r, column=2, sticky="e")
+
+        r += 1
+        ttk.Button(frm, text="選擇...", command=self.pick_custom_model).grid(row=r, column=1, sticky="w", padx=8)
 
         # Params
         r += 1
@@ -191,6 +204,9 @@ class App(tk.Tk):
         self.btn_stop.pack(side="left", padx=8)
         self.var_status = tk.StringVar(value="就緒")
         ttk.Label(ctrl, textvariable=self.var_status).pack(side="left", padx=12)
+        self.var_run_device = tk.StringVar(value="裝置：未知")
+        ttk.Label(ctrl, textvariable=self.var_run_device).pack(side="left", padx=12)
+        self.btn_stop.bind("<Double-Button-1>", lambda _e: self.force_stop_train())
 
         # Progress (epoch + batch)
         r += 1
@@ -213,6 +229,8 @@ class App(tk.Tk):
         mb.grid(row=r, column=0, columnspan=3, sticky="we", pady=8)
         self.var_metrics = tk.StringVar(value="(尚未訓練)")
         ttk.Label(mb, textvariable=self.var_metrics, justify="left").pack(anchor="w")
+        self.var_prev_epoch_metrics = tk.StringVar(value="上一輪指標： (無)")
+        ttk.Label(mb, textvariable=self.var_prev_epoch_metrics, justify="left").pack(anchor="w")
 
         # Log
         r += 1
@@ -347,6 +365,16 @@ class App(tk.Tk):
             self.last_custom_model = p
 
     # ---------------- training ----------------
+
+    def pick_model_dir(self):
+        p = filedialog.askdirectory(
+            title="選擇模型資料夾",
+            initialdir=default_dialog_dir(self.last_model_dir)
+        )
+        if p:
+            self.var_model_dir.set(p)
+            self.last_model_dir = p
+
     def _log(self, s: str):
         self.txt_log.insert("end", s)
         self.txt_log.see("end")
@@ -354,29 +382,50 @@ class App(tk.Tk):
     def start_train(self):
         dataset_zip = self.var_dataset_zip.get().strip()
         if not dataset_zip:
-            messagebox.showerror("缺少資料", "請選擇 dataset.zip")
+            messagebox.showerror("缺少資料", "請選擇訓練集")
             return
 
         work_dir = self.var_work_dir.get().strip() or str(APP_DIR / "workdir")
         out_zip_dir = self.var_out_zip_dir.get().strip() or str(APP_DIR / "output_zips")
 
+        use_custom = bool(self.var_use_custom_model.get())
         custom = self.var_custom_model.get().strip()
-        model = custom if custom else self.var_model_pick.get().strip()
+        if use_custom and not custom:
+            messagebox.showerror("缺少自訂權重", "請選擇自訂權重")
+            return
+        model = custom if use_custom else self.var_model_pick.get().strip()
         if not model:
-            messagebox.showerror("缺少模型", "請選擇模型或指定自訂 .pt")
+            messagebox.showerror("缺少模型", "請選擇模型或指定自訂權重")
             return
 
         try:
             epochs = int(self.var_epochs.get())
-            imgsz = int(self.var_imgsz.get())
-            batch = int(self.var_batch.get())
+            if epochs <= 0:
+                messagebox.showerror("無效參數", "epochs 必須是大於 0")
+                return
         except Exception:
-            messagebox.showerror("參數錯誤", "epochs/imgsz/batch 必須是整數")
+            messagebox.showerror("無效參數", "epochs 必須是整數")
             return
 
-        if epochs <= 0:
-            messagebox.showerror("參數錯誤", "epochs 必須 > 0")
+        try:
+            imgsz = int(self.var_imgsz.get())
+            if imgsz <= 0:
+                messagebox.showerror("無效參數", "imgsz 必須是大於 0")
+                return
+        except Exception:
+            messagebox.showerror("無效參數", "imgsz 必須是整數")
             return
+
+        try:
+            batch = int(self.var_batch.get())
+            if batch <= 0:
+                messagebox.showerror("無效參數", "batch 必須是大於 0")
+                return
+        except Exception:
+            messagebox.showerror("無效參數", "batch 必須是整數")
+            return
+
+
 
         cfg = TrainConfig(
             task=self.var_task.get().strip(),
@@ -384,6 +433,7 @@ class App(tk.Tk):
             work_dir=work_dir,
             out_zip_dir=out_zip_dir,
             model=model,
+            model_dir=self.var_model_dir.get().strip(),
             epochs=epochs,
             imgsz=imgsz,
             batch=batch,
@@ -400,12 +450,14 @@ class App(tk.Tk):
         self._log(f"[{now_str()}] work_dir={cfg.work_dir}\n")
         self._log(f"[{now_str()}] out_zip_dir={cfg.out_zip_dir}\n")
         self._log(f"[{now_str()}] model={cfg.model}\n")
+        self._log(f"[{now_str()}] model_dir={cfg.model_dir}\n")
         self._log(f"[{now_str()}] epochs={cfg.epochs}, imgsz={cfg.imgsz}, batch={cfg.batch}, device={cfg.device}, resume={cfg.resume}\n\n")
 
         self._set_epoch_progress(0, max(1, cfg.epochs))
         self._set_batch_progress(0, 1)
         self.var_metrics.set("(訓練中...)")
         self.var_status.set("訓練中 ...")
+        self.var_run_device.set("裝置：偵測中")
 
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -419,21 +471,47 @@ class App(tk.Tk):
             self._log(f"\n[{now_str()}] 已送出停止請求（將在下一個 callback 觸發時停下）\n")
             self.var_status.set("停止中 ...")
 
-    def _set_epoch_progress(self, cur: int, total: int):
+
+    def force_stop_train(self):
+        if self.worker:
+            self.worker.request_force_stop()
+            self._log(f"\n[{now_str()}] 已送出強制停止，訓練將立即中止。\n")
+            self.var_status.set("強制停止中 ...")
+
+    def _set_epoch_progress(self, cur: int, total: int, eta: str = ""):
         total = max(1, int(total))
         cur = max(0, min(int(cur), total))
         self.pbar_epoch["maximum"] = total
         self.pbar_epoch["value"] = cur
-        self.var_ep_text.set(f"Epoch: {cur}/{total}")
+        eta_txt = f" 剩餘時間: {eta}" if eta else ""
+        self.var_ep_text.set(f"Epoch: {cur}/{total}{eta_txt}")
 
-    def _set_batch_progress(self, cur: int, total: int):
+    def _set_batch_progress(self, cur: int, total: int, eta: str = ""):
         total = max(1, int(total))
         cur = max(0, min(int(cur), total))
         self.pbar_batch["maximum"] = total
         self.pbar_batch["value"] = cur
-        self.var_ba_text.set(f"Batch: {cur}/{total}")
+        eta_txt = f" 剩餘時間: {eta}" if eta else ""
+        self.var_ba_text.set(f"Batch: {cur}/{total}{eta_txt}")
 
-    # ---------------- queue polling ----------------
+    def _format_prev_row(self, row: Optional[Dict[str, Any]]) -> str:
+        if not row:
+            return "(無)"
+        keys = [
+            "GPU_mem",
+            "train/box_loss", "train/cls_loss", "train/dfl_loss",
+            "val/box_loss", "val/cls_loss", "val/dfl_loss",
+            "metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)",
+            "metrics/precision", "metrics/recall", "metrics/mAP50", "metrics/mAP50-95",
+            "box_loss", "cls_loss", "dfl_loss",
+            "Instances", "Class", "Images",
+        ]
+        parts = []
+        for k in keys:
+            if k in row and row[k] not in ("", None):
+                parts.append(f"{k}={row[k]}")
+        return ", ".join(parts) if parts else "(?)"
+
     def _poll_queue(self):
         try:
             while True:
@@ -444,9 +522,13 @@ class App(tk.Tk):
                 elif kind == "status":
                     self.var_status.set(msg[1])
                 elif kind == "progress_epoch":
-                    self._set_epoch_progress(msg[1], msg[2])
+                    self._set_epoch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else "")
                 elif kind == "progress_batch":
-                    self._set_batch_progress(msg[1], msg[2])
+                    self._set_batch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else "")
+                elif kind == "device":
+                    self.var_run_device.set(f"裝置：{msg[1]}")
+                elif kind == "prev_epoch_metrics":
+                    self.var_prev_epoch_metrics.set(f"上一輪指標： {self._format_prev_row(msg[1])}")
                 elif kind == "done":
                     self._on_done(msg[1], msg[2])
         except queue.Empty:
@@ -462,18 +544,21 @@ class App(tk.Tk):
             self._load_history()
 
             m = payload.get("metrics", {}) or {}
+            rows = payload.get("metrics_rows", {}) or {}
+            prev_row = rows.get("prev")
+            self.var_prev_epoch_metrics.set(f"上一輪指標： {self._format_prev_row(prev_row)}")
 
             def fmt(x):
                 return "-" if x is None else f"{x:.4f}"
 
             self.var_metrics.set(
-                "Precision: " + fmt(m.get("precision")) + "\n"
-                                                          "Recall:    " + fmt(m.get("recall")) + "\n"
-                                                                                                 "F1:        " + fmt(m.get("f1")) + "\n"
-                                                                                                                                    "mAP50:     " + fmt(m.get("mAP50")) + "\n"
-                                                                                                                                                                          "mAP50-95:  " + fmt(m.get("mAP50-95")) + "\n"
-                                                                                                                                                                                                                   f"輸出zip:   {payload.get('out_zip','')}\n"
-                                                                                                                                                                                                                   f"stopped:   {payload.get('stopped', False)}"
+                "精確率 (Precision):   " + fmt(m.get("precision")) + "\n"
+                "召回率 (Recall):      " + fmt(m.get("recall")) + "\n"
+                "F1 分數 (F1-score):   " + fmt(m.get("f1")) + "\n"
+                "mAP50:               " + fmt(m.get("mAP50")) + "\n"
+                "mAP50-95:            " + fmt(m.get("mAP50-95")) + "\n"
+                f"輸出 ZIP 檔案:       {payload.get('out_zip','')}\n"
+                f"是否中途停止:         {payload.get('stopped', False)}"
             )
             self.var_status.set("完成")
             self._log(f"\n[{now_str()}] ===== 完成 =====\n")
@@ -555,7 +640,7 @@ class App(tk.Tk):
             return
         zp = rec.get("out_zip", "")
         if not zp:
-            messagebox.showerror("錯誤", "找不到 out_zip")
+            messagebox.showerror("找不到歷史紀錄", "找不到歷史紀錄資料夾")
             return
         p = Path(zp)
         folder = p.parent
@@ -568,12 +653,13 @@ class App(tk.Tk):
             return
         run_dir = rec.get("run_dir", "")
         if not run_dir:
-            messagebox.showerror("錯誤", "此紀錄沒有 run_dir")
+            messagebox.showerror("載入失敗", "找不到此訓練結果")
             return
         try:
             self.hardcore_panel.load_run(run_dir)
+            messagebox.showinfo("載入成功", "成功載入至硬核視覺化")
         except Exception as e:
-            messagebox.showerror("錯誤", f"載入硬核視覺化失敗：{e}")
+            messagebox.showerror("載入失敗", f"硬核視覺化載入失敗：\n{e}")
 
     # ---------------- open folder helper ----------------
     def _open_folder(self, folder: Path):
@@ -592,7 +678,7 @@ class App(tk.Tk):
             else:
                 os.system(f'xdg-open "{folder}"')
         except Exception as e:
-            messagebox.showerror("錯誤", f"無法開啟資料夾：{e}")
+            messagebox.showerror("開啟失敗", f"無法開啟資料夾：\n{e}")
 
 
 if __name__ == "__main__":
