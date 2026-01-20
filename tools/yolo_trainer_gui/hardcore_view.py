@@ -1,6 +1,7 @@
 # hardcore_view.py
 from __future__ import annotations
 from pathlib import Path
+import os
 from typing import Dict, Any, Optional, List
 
 import tkinter as tk
@@ -119,18 +120,58 @@ class HardcorePanel(ttk.Frame):
     def _open_full(self, name: str, path: Path):
         top = tk.Toplevel(self)
         top.title(name)
-        img = Image.open(path).convert("RGB")
-        w, h = img.size
+        top.withdraw()
+        top.update_idletasks()
 
-        max_w = max(200, top.winfo_screenwidth() - 80)
-        max_h = max(200, top.winfo_screenheight() - 120)
-        scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
-        if scale < 1.0:
-            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-            w, h = img.size
+        orig = Image.open(path).convert("RGB")
+        top._orig_img = orig  # keep original
 
-        tkimg = ImageTk.PhotoImage(img)
-        lbl = ttk.Label(top, image=tkimg)
-        lbl.image = tkimg  # keep ref
-        lbl.pack()
-        top.geometry(f"{w}x{h}")
+        screen_w = max(400, top.winfo_screenwidth())
+        screen_h = max(300, top.winfo_screenheight())
+        # win_w = int(screen_w * 0.95)
+        # win_h = int(screen_h * 0.95)
+        # x = max(0, (screen_w - win_w) // 2)
+        # y = max(0, (screen_h - win_h) // 2)
+        # top.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        if os.name == "nt":
+            try:
+                top.state("zoomed")
+            except Exception:
+                top.geometry(f"{screen_w}x{screen_h}+0+0")
+        else:
+            top.geometry(f"{screen_w}x{screen_h}+0+0")
+
+        top.bind("<Escape>", lambda _e: top.destroy())
+        top.deiconify()
+
+        canvas = tk.Canvas(top, highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+
+        def redraw():
+            w = max(1, top.winfo_width())
+            h = max(1, top.winfo_height())
+            if (w, h) == getattr(top, "_last_size", None):
+                return
+            top._last_size = (w, h)
+            # keep aspect ratio, fit inside window
+            scale = min(w / max(orig.width, 1), h / max(orig.height, 1), 1.0)
+            new_w = max(1, int(orig.width * scale))
+            new_h = max(1, int(orig.height * scale))
+            img = orig.resize((new_w, new_h), Image.LANCZOS)
+            tkimg = ImageTk.PhotoImage(img)
+            canvas.delete("all")
+            canvas.create_image(w // 2, h // 2, image=tkimg, anchor="center")
+            canvas.image = tkimg  # keep ref
+
+        def schedule_redraw(_event=None):
+            if getattr(top, "_resize_after_id", None):
+                try:
+                    top.after_cancel(top._resize_after_id)
+                except Exception:
+                    pass
+            top._resize_after_id = top.after(10, redraw)
+
+        top._resize_after_id = None
+        top._last_size = None
+        top.bind("<Configure>", schedule_redraw)
+        redraw()
