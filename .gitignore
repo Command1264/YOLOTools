@@ -10,3 +10,7 @@ install
 models
 TaichungFireYoloEnv
 tainingData
+workdir
+output_zips
+*.pt
+train_history.jsonl
