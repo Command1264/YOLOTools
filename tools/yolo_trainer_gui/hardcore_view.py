@@ -119,17 +119,18 @@ class HardcorePanel(ttk.Frame):
     def _open_full(self, name: str, path: Path):
         top = tk.Toplevel(self)
         top.title(name)
-        top.geometry("1000x700")
-
-        canvas = tk.Canvas(top, bg="black")
-        canvas.pack(fill="both", expand=True)
-
         img = Image.open(path).convert("RGB")
-        # fit to window initially
         w, h = img.size
-        scale = min(1000 / max(w, 1), 700 / max(h, 1), 1.0)
-        img = img.resize((int(w * scale), int(h * scale)))
-        tkimg = ImageTk.PhotoImage(img)
 
-        canvas.create_image(10, 10, anchor="nw", image=tkimg)
-        canvas.image = tkimg  # keep ref
+        max_w = max(200, top.winfo_screenwidth() - 80)
+        max_h = max(200, top.winfo_screenheight() - 120)
+        scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
+        if scale < 1.0:
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            w, h = img.size
+
+        tkimg = ImageTk.PhotoImage(img)
+        lbl = ttk.Label(top, image=tkimg)
+        lbl.image = tkimg  # keep ref
+        lbl.pack()
+        top.geometry(f"{w}x{h}")
