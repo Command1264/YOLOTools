@@ -99,6 +99,7 @@ class App(tk.Tk):
         self._build_ui()
         self.bind("<Configure>", self._on_resize)
         self._bind_config_traces()
+        self._bind_eta_decimal_trace()
 
         self._load_config()
 
@@ -114,6 +115,31 @@ class App(tk.Tk):
         self._load_history()
         self._poll_queue()
         self._start_eta_tick()
+
+    def _bind_eta_decimal_trace(self):
+        try:
+            self.var_eta_decimal_places.trace_add("write", lambda *args: self._sync_eta_decimal_places())
+        except Exception:
+            pass
+
+    def _sync_eta_decimal_places(self):
+        try:
+            dp = int(self.var_eta_decimal_places.get())
+        except Exception:
+            return
+        self._eta_decimal_places = dp
+        ep_cur, ep_total = self._last_epoch_progress
+        ba_cur, ba_total = self._last_batch_progress
+        if self._eta_epoch_sec is None:
+            eta_ep = " 剩餘時間：--:--:--"
+        else:
+            eta_ep = f" 剩餘時間：{self._format_eta_seconds(self._eta_epoch_sec, self._eta_decimal_places)}"
+        if self._eta_batch_sec is None:
+            eta_ba = " 剩餘時間：--:--:--"
+        else:
+            eta_ba = f" 剩餘時間：{self._format_eta_seconds(self._eta_batch_sec, self._eta_decimal_places)}"
+        self.var_ep_text.set(f"Epoch: {ep_cur}/{ep_total}{eta_ep}")
+        self.var_ba_text.set(f"Batch: {ba_cur}/{ba_total}{eta_ba}")
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -196,6 +222,7 @@ class App(tk.Tk):
         self.var_epochs = tk.IntVar(value=50)
         self.var_imgsz = tk.IntVar(value=640)
         self.var_batch = tk.IntVar(value=16)
+        self.var_eta_decimal_places = tk.IntVar(value=self._eta_decimal_places)
         self.var_device = tk.StringVar(value="")
         self.var_resume = tk.BooleanVar(value=False)
         self.var_skip_unlabeled = tk.BooleanVar(value=True)
@@ -213,9 +240,12 @@ class App(tk.Tk):
         ttk.Label(box, text="device（空白自動 / cpu / 0 / 0,1）").grid(row=1, column=0, sticky="w", pady=8)
         ttk.Entry(box, textvariable=self.var_device, width=18).grid(row=1, column=1, sticky="w", padx=8)
 
-        ttk.Checkbutton(box, text="resume（接著上次中斷續跑）", variable=self.var_resume).grid(row=1, column=2, sticky="w")
-        ttk.Checkbutton(box, text="跳過無標記圖片（detect/seg/pose/obb）", variable=self.var_skip_unlabeled).grid(row=1, column=3, sticky="w")
-        ttk.Checkbutton(box, text="訓練後刪除解壓暫存", variable=self.var_delete_temp).grid(row=1, column=4, sticky="w")
+        ttk.Label(box, text="ETA 小數位數（<=0 不顯示）").grid(row=1, column=2, sticky="w", pady=8)
+        ttk.Entry(box, textvariable=self.var_eta_decimal_places, width=10).grid(row=1, column=3, sticky="w", padx=8)
+
+        ttk.Checkbutton(box, text="resume（接著上次中斷續跑）", variable=self.var_resume).grid(row=2, column=0, sticky="w")
+        ttk.Checkbutton(box, text="跳過無標記圖片（detect/seg/pose/obb）", variable=self.var_skip_unlabeled).grid(row=2, column=1, sticky="w")
+        ttk.Checkbutton(box, text="訓練後刪除解壓暫存", variable=self.var_delete_temp).grid(row=2, column=2, sticky="w")
 
         # Controls
         r += 1
@@ -455,6 +485,13 @@ class App(tk.Tk):
         except Exception:
             messagebox.showerror("無效參數", "batch 必須是整數")
             return
+
+        try:
+            dp = int(self.var_eta_decimal_places.get())
+        except Exception:
+            messagebox.showerror("無效參數", "ETA 小數位數必須是整數")
+            return
+        self._eta_decimal_places = dp
 
 
 
@@ -706,6 +743,7 @@ class App(tk.Tk):
             self.var_epochs,
             self.var_imgsz,
             self.var_batch,
+            self.var_eta_decimal_places,
             self.var_device,
             self.var_resume,
             self.var_skip_unlabeled,
@@ -731,6 +769,12 @@ class App(tk.Tk):
             self.var_resume.set(bool(data.get("resume", self.var_resume.get())))
             self.var_skip_unlabeled.set(bool(data.get("skip_unlabeled", self.var_skip_unlabeled.get())))
             self.var_delete_temp.set(bool(data.get("delete_temp", self.var_delete_temp.get())))
+            try:
+                dp = int(data.get("eta_decimal_places", self.var_eta_decimal_places.get()))
+                self.var_eta_decimal_places.set(dp)
+                self._eta_decimal_places = dp
+            except Exception:
+                pass
             try:
                 self.var_epochs.set(int(data.get("epochs", self.var_epochs.get())))
             except Exception:
@@ -764,6 +808,7 @@ class App(tk.Tk):
                 "epochs": int(self.var_epochs.get()),
                 "imgsz": int(self.var_imgsz.get()),
                 "batch": int(self.var_batch.get()),
+                "eta_decimal_places": int(self.var_eta_decimal_places.get()),
                 "device": self.var_device.get(),
                 "resume": bool(self.var_resume.get()),
                 "skip_unlabeled": bool(self.var_skip_unlabeled.get()),
