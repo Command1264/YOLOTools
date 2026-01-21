@@ -20,6 +20,7 @@ from hardcore_view import HardcorePanel
 APP_DIR = Path(__file__).resolve().parent
 CACHE_WEIGHTS = APP_DIR / "weights_cache.json"
 HISTORY_PATH = APP_DIR / "train_history.jsonl"
+CONFIG_PATH = APP_DIR / "trainer_config.json"
 
 
 def now_str() -> str:
@@ -80,8 +81,13 @@ class App(tk.Tk):
         self._eta_epoch_last_update = 0.0
         self._eta_batch_last_update = 0.0
         self._eta_tick_after_id = None
+        self._eta_decimal_places = 1
         self._last_epoch_progress = (0, 1)
         self._last_batch_progress = (0, 1)
+        self._loading_config = False
+        self._force_stop_locked = False
+        self.var_epoch_summary = tk.StringVar(value="(尚未訓練)")
+        self._metrics_log = ""
 
         # remember last paths for dialog rule
         self.last_dataset_zip = ""
@@ -92,6 +98,9 @@ class App(tk.Tk):
 
         self._build_ui()
         self.bind("<Configure>", self._on_resize)
+        self._bind_config_traces()
+
+        self._load_config()
 
         # load model list (try online first)
         self._load_weights(try_online=True)
@@ -239,22 +248,27 @@ class App(tk.Tk):
 
         # Metrics
         r += 1
-        mb = ttk.LabelFrame(frm, text="最後一輪指標", padding=10)
-        mb.grid(row=r, column=0, columnspan=3, sticky="we", pady=8)
-        self.var_metrics = tk.StringVar(value="(尚未訓練)")
-        ttk.Label(mb, textvariable=self.var_metrics, justify="left").pack(anchor="w")
-        self.var_prev_epoch_metrics = tk.StringVar(value="上一輪指標： (無)")
-        ttk.Label(mb, textvariable=self.var_prev_epoch_metrics, justify="left").pack(anchor="w")
+        paned_metrics_log = tk.PanedWindow(frm, orient="vertical")
+        paned_metrics_log.grid(row=r, column=0, columnspan=3, sticky="nsew", pady=8)
 
-        # Log
-        r += 1
-        lb = ttk.LabelFrame(frm, text="Log", padding=10)
-        lb.grid(row=r, column=0, columnspan=3, sticky="nsew", pady=8)
-        self.txt_log = tk.Text(lb, height=14, wrap="word")
+        mb = ttk.LabelFrame(paned_metrics_log, text="上一輪指標 / 每輪摘要", padding=10)
+        self.txt_metrics = tk.Text(mb, height=8, wrap="word")
+        self.txt_metrics.pack(side="left", fill="both", expand=True)
+        sbm = ttk.Scrollbar(mb, command=self.txt_metrics.yview)
+        sbm.pack(side="right", fill="y")
+        self.txt_metrics.configure(yscrollcommand=sbm.set)
+
+        lb = ttk.LabelFrame(paned_metrics_log, text="Log", padding=10)
+        self.txt_log = tk.Text(lb, height=3, wrap="word")
         self.txt_log.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(lb, command=self.txt_log.yview)
         sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
+
+        paned_metrics_log.add(mb)
+        paned_metrics_log.add(lb)
+        paned_metrics_log.paneconfigure(lb, minsize=60)
+        self._metrics_log_paned = paned_metrics_log
 
         frm.grid_columnconfigure(1, weight=1)
         frm.grid_rowconfigure(r, weight=1)
@@ -295,8 +309,10 @@ class App(tk.Tk):
         br.pack(fill="x", pady=10)
         ttk.Button(br, text="重新載入", command=self._load_history).pack(side="left")
         ttk.Button(br, text="查看詳細", command=self.show_selected_detail).pack(side="left", padx=8)
+        ttk.Button(br, text="開啟輸出 zip", command=self.open_selected_zip).pack(side="left", padx=8)
         ttk.Button(br, text="開啟輸出 zip 資料夾", command=self.open_selected_zip_dir).pack(side="left", padx=8)
         ttk.Button(br, text="載入到硬核視覺化", command=self.load_selected_to_hardcore).pack(side="left", padx=8)
+        ttk.Button(br, text="刪除選取", command=self.delete_selected_history).pack(side="left", padx=8)
 
         # -------- Hardcore Tab --------
         hp = ttk.Frame(self.tab_hardcore, padding=12)
@@ -394,6 +410,7 @@ class App(tk.Tk):
         self.txt_log.see("end")
 
     def start_train(self):
+        self._save_config()
         dataset_zip = self.var_dataset_zip.get().strip()
         if not dataset_zip:
             messagebox.showerror("缺少資料", "請選擇訓練集")
@@ -469,8 +486,10 @@ class App(tk.Tk):
 
         self._set_epoch_progress(0, max(1, cfg.epochs))
         self._set_batch_progress(0, 1)
-        self.var_metrics.set("(訓練中...)")
-        self.var_status.set("訓練中 ...")
+        self._metrics_log = ""
+        self._update_metrics_text()
+        self.var_epoch_summary.set("(訓練中...)")
+        self.var_status.set("準備中 ...")
         self.var_run_device.set("裝置：偵測中")
 
         self.btn_start.config(state="disabled")
@@ -488,6 +507,9 @@ class App(tk.Tk):
 
     def force_stop_train(self):
         if self.worker:
+            if self._force_stop_locked:
+                messagebox.showinfo("強制停止", "目前正在下載/載入模型，強制停止暫不可用。")
+                return
             if messagebox.askyesno("強制停止", "確定要強制停止嗎？"):
                 self.worker.request_force_stop()
                 self._log(f"\n[{now_str()}] 已送出強制停止，訓練將立即中止。\n")
@@ -501,9 +523,14 @@ class App(tk.Tk):
         self.pbar_epoch["maximum"] = total
         self.pbar_epoch["value"] = cur
         if eta_seconds is not None:
-            self._eta_epoch_sec = max(0, int(eta_seconds))
-            self._eta_epoch_last_update = time.time()
-        eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_epoch_sec)}" if self._eta_epoch_sec is not None else ""
+            if not (eta_seconds <= 0 and cur >= total):
+                self._eta_epoch_sec = max(0.0, float(eta_seconds))
+                self._eta_epoch_last_update = time.time()
+        if self._eta_epoch_sec is None:
+            eta_txt = " 剩餘時間：--:--:--"
+        else:
+            eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_epoch_sec, self._eta_decimal_places)}"
+            # print(f"更新 epoch eta：{self._eta_epoch_sec}")
         self.var_ep_text.set(f"Epoch: {cur}/{total}{eta_txt}")
 
     def _set_batch_progress(self, cur: int, total: int, eta_seconds: Optional[float] = None):
@@ -513,25 +540,51 @@ class App(tk.Tk):
         self.pbar_batch["maximum"] = total
         self.pbar_batch["value"] = cur
         if eta_seconds is not None:
-            self._eta_batch_sec = max(0, int(eta_seconds))
-            self._eta_batch_last_update = time.time()
-        eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_batch_sec)}" if self._eta_batch_sec is not None else ""
+            if not (eta_seconds <= 0 and cur >= total):
+                self._eta_batch_sec = max(0.0, float(eta_seconds))
+                self._eta_batch_last_update = time.time()
+        if self._eta_batch_sec is None:
+            eta_txt = " 剩餘時間：--:--:--"
+        else:
+            eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_batch_sec, self._eta_decimal_places)}"
+            # print(f"更新 batch eta：{self._eta_batch_sec}")
         self.var_ba_text.set(f"Batch: {cur}/{total}{eta_txt}")
 
-    def _format_eta_seconds(self, seconds: Optional[int]) -> str:
-        if seconds is None:
-            return ""
-        sec = max(0, int(seconds))
-        if sec == 0:
-            return "00:00:00"
-        mins, s = divmod(sec, 60)
+    def _format_eta_seconds(self, seconds: Optional[float], decimal_places: int = 1) -> str:
+        if seconds is None: return ""
+
+        sec_f = max(0.0, float(seconds))
+        sec_i = int(sec_f)
+
+        if decimal_places <= 0:
+            ms = 0
+        else:
+            unit = 10 ** decimal_places
+            frac = sec_f - sec_i
+            ms = int(round(frac * unit))
+
+        if decimal_places > 0 and ms >= 10 ** decimal_places:
+            sec_i += 1
+            ms = 0
+        if sec_i == 0 and ms == 0:
+            if decimal_places <= 0: return "00:00:00"
+            return f"00:00:00.{0:0{decimal_places}d}"
+
+        mins, s = divmod(sec_i, 60)
         hrs, m = divmod(mins, 60)
         days, h = divmod(hrs, 24)
         months, d = divmod(days, 30)
         years, mo = divmod(months, 12)
 
-        if years or mo or d: return f"{years:04d}:{mo:02d}:{d:02d} {h:02d}:{m:02d}:{s:02d}"
-        return f"{h:02d}:{m:02d}:{s:02d}"
+        if decimal_places <= 0:
+            if years or mo or d: return f"{years:04d}:{mo:02d}:{d:02d} {h:02d}:{m:02d}:{s:02d}"
+            return f"{h:02d}:{m:02d}:{s:02d}"
+
+        frac = f"{ms:0{decimal_places}d}"
+        if years or mo or d: return f"{years:04d}:{mo:02d}:{d:02d} {h:02d}:{m:02d}:{s:02d}.{frac}"
+        return f"{h:02d}:{m:02d}:{s:02d}.{frac}"
+
+
 
     def _start_eta_tick(self):
         if self._eta_tick_after_id is not None:
@@ -541,17 +594,21 @@ class App(tk.Tk):
     def _tick_eta(self):
         now = time.time()
         if self._eta_epoch_sec is not None and self._eta_epoch_sec > 0:
-            if now - self._eta_epoch_last_update >= 1.0:
-                self._eta_epoch_sec = max(0, self._eta_epoch_sec - 1)
+            delta = now - self._eta_epoch_last_update
+            if delta > 0:
+                self._eta_epoch_sec = max(0.0, self._eta_epoch_sec - delta)
+                self._eta_epoch_last_update = now
                 cur, total = self._last_epoch_progress
-                eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_epoch_sec)}"
+                eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_epoch_sec, self._eta_decimal_places)}"
                 self.var_ep_text.set(f"Epoch: {cur}/{total}{eta_txt}")
 
         if self._eta_batch_sec is not None and self._eta_batch_sec > 0:
-            if now - self._eta_batch_last_update >= 1.0:
-                self._eta_batch_sec = max(0, self._eta_batch_sec - 1)
+            delta = now - self._eta_batch_last_update
+            if delta > 0:
+                self._eta_batch_sec = max(0.0, self._eta_batch_sec - delta)
+                self._eta_batch_last_update = now
                 cur, total = self._last_batch_progress
-                eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_batch_sec)}"
+                eta_txt = f" 剩餘時間：{self._format_eta_seconds(self._eta_batch_sec, self._eta_decimal_places)}"
                 self.var_ba_text.set(f"Batch: {cur}/{total}{eta_txt}")
 
         self._eta_tick_after_id = self.after(1000, self._tick_eta)
@@ -559,20 +616,162 @@ class App(tk.Tk):
     def _format_prev_row(self, row: Optional[Dict[str, Any]]) -> str:
         if not row:
             return "(無)"
-        keys = [
-            "GPU_mem",
-            "train/box_loss", "train/cls_loss", "train/dfl_loss",
-            "val/box_loss", "val/cls_loss", "val/dfl_loss",
-            "metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)",
-            "metrics/precision", "metrics/recall", "metrics/mAP50", "metrics/mAP50-95",
-            "box_loss", "cls_loss", "dfl_loss",
-            "Instances", "Class", "Images",
+        def val(keys):
+            for k in keys:
+                if k in row and row[k] not in ("", None):
+                    return row[k]
+            return None
+
+        fields = [
+            ("GPU_mem", ["GPU_mem", "gpu_mem"]),
+            ("box_loss", ["train/box_loss", "box_loss"]),
+            ("cls_loss", ["train/cls_loss", "cls_loss"]),
+            ("dfl_loss", ["train/dfl_loss", "dfl_loss"]),
+            ("Instances", ["Instances"]),
+            ("Size", ["Size"]),
+            ("Class", ["Class"]),
+            ("Images", ["Images"]),
+            ("Box(P)", ["metrics/precision(B)", "metrics/precision", "precision"]),
+            ("R", ["metrics/recall(B)", "metrics/recall", "recall"]),
+            ("mAP50", ["metrics/mAP50(B)", "metrics/mAP50", "mAP50"]),
+            ("mAP50-95", ["metrics/mAP50-95(B)", "metrics/mAP50-95", "mAP50-95", "mAP5095"]),
         ]
-        parts = []
-        for k in keys:
-            if k in row and row[k] not in ("", None):
-                parts.append(f"{k}={row[k]}")
-        return ", ".join(parts) if parts else "(?)"
+        lines = []
+        for label, keys in fields:
+            v = val(keys)
+            if v is None:
+                continue
+            lines.append(f"{label}: {v}")
+        return "\n".join(lines) if lines else "(無)"
+
+    def _format_epoch_summary(self, row: Optional[Dict[str, Any]]) -> str:
+        if not row:
+            return "(無)"
+
+        def val(keys):
+            for k in keys:
+                if k in row and row[k] not in ("", None):
+                    return row[k]
+            return None
+
+        def fmt(x):
+            try:
+                return f"{float(x):.4f}"
+            except Exception:
+                return "-" if x is None else str(x)
+
+        p = val(["metrics/precision(B)", "metrics/precision", "precision"])
+        r = val(["metrics/recall(B)", "metrics/recall", "recall"])
+        map50 = val(["metrics/mAP50(B)", "metrics/mAP50", "mAP50"])
+        map95 = val(["metrics/mAP50-95(B)", "metrics/mAP50-95", "mAP50-95", "mAP5095"])
+
+        f1 = None
+        try:
+            pf = float(p)
+            rf = float(r)
+            if pf + rf > 0:
+                f1 = 2 * pf * rf / (pf + rf)
+        except Exception:
+            f1 = None
+
+        lines = []
+        if p is not None: lines.append("精確率 (Precision):   " + fmt(p))
+        if r is not None: lines.append("召回率 (Recall):      " + fmt(r))
+        if f1 is not None: lines.append("F1 分數 (F1-score):   " + fmt(f1))
+        if map50 is not None: lines.append("mAP50:               " + fmt(map50))
+        if map95 is not None: lines.append("mAP50-95:            " + fmt(map95))
+        return "\n".join(lines) if lines else "(無)"
+
+    def _update_metrics_text(self):
+        self.txt_metrics.delete("1.0", "end")
+        self.txt_metrics.insert("end", self._metrics_log or "(無)")
+        self.txt_metrics.see("end")
+
+    def _bind_config_traces(self):
+        def _trace(v):
+            try:
+                v.trace_add("write", lambda *args: self._save_config())
+            except Exception:
+                pass
+
+        for v in [
+            self.var_task,
+            self.var_dataset_zip,
+            self.var_work_dir,
+            self.var_out_zip_dir,
+            self.var_model_pick,
+            self.var_model_dir,
+            self.var_use_custom_model,
+            self.var_custom_model,
+            self.var_epochs,
+            self.var_imgsz,
+            self.var_batch,
+            self.var_device,
+            self.var_resume,
+            self.var_skip_unlabeled,
+            self.var_delete_temp,
+        ]:
+            _trace(v)
+
+    def _load_config(self):
+        if not CONFIG_PATH.exists():
+            return
+        try:
+            self._loading_config = True
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            self.var_task.set(data.get("task", self.var_task.get()))
+            self.var_dataset_zip.set(data.get("dataset_zip", self.var_dataset_zip.get()))
+            self.var_work_dir.set(data.get("work_dir", self.var_work_dir.get()))
+            self.var_out_zip_dir.set(data.get("out_zip_dir", self.var_out_zip_dir.get()))
+            self.var_model_pick.set(data.get("model_pick", self.var_model_pick.get()))
+            self.var_model_dir.set(data.get("model_dir", self.var_model_dir.get()))
+            self.var_use_custom_model.set(bool(data.get("use_custom_model", self.var_use_custom_model.get())))
+            self.var_custom_model.set(data.get("custom_model", self.var_custom_model.get()))
+            self.var_device.set(data.get("device", self.var_device.get()))
+            self.var_resume.set(bool(data.get("resume", self.var_resume.get())))
+            self.var_skip_unlabeled.set(bool(data.get("skip_unlabeled", self.var_skip_unlabeled.get())))
+            self.var_delete_temp.set(bool(data.get("delete_temp", self.var_delete_temp.get())))
+            try:
+                self.var_epochs.set(int(data.get("epochs", self.var_epochs.get())))
+            except Exception:
+                pass
+            try:
+                self.var_imgsz.set(int(data.get("imgsz", self.var_imgsz.get())))
+            except Exception:
+                pass
+            try:
+                self.var_batch.set(int(data.get("batch", self.var_batch.get())))
+            except Exception:
+                pass
+        except Exception:
+            return
+        finally:
+            self._loading_config = False
+
+    def _save_config(self):
+        if self._loading_config:
+            return
+        try:
+            data = {
+                "task": self.var_task.get(),
+                "dataset_zip": self.var_dataset_zip.get(),
+                "work_dir": self.var_work_dir.get(),
+                "out_zip_dir": self.var_out_zip_dir.get(),
+                "model_pick": self.var_model_pick.get(),
+                "model_dir": self.var_model_dir.get(),
+                "use_custom_model": bool(self.var_use_custom_model.get()),
+                "custom_model": self.var_custom_model.get(),
+                "epochs": int(self.var_epochs.get()),
+                "imgsz": int(self.var_imgsz.get()),
+                "batch": int(self.var_batch.get()),
+                "device": self.var_device.get(),
+                "resume": bool(self.var_resume.get()),
+                "skip_unlabeled": bool(self.var_skip_unlabeled.get()),
+                "delete_temp": bool(self.var_delete_temp.get()),
+            }
+            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception:
+            return
 
     def _poll_queue(self):
         try:
@@ -601,13 +800,17 @@ class App(tk.Tk):
             elif kind == "status":
                 self.var_status.set(msg[1])
             elif kind == "progress_epoch":
-                self._set_epoch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else "")
+                self._set_epoch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else None)
             elif kind == "progress_batch":
-                self._set_batch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else "")
+                self._set_batch_progress(msg[1], msg[2], msg[3] if len(msg) > 3 else None)
             elif kind == "device":
                 self.var_run_device.set(f"裝置：{msg[1]}")
             elif kind == "prev_epoch_metrics":
-                self.var_prev_epoch_metrics.set(f"上一輪指標：{self._format_prev_row(msg[1])}")
+                row = msg[1]
+                self._metrics_log = self._format_prev_row(row) + "\n\n" + self._format_epoch_summary(row)
+                self._update_metrics_text()
+            elif kind == "force_stop_lock":
+                self._force_stop_locked = bool(msg[1])
             elif kind == "done":
                 self._on_done(msg[1], msg[2])
 
@@ -629,30 +832,37 @@ class App(tk.Tk):
             self._flush_after_id = self.after(50, self._flush_pending_msgs)
 
     def _on_done(self, ok: bool, payload: Dict[str, Any]):
+        self._force_stop_locked = False
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
+
+        # Force ETA to zero before any completion messagebox.
+        self._eta_epoch_sec = 0.0
+        self._eta_batch_sec = 0.0
+        self._eta_epoch_last_update = time.time()
+        self._eta_batch_last_update = time.time()
+        ep_cur, ep_total = self._last_epoch_progress
+        ba_cur, ba_total = self._last_batch_progress
+        self.var_ep_text.set(
+            f"Epoch: {ep_cur}/{ep_total} 剩餘時間：{self._format_eta_seconds(0.0, self._eta_decimal_places)}"
+        )
+        self.var_ba_text.set(
+            f"Batch: {ba_cur}/{ba_total} 剩餘時間：{self._format_eta_seconds(0.0, self._eta_decimal_places)}"
+        )
 
         if ok:
             append_history(payload)
             self._load_history()
 
-            m = payload.get("metrics", {}) or {}
             rows = payload.get("metrics_rows", {}) or {}
-            prev_row = rows.get("prev")
-            self.var_prev_epoch_metrics.set(f"上一輪指標： {self._format_prev_row(prev_row)}")
-
-            def fmt(x):
-                return "-" if x is None else f"{x:.4f}"
-
-            self.var_metrics.set(
-                "精確率 (Precision):   " + fmt(m.get("precision")) + "\n"
-                "召回率 (Recall):      " + fmt(m.get("recall")) + "\n"
-                "F1 分數 (F1-score):   " + fmt(m.get("f1")) + "\n"
-                "mAP50:               " + fmt(m.get("mAP50")) + "\n"
-                "mAP50-95:            " + fmt(m.get("mAP50-95")) + "\n"
-                f"輸出 ZIP 檔案:       {payload.get('out_zip','')}\n"
+            last_row = rows.get("last")
+            self._metrics_log = self._format_prev_row(last_row) + "\n\n" + self._format_epoch_summary(last_row)
+            summary = (
+                f"\n輸出 ZIP 檔案:       {payload.get('out_zip','')}\n"
                 f"是否中途停止:         {payload.get('stopped', False)}"
             )
+            self._metrics_log += summary
+            self._update_metrics_text()
             self.var_status.set("完成")
             self._log(f"\n[{now_str()}] ===== 完成 =====\n")
 
@@ -663,11 +873,22 @@ class App(tk.Tk):
                     self.hardcore_panel.load_run(run_dir)
                 except Exception as e:
                     self._log(f"[{now_str()}] 硬核視覺化載入失敗：{e}\n")
+            if payload.get("stopped", False):
+                messagebox.showinfo("訓練結束", "訓練已停止。")
+            else:
+                messagebox.showinfo("訓練完成", "訓練完成。")
         else:
             err = payload.get("error", "Unknown error")
             self.var_status.set("失敗")
             self._log(f"\n[{now_str()}] ===== 失敗 =====\n{err}\n")
             messagebox.showerror("訓練失敗", err)
+
+        self._eta_epoch_sec = None
+        self._eta_batch_sec = None
+        self.pbar_epoch["value"] = 0
+        self.pbar_batch["value"] = 0
+        self.var_ep_text.set("Epoch: 0/0")
+        self.var_ba_text.set("Batch: 0/0")
 
     # ---------------- history ----------------
     def _load_history(self):
@@ -714,6 +935,8 @@ class App(tk.Tk):
         return None
 
     def show_selected_detail(self):
+        if not self._ensure_single_selection("查看詳細"):
+            return
         rec = self._selected_record()
         if not rec:
             messagebox.showinfo("提示", "請先選擇一筆歷史紀錄")
@@ -727,6 +950,24 @@ class App(tk.Tk):
         txt.configure(state="disabled")
 
     def open_selected_zip_dir(self):
+        sels = self.tree.selection()
+        if not sels:
+            messagebox.showinfo("提示", "請先選擇一筆歷史紀錄")
+            return
+        # If single selection and zip exists, open folder and select zip.
+        if len(sels) == 1:
+            rec = self._selected_record()
+            if rec:
+                zp = rec.get("out_zip", "")
+                if zp:
+                    p = Path(zp)
+                    if p.exists() and os.name == "nt":
+                        try:
+                            os.system(f'explorer /select,"{p}"')
+                            return
+                        except Exception:
+                            pass
+        # fallback: open folder from first selected
         rec = self._selected_record()
         if not rec:
             messagebox.showinfo("提示", "請先選擇一筆歷史紀錄")
@@ -740,6 +981,8 @@ class App(tk.Tk):
         self._open_folder(folder)
 
     def load_selected_to_hardcore(self):
+        if not self._ensure_single_selection("載入硬核視覺化"):
+            return
         rec = self._selected_record()
         if not rec:
             messagebox.showinfo("提示", "請先選擇一筆歷史紀錄")
@@ -753,6 +996,139 @@ class App(tk.Tk):
             messagebox.showinfo("載入成功", "成功載入至硬核視覺化")
         except Exception as e:
             messagebox.showerror("載入失敗", f"硬核視覺化載入失敗：\n{e}")
+
+    def _ensure_single_selection(self, action_name: str) -> bool:
+        sels = self.tree.selection()
+        if len(sels) > 1:
+            messagebox.showwarning("多選限制", f"{action_name} 只能單選，請只選擇一筆紀錄。")
+            return False
+        return True
+
+    def open_selected_zip(self):
+        if not self._ensure_single_selection("開啟輸出 zip"):
+            return
+        rec = self._selected_record()
+        if not rec:
+            messagebox.showinfo("提示", "請先選擇一筆歷史紀錄")
+            return
+        zp = rec.get("out_zip", "")
+        if not zp:
+            messagebox.showwarning("找不到輸出", "找不到輸出 zip。")
+            return
+        p = Path(zp)
+        if not p.exists():
+            messagebox.showwarning("找不到輸出", "輸出 zip 不存在。")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(p))
+                return
+        except Exception:
+            pass
+        # fallback: open folder and select the zip
+        try:
+            if os.name == "nt":
+                os.system(f'explorer /select,"{p}"')
+            else:
+                self._open_folder(p.parent)
+        except Exception:
+            self._open_folder(p.parent)
+
+    def _confirm_delete_dialog(self, count: int) -> Optional[bool]:
+        top = tk.Toplevel(self)
+        top.title("刪除確認")
+        top.resizable(False, False)
+        top.grab_set()
+
+        top.columnconfigure(0, weight=1)
+
+        msg = ttk.Label(
+            top,
+            text=f"即將刪除 {count} 筆歷史紀錄。\n此操作無法復原，是否繼續？",
+            justify="left"
+        )
+        msg.grid(row=0, column=0, sticky="w", padx=16, pady=(10, 6))
+
+        var_del_zip = tk.BooleanVar(value=False)
+        cb = ttk.Checkbutton(top, text="同時刪除對應的輸出 zip", variable=var_del_zip)
+        cb.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 6))
+
+        ret = {"ok": None}
+        btns = ttk.Frame(top)
+        btns.grid(row=2, column=0, sticky="e", padx=16, pady=(0, 10))
+        ttk.Button(btns, text="取消", command=lambda: _close(False)).pack(side="right")
+        ttk.Button(btns, text="刪除", command=lambda: _close(True)).pack(side="right", padx=8)
+
+        def _close(ok: bool):
+            ret["ok"] = ok
+            top.destroy()
+
+        # Center and size to content.
+        top.update_idletasks()
+        w = top.winfo_reqwidth()
+        h = top.winfo_reqheight()
+        x = self.winfo_rootx() + (self.winfo_width() - w) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - h) // 2
+        top.geometry(f"{w}x{h}+{x}+{y}")
+        top.minsize(w, h)
+        top.maxsize(w, h)
+
+        top.wait_window()
+        if ret["ok"] is None:
+            return None
+        return ret["ok"], bool(var_del_zip.get())
+
+    def delete_selected_history(self):
+        sels = self.tree.selection()
+        if not sels:
+            messagebox.showinfo("提示", "請先選擇要刪除的歷史紀錄")
+            return
+        confirm = self._confirm_delete_dialog(len(sels))
+        if not confirm:
+            return
+        ok, del_zip = confirm
+        if not ok:
+            return
+
+        items = read_history(100000)
+        selected_keys = set()
+        for sel in sels:
+            vals = self.tree.item(sel, "values")
+            if not vals:
+                continue
+            selected_keys.add((vals[0], vals[6], vals[7]))
+
+        kept = []
+        removed = []
+        for rec in items:
+            key = (rec.get("time", ""), rec.get("out_zip", ""), rec.get("run_dir", ""))
+            if key in selected_keys:
+                removed.append(rec)
+            else:
+                kept.append(rec)
+
+        # rewrite history
+        try:
+            HISTORY_PATH.write_text(
+                "\n".join(json.dumps(r, ensure_ascii=False) for r in kept) + ("\n" if kept else ""),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            messagebox.showerror("刪除失敗", f"無法更新歷史檔：{e}")
+            return
+
+        if del_zip:
+            for rec in removed:
+                zp = rec.get("out_zip", "")
+                if not zp:
+                    continue
+                try:
+                    Path(zp).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        self._load_history()
+        messagebox.showinfo("完成", f"已刪除 {len(removed)} 筆歷史紀錄。")
 
     # ---------------- open folder helper ----------------
     def _open_folder(self, folder: Path):

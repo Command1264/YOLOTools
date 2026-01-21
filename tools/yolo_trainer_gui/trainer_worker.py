@@ -10,7 +10,8 @@ from typing import Dict, Any, Optional, Tuple
 
 from dataset_prep import (
     extract_zip, find_data_yaml, filter_unlabeled_yolo_dataset,
-    zip_folder, remove_dir_safe, rewrite_data_yaml_to_extracted_root
+    zip_folder, remove_dir_safe, rewrite_data_yaml_to_extracted_root,
+    compute_dataset_manifest, manifest_matches, read_manifest, write_manifest
 )
 
 class ForceStop(Exception):
@@ -73,6 +74,18 @@ def read_prev_epoch_row(run_dir: Path) -> Optional[Dict[str, Any]]:
         return None
     return rows[-2]
 
+def read_last_epoch_row(run_dir: Path) -> Optional[Dict[str, Any]]:
+    csv_path = run_dir / "results.csv"
+    if not csv_path.exists():
+        return None
+    import csv
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    if not rows:
+        return None
+    return rows[-1]
+
 
 @dataclass
 class TrainConfig:
@@ -104,6 +117,8 @@ class TrainerWorker(threading.Thread):
         self._epoch_cur = 0
         self._batch_total = 0
         self._batch_cur = 0
+        self._batch_total_train = 0
+        self._batch_total_val = 0
         self._train_start_time = 0.0
         self._epoch_start_time = 0.0
         self._epoch_durations = []
@@ -142,6 +157,9 @@ class TrainerWorker(threading.Thread):
     def report_device(self, s: str):
         self.q.put(("device", s))
 
+    def force_stop_lock(self, locked: bool):
+        self.q.put(("force_stop_lock", locked))
+
     def _estimate_eta(self, avg_unit_sec: Optional[float], cur: int, total: int) -> Optional[float]:
         if avg_unit_sec is None or cur < 0 or total <= 0:
             return None
@@ -169,11 +187,30 @@ class TrainerWorker(threading.Thread):
             if model_dir:
                 model_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1) extract
-            self.status("解壓縮資料集 ...")
-            name_prefix = f"ds_{dataset_zip.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            extracted_root = extract_zip(dataset_zip, work_dir, name_prefix)
-            self.log(f"[{now_str()}] 解壓縮完成：{extracted_root}\n")
+            # 1) extract or reuse
+            name_prefix = f"ds_{dataset_zip.stem}"
+            extracted_root = work_dir / name_prefix
+            manifest_path = extracted_root / "_manifest.yaml"
+            reuse = False
+            if extracted_root.exists():
+                self.status("檢查資料集（可否重用） ...")
+                expect = read_manifest(manifest_path)
+                if expect and manifest_matches(extracted_root, expect):
+                    reuse = True
+                    self.log(f"[{now_str()}] 使用既有解壓資料：{extracted_root}\n")
+            if not reuse:
+                self.status("解壓縮資料集 ...")
+                self.force_stop_lock(True)
+                try:
+                    extracted_root = extract_zip(dataset_zip, work_dir, name_prefix)
+                    self.log(f"[{now_str()}] 解壓縮完成：{extracted_root}\n")
+                    try:
+                        manifest = compute_dataset_manifest(extracted_root)
+                        write_manifest(manifest_path, manifest)
+                    except Exception:
+                        pass
+                finally:
+                    self.force_stop_lock(False)
 
             # 2) find yaml
             data_yaml = find_data_yaml(extracted_root)
@@ -198,14 +235,18 @@ class TrainerWorker(threading.Thread):
 
             # 4) load model
             self.status("載入模型 ...")
+            self.force_stop_lock(True)
             model_path = cfg.model
             try:
                 if model_dir and not Path(cfg.model).expanduser().exists():
                     model_path = str(model_dir / Path(cfg.model).name)
             except Exception:
                 pass
-            model = YOLO(model_path)
-            self.log(f"[{now_str()}] 模型：{model_path}\n")
+            try:
+                model = YOLO(model_path)
+                self.log(f"[{now_str()}] 模型：{model_path}\n")
+            finally:
+                self.force_stop_lock(False)
 
             # 5) callbacks
             # NOTE: callback events list can be seen via get_default_callbacks() in docs. :contentReference[oaicite:6]{index=6}
@@ -243,11 +284,14 @@ class TrainerWorker(threading.Thread):
 
             def on_train_epoch_start(trainer):
                 stop_if_needed(trainer)
+                self.status("訓練中 ...")
                 # try update batch_total for this epoch
                 try:
-                    self._batch_total = len(trainer.train_loader)
+                    self._batch_total_train = len(trainer.train_loader)
                 except Exception:
-                    self._batch_total = 0
+                    self._batch_total_train = 0
+                self._batch_total_val = 0
+                self._batch_total = self._batch_total_train
                 self._batch_cur = 0
                 self._epoch_start_time = time.time()
                 self._batch_durations = []
@@ -255,7 +299,39 @@ class TrainerWorker(threading.Thread):
                 if self._batch_total > 0:
                     self.progress_batch_eta(0, self._batch_total, None)
 
+            def on_val_start(trainer):
+                stop_if_needed(trainer)
+                # include validation batches in total
+                try:
+                    v_loader = getattr(trainer, "validator", None)
+                    if v_loader is not None and getattr(v_loader, "dataloader", None) is not None:
+                        self._batch_total_val = len(v_loader.dataloader)
+                    elif getattr(trainer, "val_loader", None) is not None:
+                        self._batch_total_val = len(trainer.val_loader)
+                except Exception:
+                    self._batch_total_val = 0
+                self._batch_total = self._batch_total_train + self._batch_total_val
+                if self._batch_total > 0:
+                    self.progress_batch_eta(self._batch_cur, self._batch_total, None)
+
             def on_train_batch_end(trainer):
+                stop_if_needed(trainer)
+                if self._batch_total > 0:
+                    now = time.time()
+                    if self._last_batch_end_time > 0:
+                        self._batch_durations.append(now - self._last_batch_end_time)
+                        if len(self._batch_durations) > 50:
+                            self._batch_durations = self._batch_durations[-50:]
+                    self._last_batch_end_time = now
+                    self._batch_cur += 1
+                    avg_batch = (sum(self._batch_durations) / len(self._batch_durations)) if self._batch_durations else None
+                    self.progress_batch_eta(
+                        self._batch_cur,
+                        self._batch_total,
+                        self._estimate_eta(avg_batch, self._batch_cur, self._batch_total),
+                    )
+
+            def on_val_batch_end(trainer):
                 stop_if_needed(trainer)
                 if self._batch_total > 0:
                     now = time.time()
@@ -286,26 +362,29 @@ class TrainerWorker(threading.Thread):
                 self.progress_epoch_eta(ep, self._epoch_total, self._estimate_eta(avg_epoch, ep, self._epoch_total))
                 try:
                     run_dir = Path(getattr(trainer, "save_dir", ""))
-                    prev_row = read_prev_epoch_row(run_dir) if run_dir else None
-                    self.q.put(("prev_epoch_metrics", prev_row))
+                    last_row = read_last_epoch_row(run_dir) if run_dir else None
+                    self.q.put(("prev_epoch_metrics", last_row))
                 except Exception:
                     pass
 
             def on_train_end(trainer):
-                self.progress_epoch_eta(self._epoch_total, self._epoch_total, 0.0)
+                # Do not force ETA to 0 here; UI will clear when training fully stops.
+                pass
 
             # attach callbacks (best-effort)
             try:
                 model.add_callback("on_train_start", on_train_start)
                 model.add_callback("on_train_epoch_start", on_train_epoch_start)
                 model.add_callback("on_train_batch_end", on_train_batch_end)
+                model.add_callback("on_val_start", on_val_start)
+                model.add_callback("on_val_batch_end", on_val_batch_end)
                 model.add_callback("on_train_epoch_end", on_train_epoch_end)
                 model.add_callback("on_train_end", on_train_end)
             except Exception:
                 self.log(f"[{now_str()}] 警告：此 ultralytics 版本不支援 add_callback，進度/停止可能較不完整。\n")
 
             # 6) train kwargs
-            self.status("訓練中 ...")
+            self.status("準備中 ...")
             run_name = f"{cfg.task}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             train_kwargs = dict(
                 data=str(data_yaml) if cfg.task != "classify" else str(extracted_root),  # classify often uses folder structure
@@ -363,7 +442,7 @@ class TrainerWorker(threading.Thread):
             zip_folder(run_dir, out_zip_path, self.log)
 
             # 10) optional delete temp dataset extraction
-            if cfg.delete_temp:
+            if cfg.delete_temp and not (self.stop_requested or self.force_stop_requested):
                 self.status("清理暫存 ...")
                 remove_dir_safe(extracted_root, self.log)
 
@@ -414,7 +493,7 @@ class TrainerWorker(threading.Thread):
                 except Exception:
                     out_zip_path = ""
 
-            if cfg.delete_temp and extracted_root:
+            if cfg.delete_temp and extracted_root and not (self.stop_requested or self.force_stop_requested):
                 remove_dir_safe(Path(extracted_root), self.log)
 
             payload = {

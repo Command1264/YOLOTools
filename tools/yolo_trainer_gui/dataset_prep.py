@@ -5,6 +5,7 @@ import shutil
 import zipfile
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
+import hashlib
 
 import yaml
 
@@ -25,6 +26,49 @@ def extract_zip(zip_path: Path, out_dir: Path, name_prefix: str) -> Path:
     if len(entries) == 1 and entries[0].is_dir():
         return entries[0]
     return root
+
+def _iter_files_for_hash(root: Path) -> List[Path]:
+    out = []
+    for p in root.rglob("*"):
+        if p.is_file():
+            out.append(p)
+    return out
+
+def _hash_file_list(paths: List[Path]) -> str:
+    h = hashlib.sha256()
+    for p in sorted(paths, key=lambda x: str(x).lower()):
+        try:
+            rel = str(p).replace("\\", "/")
+            h.update(rel.encode("utf-8", errors="ignore"))
+            h.update(str(p.stat().st_size).encode("utf-8"))
+        except Exception:
+            continue
+    return h.hexdigest()
+
+def compute_dataset_manifest(root: Path) -> Dict[str, Any]:
+    files = _iter_files_for_hash(root)
+    return {
+        "file_count": len(files),
+        "hash": _hash_file_list(files),
+    }
+
+def manifest_matches(root: Path, expected: Dict[str, Any]) -> bool:
+    try:
+        cur = compute_dataset_manifest(root)
+        return cur.get("file_count") == expected.get("file_count") and cur.get("hash") == expected.get("hash")
+    except Exception:
+        return False
+
+def write_manifest(path: Path, data: Dict[str, Any]) -> None:
+    path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+def read_manifest(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 def find_data_yaml(root: Path) -> Optional[Path]:
     for p in (root / "data.yaml", root / "data.yml"):
