@@ -257,6 +257,101 @@ class TrainerWorker(threading.Thread):
                 if self.stop_requested:
                     setattr(trainer, "stop", True)
 
+            def format_device_label(dev_hint: Optional[str], trainer_obj=None) -> Optional[str]:
+                dev = (dev_hint or "").strip()
+                actual = None
+                if trainer_obj is not None:
+                    try:
+                        model_obj = getattr(trainer_obj, "model", None)
+                        if model_obj is not None:
+                            param = next(iter(model_obj.parameters()))
+                            actual = str(param.device)
+                    except Exception:
+                        actual = None
+                if actual:
+                    dev = actual
+                if not dev:
+                    return None
+                try:
+                    import torch
+                    if dev.lower().startswith("cpu"):
+                        cpu_name = ""
+                        try:
+                            import os
+                            if os.name == "nt":
+                                import subprocess
+                                out = subprocess.check_output(
+                                    [
+                                        "powershell",
+                                        "-NoProfile",
+                                        "-Command",
+                                        "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)"
+                                    ],
+                                    text=True,
+                                    stderr=subprocess.DEVNULL
+                                )
+                                cpu_name = out.strip()
+                        except Exception:
+                            cpu_name = ""
+                        if not cpu_name:
+                            try:
+                                import os
+                                if os.name == "nt":
+                                    import subprocess
+                                    out = subprocess.check_output(
+                                        ["wmic", "cpu", "get", "name"], text=True, stderr=subprocess.DEVNULL
+                                    )
+                                    lines = [l.strip() for l in out.splitlines() if l.strip()]
+                                    if len(lines) >= 2:
+                                        cpu_name = lines[1]
+                            except Exception:
+                                cpu_name = ""
+                        if not cpu_name:
+                            try:
+                                import platform
+                                cpu_name = platform.processor() or ""
+                                if not cpu_name:
+                                    cpu_name = platform.uname().processor or ""
+                            except Exception:
+                                cpu_name = ""
+                        if not cpu_name:
+                            try:
+                                import os
+                                cpu_name = os.environ.get("PROCESSOR_IDENTIFIER", "") or ""
+                            except Exception:
+                                cpu_name = ""
+                        if cpu_name:
+                            return f"cpu({cpu_name})"
+                        return "cpu"
+
+                    if torch.cuda.is_available():
+                        idxs = []
+                        if dev.startswith("cuda:"):
+                            parts = dev.split(":", 1)[1].split(",")
+                            for p in parts:
+                                p = p.strip()
+                                if p.isdigit():
+                                    idxs.append(int(p))
+                        elif dev.replace(",", "").isdigit():
+                            for p in dev.split(","):
+                                p = p.strip()
+                                if p.isdigit():
+                                    idxs.append(int(p))
+                        if not idxs:
+                            idxs = [torch.cuda.current_device()]
+                        names = []
+                        for i in idxs:
+                            try:
+                                names.append(torch.cuda.get_device_name(i))
+                            except Exception:
+                                names.append("unknown")
+                        idxs_txt = ",".join(str(i) for i in idxs)
+                        names_txt = "; ".join(names)
+                        return f"cuda:{idxs_txt}({names_txt})"
+                except Exception:
+                    return dev
+                return dev
+
             def on_train_start(trainer):
                 self._train_start_time = time.time()
                 self._epoch_start_time = self._train_start_time
@@ -277,14 +372,18 @@ class TrainerWorker(threading.Thread):
                         dev = str(getattr(trainer, "args", None).device)
                     except Exception:
                         dev = None
-                if dev:
-                    self.report_device(dev)
+                dev_label = format_device_label(dev, trainer)
+                if dev_label:
+                    self.report_device(dev_label)
                 self._epoch_cur = 0
                 self.progress_epoch_eta(0, self._epoch_total, None)
 
             def on_train_epoch_start(trainer):
                 stop_if_needed(trainer)
                 self.status("訓練中 ...")
+                dev_label = format_device_label(None, trainer)
+                if dev_label:
+                    self.report_device(dev_label)
                 # try update batch_total for this epoch
                 try:
                     self._batch_total_train = len(trainer.train_loader)
@@ -396,8 +495,61 @@ class TrainerWorker(threading.Thread):
                 exist_ok=False,
                 verbose=True,
             )
-            if cfg.device.strip():
-                train_kwargs["device"] = cfg.device.strip()
+            device_arg = cfg.device.strip()
+            try:
+                import torch
+                cuda_ok = torch.cuda.is_available()
+                device_count = torch.cuda.device_count() if cuda_ok else 0
+
+                def parse_device_indices(text: str):
+                    if not text:
+                        return []
+                    if text.startswith("cuda:"):
+                        text = text.split(":", 1)[1]
+                    if not text:
+                        return []
+                    idxs = []
+                    for p in text.split(","):
+                        p = p.strip()
+                        if p.isdigit():
+                            idxs.append(int(p))
+                    return idxs
+
+                def normalize_device_arg(text: str) -> str:
+                    if not text:
+                        return "cuda:0" if device_count > 0 else "cpu"
+                    if text.lower() == "cpu":
+                        return "cpu"
+                    if device_count <= 0:
+                        return "cpu"
+                    idxs = parse_device_indices(text)
+                    if not idxs:
+                        return "cuda:0"
+                    valid = []
+                    seen = set()
+                    for i in idxs:
+                        if 0 <= i < device_count and i not in seen:
+                            seen.add(i)
+                            valid.append(i)
+                    if not valid:
+                        return "cuda:0"
+                    return "cuda:" + ",".join(str(i) for i in valid)
+
+                normalized = normalize_device_arg(device_arg)
+                if device_arg and device_arg != normalized:
+                    dev_in = device_arg.strip().lower()
+                    dev_norm = normalized.strip().lower()
+                    if dev_in in ("0", "cuda:0") and dev_norm == "cuda:0":
+                        device_arg = normalized
+                    elif normalized == "cpu":
+                        self.log(f"[{now_str()}] device 設定不可用，已改用 CPU。\n")
+                    elif normalized.startswith("cuda:"):
+                        self.log(f"[{now_str()}] device 設定不可用，已改用 {normalized}。\n")
+                device_arg = normalized
+            except Exception:
+                pass
+            if device_arg:
+                train_kwargs["device"] = device_arg
             if cfg.resume:
                 train_kwargs["resume"] = True  # supports resume in cfg. :contentReference[oaicite:8]{index=8}
 
