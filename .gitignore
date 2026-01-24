@@ -9,7 +9,7 @@ dist
 install
 models
 TaichungFireYoloEnv
-tainingData
+trainingData
 workdir
 output_zips
 *.pt
