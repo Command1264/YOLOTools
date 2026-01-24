@@ -8,6 +8,10 @@ from typing import List, Dict, Optional
 import requests
 
 DEFAULT_FALLBACK = [
+    # Legacy
+    "yolov3.pt", "yolov3-spp.pt", "yolov3-tiny.pt",
+    "yolov5n.pt", "yolov5s.pt", "yolov5m.pt", "yolov5l.pt", "yolov5x.pt",
+    "yolov7.pt", "yolov7-tiny.pt", "yolov7x.pt",
     # Detect (common)
     "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
     "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
@@ -22,10 +26,25 @@ DEFAULT_FALLBACK = [
     "yolo11n-obb.pt", "yolo11s-obb.pt", "yolo11m-obb.pt", "yolo11l-obb.pt", "yolo11x-obb.pt",
     # Cls (common naming)
     "yolov8n-cls.pt", "yolov8s-cls.pt", "yolov8m-cls.pt", "yolov8l-cls.pt", "yolov8x-cls.pt",
+    "yolo11n-cls.pt", "yolo11s-cls.pt", "yolo11m-cls.pt", "yolo11l-cls.pt", "yolo11x-cls.pt",
+    "yolov5n-cls.pt", "yolov5s-cls.pt", "yolov5m-cls.pt", "yolov5l-cls.pt", "yolov5x-cls.pt",
+    # Legacy Seg
+    "yolov5n-seg.pt", "yolov5s-seg.pt", "yolov5m-seg.pt", "yolov5l-seg.pt", "yolov5x-seg.pt",
 ]
 
 DOCS_MODELS_URL = "https://docs.ultralytics.com/models/"  # lists supported families
 GITHUB_README_URL = "https://raw.githubusercontent.com/ultralytics/ultralytics/main/README.md"
+
+def _merge_weights(primary: List[str], extra: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for w in list(primary) + list(extra):
+        key = w.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(w)
+    return out
 
 
 def _extract_pt_names(text: str) -> List[str]:
@@ -61,7 +80,7 @@ def load_weights(cache_path: Path) -> List[str]:
         try:
             data = json.loads(cache_path.read_text(encoding="utf-8"))
             if isinstance(data, list) and data:
-                return data
+                return _merge_weights(data, DEFAULT_FALLBACK)
         except Exception:
             pass
     return DEFAULT_FALLBACK[:]
@@ -78,9 +97,10 @@ def get_weights(cache_path: Path, try_online: bool = True) -> Dict[str, List[str
     if try_online:
         try:
             w = fetch_ultralytics_weights_online()
-            if len(w) >= 10:
-                save_weights(cache_path, w)
-                return {"weights": w, "source": "online"}
+            merged = _merge_weights(w, DEFAULT_FALLBACK)
+            if len(merged) >= 10:
+                save_weights(cache_path, merged)
+                return {"weights": merged, "source": "online"}
         except Exception:
             pass
 
@@ -125,6 +145,11 @@ def filter_weights_by_task(weights: list[str], task: str) -> list[str]:
 
 _SIZE_ORDER = {"n": 0, "s": 1, "m": 2, "l": 3, "x": 4}
 
+def _family_sort_key(name: str):
+    m = re.search(r"(\d+)", name)
+    num = int(m.group(1)) if m else -1
+    return (num, name)
+
 def _size_rank(name: str) -> int:
     base = Path(name).name.lower()
     if base.endswith(".pt"):
@@ -137,3 +162,54 @@ def _size_rank(name: str) -> int:
 
 def _sort_weights_small_to_large(weights: List[str]) -> List[str]:
     return sorted(weights, key=lambda w: (_size_rank(w), w.lower()))
+
+
+def parse_weight_meta(weight: str) -> Dict[str, str]:
+    base = Path(weight).name.lower()
+    if base.endswith(".pt"):
+        base = base[:-3]
+    task = infer_task_from_weight_name(weight)
+    token = base.split("-")[0]
+    size = ""
+    family = token
+    if token:
+        last = token[-1]
+        if last in _SIZE_ORDER:
+            size = last
+            family = token[:-1]
+    return {"task": task, "family": family, "size": size}
+
+
+def list_model_families(weights: list[str], task: str) -> list[str]:
+    task_weights = filter_weights_by_task(weights, task)
+    families = []
+    for w in task_weights:
+        fam = parse_weight_meta(w)["family"]
+        if fam:
+            families.append(fam)
+    return sorted(set(families), key=_family_sort_key)
+
+
+def list_model_sizes(weights: list[str], task: str, family: str = "") -> list[str]:
+    task_weights = filter_weights_by_task(weights, task)
+    fam = family.lower().strip()
+    if fam:
+        task_weights = [w for w in task_weights if parse_weight_meta(w)["family"] == fam]
+    sizes = []
+    for w in task_weights:
+        size = parse_weight_meta(w)["size"]
+        if size:
+            sizes.append(size)
+    return sorted(set(sizes), key=lambda s: _SIZE_ORDER.get(s, 99))
+
+
+def filter_weights(weights: list[str], task: str, family: str = "", size: str = "") -> list[str]:
+    task_weights = filter_weights_by_task(weights, task)
+    out = task_weights
+    fam = family.lower().strip()
+    sz = size.lower().strip()
+    if fam:
+        out = [w for w in out if parse_weight_meta(w)["family"] == fam]
+    if sz:
+        out = [w for w in out if parse_weight_meta(w)["size"] == sz]
+    return _sort_weights_small_to_large(out if out else task_weights)

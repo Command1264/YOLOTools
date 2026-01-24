@@ -13,7 +13,12 @@ from typing import Dict, Any, Optional
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from model_registry import get_weights, filter_weights_by_task
+from model_registry import (
+    get_weights,
+    list_model_families,
+    list_model_sizes,
+    filter_weights,
+)
 from trainer_worker import TrainConfig, TrainerWorker
 from hardcore_view import HardcorePanel
 
@@ -21,23 +26,66 @@ APP_DIR = Path(__file__).resolve().parent
 CACHE_WEIGHTS = APP_DIR / "weights_cache.json"
 HISTORY_PATH = APP_DIR / "train_history.jsonl"
 CONFIG_PATH = APP_DIR / "trainer_config.json"
+ALL_OPTION = "全部"
 
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def default_dialog_dir(last_path: str) -> str:
+def normalize_path(path_str: str) -> str:
+    if not path_str:
+        return ""
+    try:
+        return Path(path_str).as_posix()
+    except Exception:
+        return path_str.replace("\\", "/")
+
+
+def _norm_weight_name(name: str) -> str:
+    if not name:
+        return ""
+    return name.strip().lower()
+
+
+def merge_weight_values(values: list[str], keep: str) -> list[str]:
+    if not keep:
+        return values
+    keep_norm = _norm_weight_name(keep)
+    for v in values:
+        if _norm_weight_name(v) == keep_norm:
+            return values
+    return [keep] + values
+
+
+def normalize_filter_value(value: str) -> str:
+    if not value:
+        return ""
+    v = value.strip()
+    if not v:
+        return ""
+    if v.lower() == "all" or v == ALL_OPTION:
+        return ""
+    return v
+
+
+def default_dialog_dir(last_path: str, current_path: str = "") -> str:
     """
     Rule:
-    - if no selection => open APP_DIR
-    - if has selection => open selected path (folder if folder, parent if file)
+    - prefer last selection, fallback to current value
+    - open selected path (folder if folder, parent if file)
+    - if target not exists, try its parent
+    - if none, open APP_DIR
     """
-    if not last_path:
-        return str(APP_DIR)
-    p = Path(last_path)
-    if p.exists():
-        return str(p if p.is_dir() else p.parent)
+    for candidate in [last_path, current_path]:
+        if not candidate:
+            continue
+        p = Path(candidate)
+        if p.exists():
+            return str(p if p.is_dir() else p.parent)
+        parent = p.parent
+        if parent.exists():
+            return str(parent)
     return str(APP_DIR)
 
 
@@ -86,6 +134,7 @@ class App(tk.Tk):
         self._last_batch_progress = (0, 1)
         self._loading_config = False
         self._force_stop_locked = False
+        self._updating_model_filters = False
         self.var_epoch_summary = tk.StringVar(value="(尚未訓練)")
         self._metrics_log = ""
 
@@ -100,17 +149,19 @@ class App(tk.Tk):
         self.bind("<Configure>", self._on_resize)
         self._bind_config_traces()
         self._bind_eta_decimal_trace()
+        self.var_use_custom_model.trace_add("write", lambda *args: self._sync_model_mode())
 
         self._load_config()
+        self._sync_last_paths()
+        self._sync_model_mode()
 
         # load model list (try online first)
         self._load_weights(try_online=True)
 
-        # apply task filter once after weights loaded
-        self._apply_task_filter()
-
-        # trace task changes -> re-filter
-        self.var_task.trace_add("write", lambda *args: self._apply_task_filter())
+        # trace filter changes -> re-filter
+        self.var_task.trace_add("write", lambda *args: self._apply_model_filters())
+        self.var_model_family.trace_add("write", lambda *args: self._apply_model_filters())
+        self.var_model_size.trace_add("write", lambda *args: self._apply_model_filters())
 
         self._load_history()
         self._poll_queue()
@@ -155,21 +206,86 @@ class App(tk.Tk):
         nb.add(self.tab_hardcore, text="硬核視覺化")
 
         # -------- Train Tab --------
-        frm = ttk.Frame(self.tab_train, padding=12)
-        frm.pack(fill="both", expand=True)
+        train_container = ttk.Frame(self.tab_train)
+        train_container.pack(fill="both", expand=True)
+        self._train_canvas = tk.Canvas(train_container, highlightthickness=0)
+        self._train_scrollbar = ttk.Scrollbar(
+            train_container, orient="vertical", command=self._train_canvas.yview
+        )
+        self._train_canvas.configure(yscrollcommand=self._train_scrollbar.set)
+        self._train_scrollbar.pack(side="right", fill="y")
+        self._train_canvas.pack(side="left", fill="both", expand=True)
+        frm = ttk.Frame(self._train_canvas, padding=12)
+        self._train_content = frm
+        self._train_canvas_window = self._train_canvas.create_window((0, 0), window=frm, anchor="nw")
+        self._train_canvas.bind("<Configure>", self._on_train_canvas_configure)
+        frm.bind("<Configure>", self._on_train_frame_configure)
+        self._bind_train_mousewheel()
 
         r = 0
-        ttk.Label(frm, text="任務（Task）：").grid(row=r, column=0, sticky="w", pady=6)
+        model_box = ttk.LabelFrame(frm, text="模型選擇", padding=10)
+        model_box.grid(row=r, column=0, columnspan=3, sticky="we", pady=6)
+        model_box.columnconfigure(1, weight=1)
+        model_box.columnconfigure(3, weight=1)
+        self._model_box = model_box
+
         self.var_task = tk.StringVar(value="detect")
-        cmb_task = ttk.Combobox(
-            frm,
+        self.var_model_family = tk.StringVar(value=ALL_OPTION)
+        self.var_model_size = tk.StringVar(value=ALL_OPTION)
+
+        ttk.Label(model_box, text="任務").grid(row=0, column=0, sticky="w")
+        self.cmb_task = ttk.Combobox(
+            model_box,
             textvariable=self.var_task,
             state="readonly",
-            values=["detect", "segment", "classify", "pose", "obb"]
+            values=["detect", "segment", "classify", "pose", "obb"],
+            width=12,
         )
-        cmb_task.grid(row=r, column=1, sticky="we", padx=8)
-        ttk.Button(frm, text="更新官方模型清單（線上）", command=lambda: self._load_weights(True)).grid(
-            row=r, column=2, sticky="e"
+        self.cmb_task.grid(row=0, column=1, sticky="we", padx=6)
+
+        ttk.Label(model_box, text="版本").grid(row=0, column=2, sticky="w")
+        self.cmb_model_family = ttk.Combobox(
+            model_box,
+            textvariable=self.var_model_family,
+            state="readonly",
+            width=12,
+        )
+        self.cmb_model_family.grid(row=0, column=3, sticky="we", padx=6)
+
+        ttk.Label(model_box, text="大小").grid(row=0, column=4, sticky="w")
+        self.cmb_model_size = ttk.Combobox(
+            model_box,
+            textvariable=self.var_model_size,
+            state="readonly",
+            width=6,
+        )
+        self.cmb_model_size.grid(row=0, column=5, sticky="w", padx=6)
+
+        self.btn_update_models = ttk.Button(
+            model_box, text="更新官方模型清單（線上）", command=lambda: self._load_weights(True)
+        )
+        self.btn_update_models.grid(
+            row=0, column=6, sticky="e"
+        )
+
+        ttk.Label(model_box, text="模型").grid(row=1, column=0, sticky="w", pady=6)
+        self.var_model_pick = tk.StringVar()
+        self.cmb_model = ttk.Combobox(model_box, textvariable=self.var_model_pick)
+        self.cmb_model.grid(row=1, column=1, columnspan=5, sticky="we", padx=6)
+        self.var_model_source = tk.StringVar(value="(尚未載入)")
+        ttk.Label(model_box, textvariable=self.var_model_source).grid(row=1, column=6, sticky="e")
+
+        ttk.Label(model_box, text="自訂權重").grid(row=2, column=0, sticky="w", pady=6)
+        self.var_use_custom_model = tk.BooleanVar(value=False)
+        self.var_custom_model = tk.StringVar()
+        custom_row = ttk.Frame(model_box)
+        custom_row.grid(row=2, column=1, columnspan=5, sticky="we", padx=6, pady=6)
+        self.ent_custom_model = ttk.Entry(custom_row, textvariable=self.var_custom_model)
+        self.ent_custom_model.pack(side="left", fill="x", expand=True)
+        self.btn_pick_custom_model = ttk.Button(custom_row, text="選擇...", command=self.pick_custom_model)
+        self.btn_pick_custom_model.pack(side="left", padx=6)
+        ttk.Checkbutton(model_box, text="使用自訂權重", variable=self.var_use_custom_model).grid(
+            row=2, column=6, sticky="e"
         )
 
         r += 1
@@ -180,44 +296,27 @@ class App(tk.Tk):
 
         r += 1
         ttk.Label(frm, text="訓練工作資料夾（解壓縮/訓練模型）：").grid(row=r, column=0, sticky="w", pady=6)
-        self.var_work_dir = tk.StringVar(value=str(APP_DIR / "workdir"))
+        self.var_work_dir = tk.StringVar(value=normalize_path(str(APP_DIR / "workdir")))
         ttk.Entry(frm, textvariable=self.var_work_dir).grid(row=r, column=1, sticky="we", padx=8)
         ttk.Button(frm, text="選擇...", command=self.pick_work_dir).grid(row=r, column=2, sticky="e")
 
         r += 1
         ttk.Label(frm, text="輸出 zip 存放資料夾：").grid(row=r, column=0, sticky="w", pady=6)
-        self.var_out_zip_dir = tk.StringVar(value=str(APP_DIR / "output_zips"))
+        self.var_out_zip_dir = tk.StringVar(value=normalize_path(str(APP_DIR / "output_zips")))
         ttk.Entry(frm, textvariable=self.var_out_zip_dir).grid(row=r, column=1, sticky="we", padx=8)
         ttk.Button(frm, text="選擇...", command=self.pick_out_zip_dir).grid(row=r, column=2, sticky="e")
 
         r += 1
-        ttk.Label(frm, text="模型（依 Task 過濾後清單）：").grid(row=r, column=0, sticky="w", pady=6)
-        self.var_model_pick = tk.StringVar()
-        self.cmb_model = ttk.Combobox(frm, textvariable=self.var_model_pick)
-        self.cmb_model.grid(row=r, column=1, sticky="we", padx=8)
-        self.var_model_source = tk.StringVar(value="(尚未載入)")
-        ttk.Label(frm, textvariable=self.var_model_source).grid(row=r, column=2, sticky="e")
-
-        r += 1
         ttk.Label(frm, text="模型存放資料夾(下載/快取)").grid(row=r, column=0, sticky="w", pady=6)
-        self.var_model_dir = tk.StringVar(value=str(APP_DIR / "models"))
+        self.var_model_dir = tk.StringVar(value=normalize_path(str(APP_DIR / "models")))
         ttk.Entry(frm, textvariable=self.var_model_dir).grid(row=r, column=1, sticky="we", padx=8)
         ttk.Button(frm, text="選擇...", command=self.pick_model_dir).grid(row=r, column=2, sticky="e")
-
-        r += 1
-        ttk.Label(frm, text="或自訂權重（.pt）：").grid(row=r, column=0, sticky="w", pady=6)
-        self.var_use_custom_model = tk.BooleanVar(value=False)
-        self.var_custom_model = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.var_custom_model).grid(row=r, column=1, sticky="we", padx=8)
-        ttk.Checkbutton(frm, text="使用自訂權重", variable=self.var_use_custom_model).grid(row=r, column=2, sticky="e")
-
-        r += 1
-        ttk.Button(frm, text="選擇...", command=self.pick_custom_model).grid(row=r, column=1, sticky="w", padx=8)
 
         # Params
         r += 1
         box = ttk.LabelFrame(frm, text="訓練參數", padding=10)
         box.grid(row=r, column=0, columnspan=3, sticky="we", pady=10)
+        self._train_params_box = box
 
         self.var_epochs = tk.IntVar(value=50)
         self.var_imgsz = tk.IntVar(value=640)
@@ -265,6 +364,7 @@ class App(tk.Tk):
         r += 1
         pb = ttk.LabelFrame(frm, text="進度", padding=10)
         pb.grid(row=r, column=0, columnspan=3, sticky="we", pady=8)
+        self._progress_box = pb
 
         self.var_ep_text = tk.StringVar(value="Epoch: 0/0")
         self.var_ba_text = tk.StringVar(value="Batch: 0/0")
@@ -282,14 +382,14 @@ class App(tk.Tk):
         paned_metrics_log.grid(row=r, column=0, columnspan=3, sticky="nsew", pady=8)
 
         mb = ttk.LabelFrame(paned_metrics_log, text="上一輪指標 / 每輪摘要", padding=10)
-        self.txt_metrics = tk.Text(mb, height=8, wrap="word")
+        self.txt_metrics = tk.Text(mb, height=5, wrap="word")
         self.txt_metrics.pack(side="left", fill="both", expand=True)
         sbm = ttk.Scrollbar(mb, command=self.txt_metrics.yview)
         sbm.pack(side="right", fill="y")
         self.txt_metrics.configure(yscrollcommand=sbm.set)
 
         lb = ttk.LabelFrame(paned_metrics_log, text="Log", padding=10)
-        self.txt_log = tk.Text(lb, height=3, wrap="word")
+        self.txt_log = tk.Text(lb, height=5, wrap="word")
         self.txt_log.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(lb, command=self.txt_log.yview)
         sb.pack(side="right", fill="y")
@@ -297,8 +397,10 @@ class App(tk.Tk):
 
         paned_metrics_log.add(mb)
         paned_metrics_log.add(lb)
-        paned_metrics_log.paneconfigure(lb, minsize=60)
         self._metrics_log_paned = paned_metrics_log
+        self._metrics_box = mb
+        self._log_box = lb
+        self.after(0, self._configure_metrics_panes)
 
         frm.grid_columnconfigure(1, weight=1)
         frm.grid_rowconfigure(r, weight=1)
@@ -356,6 +458,142 @@ class App(tk.Tk):
         self.hardcore_panel = HardcorePanel(hp)
         self.hardcore_panel.pack(fill="both", expand=True)
 
+    def _configure_metrics_panes(self):
+        if not getattr(self, "_metrics_log_paned", None):
+            return
+        try:
+            self.update_idletasks()
+            min_metrics = max(80, self.txt_metrics.winfo_reqheight())
+            min_log = max(80, self.txt_log.winfo_reqheight())
+            self._metrics_log_paned.paneconfigure(
+                self._metrics_box, minsize=min_metrics, stretch="always"
+            )
+            self._metrics_log_paned.paneconfigure(
+                self._log_box, minsize=min_log, stretch="never"
+            )
+        except Exception:
+            return
+
+    def _sync_model_mode(self):
+        use_custom = bool(self.var_use_custom_model.get())
+        if use_custom:
+            self.cmb_task.configure(state="disabled")
+            self.cmb_model_family.configure(state="disabled")
+            self.cmb_model_size.configure(state="disabled")
+            self.cmb_model.configure(state="disabled")
+            self.btn_update_models.configure(state="disabled")
+            self.ent_custom_model.configure(state="normal")
+            self.btn_pick_custom_model.configure(state="normal")
+        else:
+            self.cmb_task.configure(state="readonly")
+            self.cmb_model_family.configure(state="readonly")
+            self.cmb_model_size.configure(state="readonly")
+            self.cmb_model.configure(state="normal")
+            self.btn_update_models.configure(state="normal")
+            self.ent_custom_model.configure(state="disabled")
+            self.btn_pick_custom_model.configure(state="disabled")
+
+    def _on_train_canvas_configure(self, event):
+        try:
+            self._train_canvas.itemconfigure(self._train_canvas_window, width=event.width)
+        except Exception:
+            return
+        try:
+            if getattr(self, "_train_content", None):
+                req_h = self._train_content.winfo_reqheight()
+                self._train_canvas.itemconfigure(
+                    self._train_canvas_window, height=max(event.height, req_h)
+                )
+        except Exception:
+            pass
+        self._update_train_scrollbar()
+
+    def _on_train_frame_configure(self, _event):
+        if not getattr(self, "_train_canvas", None):
+            return
+        self._train_canvas.configure(scrollregion=self._train_canvas.bbox("all"))
+        self._update_train_scrollbar()
+
+    def _update_train_scrollbar(self):
+        canvas = getattr(self, "_train_canvas", None)
+        scrollbar = getattr(self, "_train_scrollbar", None)
+        frame = getattr(self, "_train_content", None)
+        if not canvas or not scrollbar or not frame:
+            return
+        canvas.update_idletasks()
+        need = frame.winfo_reqheight() > canvas.winfo_height()
+        if need:
+            if not scrollbar.winfo_ismapped():
+                scrollbar.pack(side="right", fill="y")
+            canvas.configure(yscrollcommand=scrollbar.set)
+        else:
+            if scrollbar.winfo_ismapped():
+                scrollbar.pack_forget()
+            canvas.configure(yscrollcommand=None)
+            canvas.yview_moveto(0)
+
+    def _bind_train_mousewheel(self):
+        if not getattr(self, "_train_canvas", None):
+            return
+        if os.name == "nt" or sys.platform == "darwin":
+            self._train_canvas.bind_all("<MouseWheel>", self._on_train_mousewheel)
+        else:
+            self._train_canvas.bind_all("<Button-4>", self._on_train_mousewheel)
+            self._train_canvas.bind_all("<Button-5>", self._on_train_mousewheel)
+
+    def _unbind_train_mousewheel(self):
+        if not getattr(self, "_train_canvas", None):
+            return
+        if os.name == "nt" or sys.platform == "darwin":
+            self._train_canvas.unbind_all("<MouseWheel>")
+        else:
+            self._train_canvas.unbind_all("<Button-4>")
+            self._train_canvas.unbind_all("<Button-5>")
+
+    def _on_train_mousewheel(self, event):
+        scrollbar = getattr(self, "_train_scrollbar", None)
+        if not scrollbar or not scrollbar.winfo_ismapped():
+            return
+        widget = event.widget
+        if isinstance(widget, tk.Text):
+            return
+        if isinstance(widget, ttk.Combobox) or self._widget_in_container(widget, self.cmb_model):
+            return
+        if not self._widget_in_container(widget, self._train_content):
+            return
+        target_boxes = [
+            getattr(self, "_model_box", None),
+            getattr(self, "_train_params_box", None),
+            getattr(self, "_progress_box", None),
+        ]
+        if any(self._widget_in_container(widget, box) for box in target_boxes if box):
+            self._scroll_train_canvas(event)
+            return
+        self._scroll_train_canvas(event)
+
+    def _scroll_train_canvas(self, event):
+        delta = 0
+        if os.name == "nt" or sys.platform == "darwin":
+            delta = -1 if event.delta > 0 else 1
+        else:
+            if event.num == 4:
+                delta = -1
+            elif event.num == 5:
+                delta = 1
+        if delta:
+            self._train_canvas.yview_scroll(delta, "units")
+
+    def _widget_in_container(self, widget, container) -> bool:
+        cur = widget
+        while cur is not None:
+            if cur == container:
+                return True
+            try:
+                cur = cur.master
+            except Exception:
+                break
+        return False
+
     # ---------------- model list ----------------
     def _load_weights(self, try_online: bool):
         info = get_weights(CACHE_WEIGHTS, try_online=try_online)
@@ -365,62 +603,90 @@ class App(tk.Tk):
         # 暫存「原始清單」到 self，以免 combobox values 已被過濾後越濾越少
         self._base_weights = list(w)
 
-        self.var_model_source.set(f"模型清單來源：{src}（已自動依 Task 過濾）")
-        self._apply_task_filter()
+        self.var_model_source.set(f"模型清單來源：{src}（已依 任務/版本/大小 過濾）")
+        self._apply_model_filters()
 
-    def _apply_task_filter(self):
-        # 永遠從 base weights 過濾
-        base = getattr(self, "_base_weights", None)
-        if not base:
-            info = get_weights(CACHE_WEIGHTS, try_online=False)
-            base = info["weights"]
-            self._base_weights = list(base)
+    def _apply_model_filters(self):
+        if getattr(self, "_updating_model_filters", False):
+            return
+        self._updating_model_filters = True
+        try:
+            # 永遠從 base weights 過濾
+            base = getattr(self, "_base_weights", None)
+            if not base:
+                info = get_weights(CACHE_WEIGHTS, try_online=False)
+                base = info["weights"]
+                self._base_weights = list(base)
 
-        task = self.var_task.get().strip()
-        filtered = filter_weights_by_task(list(base), task)
+            task = self.var_task.get().strip()
+            families = list_model_families(list(base), task)
+            family_values = [ALL_OPTION] + families
+            if self.var_model_family.get() not in family_values:
+                self.var_model_family.set(ALL_OPTION)
+            self.cmb_model_family["values"] = family_values
 
-        self.cmb_model["values"] = filtered
-        if filtered:
+            family = normalize_filter_value(self.var_model_family.get())
+            sizes = list_model_sizes(list(base), task, family)
+            size_values = [ALL_OPTION] + sizes
+            if self.var_model_size.get() not in size_values:
+                self.var_model_size.set(ALL_OPTION)
+            self.cmb_model_size["values"] = size_values
+
+            family = normalize_filter_value(self.var_model_family.get())
+            size = normalize_filter_value(self.var_model_size.get())
+            filtered = filter_weights(list(base), task, family, size)
+
             cur = self.var_model_pick.get().strip()
-            if cur not in filtered:
-                self.var_model_pick.set(filtered[0])
+            base_names = {_norm_weight_name(w) for w in base}
+            if cur and _norm_weight_name(cur) not in base_names:
+                filtered = merge_weight_values(filtered, cur)
+            self.cmb_model["values"] = filtered
+            if filtered:
+                if cur not in filtered:
+                    self.var_model_pick.set(filtered[0])
+        finally:
+            self._updating_model_filters = False
 
     # ---------------- file dialogs ----------------
     def pick_dataset_zip(self):
         p = filedialog.askopenfilename(
-            title="選擇 dataset.zip",
-            initialdir=default_dialog_dir(self.last_dataset_zip),
+            title="選擇資料集",
+            initialdir=default_dialog_dir(self.last_dataset_zip, self.var_dataset_zip.get()),
             filetypes=[("Zip files", "*.zip"), ("All files", "*.*")]
         )
         if p:
+            p = normalize_path(p)
             self.var_dataset_zip.set(p)
             self.last_dataset_zip = p
 
     def pick_work_dir(self):
         p = filedialog.askdirectory(
             title="選擇工作資料夾",
-            initialdir=default_dialog_dir(self.last_work_dir)
+            initialdir=default_dialog_dir(self.last_work_dir, self.var_work_dir.get())
         )
         if p:
+            p = normalize_path(p)
             self.var_work_dir.set(p)
             self.last_work_dir = p
 
     def pick_out_zip_dir(self):
         p = filedialog.askdirectory(
             title="選擇輸出 zip 資料夾",
-            initialdir=default_dialog_dir(self.last_out_zip_dir)
+            initialdir=default_dialog_dir(self.last_out_zip_dir, self.var_out_zip_dir.get())
         )
         if p:
+            p = normalize_path(p)
             self.var_out_zip_dir.set(p)
             self.last_out_zip_dir = p
 
     def pick_custom_model(self):
         p = filedialog.askopenfilename(
             title="選擇自訂模型 .pt",
-            initialdir=default_dialog_dir(self.last_custom_model),
+            initialdir=default_dialog_dir(self.last_custom_model, self.var_custom_model.get()),
             filetypes=[("PyTorch weights", "*.pt"), ("All files", "*.*")]
         )
         if p:
+            p = normalize_path(p)
             self.var_custom_model.set(p)
             self.last_custom_model = p
 
@@ -429,9 +695,10 @@ class App(tk.Tk):
     def pick_model_dir(self):
         p = filedialog.askdirectory(
             title="選擇模型資料夾",
-            initialdir=default_dialog_dir(self.last_model_dir)
+            initialdir=default_dialog_dir(self.last_model_dir, self.var_model_dir.get())
         )
         if p:
+            p = normalize_path(p)
             self.var_model_dir.set(p)
             self.last_model_dir = p
 
@@ -737,6 +1004,8 @@ class App(tk.Tk):
             self.var_work_dir,
             self.var_out_zip_dir,
             self.var_model_pick,
+            self.var_model_family,
+            self.var_model_size,
             self.var_model_dir,
             self.var_use_custom_model,
             self.var_custom_model,
@@ -758,13 +1027,21 @@ class App(tk.Tk):
             self._loading_config = True
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             self.var_task.set(data.get("task", self.var_task.get()))
-            self.var_dataset_zip.set(data.get("dataset_zip", self.var_dataset_zip.get()))
-            self.var_work_dir.set(data.get("work_dir", self.var_work_dir.get()))
-            self.var_out_zip_dir.set(data.get("out_zip_dir", self.var_out_zip_dir.get()))
+            self.var_dataset_zip.set(normalize_path(data.get("dataset_zip", self.var_dataset_zip.get())))
+            self.var_work_dir.set(normalize_path(data.get("work_dir", self.var_work_dir.get())))
+            self.var_out_zip_dir.set(normalize_path(data.get("out_zip_dir", self.var_out_zip_dir.get())))
             self.var_model_pick.set(data.get("model_pick", self.var_model_pick.get()))
-            self.var_model_dir.set(data.get("model_dir", self.var_model_dir.get()))
+            fam = data.get("model_family", self.var_model_family.get())
+            if not fam or str(fam).lower() == "all":
+                fam = self.var_model_family.get()
+            self.var_model_family.set(fam)
+            size = data.get("model_size", self.var_model_size.get())
+            if not size or str(size).lower() == "all":
+                size = self.var_model_size.get()
+            self.var_model_size.set(size)
+            self.var_model_dir.set(normalize_path(data.get("model_dir", self.var_model_dir.get())))
             self.var_use_custom_model.set(bool(data.get("use_custom_model", self.var_use_custom_model.get())))
-            self.var_custom_model.set(data.get("custom_model", self.var_custom_model.get()))
+            self.var_custom_model.set(normalize_path(data.get("custom_model", self.var_custom_model.get())))
             self.var_device.set(data.get("device", self.var_device.get()))
             self.var_resume.set(bool(data.get("resume", self.var_resume.get())))
             self.var_skip_unlabeled.set(bool(data.get("skip_unlabeled", self.var_skip_unlabeled.get())))
@@ -798,13 +1075,15 @@ class App(tk.Tk):
         try:
             data = {
                 "task": self.var_task.get(),
-                "dataset_zip": self.var_dataset_zip.get(),
-                "work_dir": self.var_work_dir.get(),
-                "out_zip_dir": self.var_out_zip_dir.get(),
+                "dataset_zip": normalize_path(self.var_dataset_zip.get()),
+                "work_dir": normalize_path(self.var_work_dir.get()),
+                "out_zip_dir": normalize_path(self.var_out_zip_dir.get()),
                 "model_pick": self.var_model_pick.get(),
-                "model_dir": self.var_model_dir.get(),
+                "model_family": normalize_filter_value(self.var_model_family.get()) or "all",
+                "model_size": normalize_filter_value(self.var_model_size.get()) or "all",
+                "model_dir": normalize_path(self.var_model_dir.get()),
                 "use_custom_model": bool(self.var_use_custom_model.get()),
-                "custom_model": self.var_custom_model.get(),
+                "custom_model": normalize_path(self.var_custom_model.get()),
                 "epochs": int(self.var_epochs.get()),
                 "imgsz": int(self.var_imgsz.get()),
                 "batch": int(self.var_batch.get()),
@@ -817,6 +1096,13 @@ class App(tk.Tk):
             CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
         except Exception:
             return
+
+    def _sync_last_paths(self):
+        self.last_dataset_zip = normalize_path(self.var_dataset_zip.get())
+        self.last_work_dir = normalize_path(self.var_work_dir.get())
+        self.last_out_zip_dir = normalize_path(self.var_out_zip_dir.get())
+        self.last_custom_model = normalize_path(self.var_custom_model.get())
+        self.last_model_dir = normalize_path(self.var_model_dir.get())
 
     def _poll_queue(self):
         try:
