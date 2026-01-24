@@ -14,7 +14,7 @@ from tkinter import ttk, filedialog, messagebox
 import yaml
 
 from server import YoloServer
-from tray_win import TrayIcon
+from tray import TrayIcon
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "yolo_server_gui_config.yml"
