@@ -59,6 +59,9 @@ Just do it and report the result.
 Use ./read.py to read any file.
 讀任何檔案請使用 ./read.py。
 
+Before starting any task, re-read this SYSTEM.md using ./workflow/read.py.
+每次開始任何任務前，必須用 ./workflow/read.py 重新讀取本 SYSTEM.md。
+
 Communicate in Traditional Chinese with me.
 與我用繁體中文溝通。
 
