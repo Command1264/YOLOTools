@@ -16,3 +16,4 @@ output_zips
 train_history.jsonl
 .workflow
 *.json*
+*.spec
