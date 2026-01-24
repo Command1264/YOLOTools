@@ -1,5 +1,5 @@
-Behavior rules: see `workflow-new/SYSTEM.md`.
-行為規則請見 `workflow-new/SYSTEM.md`。
+Behavior rules: see `workflow/SYSTEM.md`.
+行為規則請見 `workflow/SYSTEM.md`。
 
 # Project Overview (English)
 This project trains and validates YOLO models to detect fire and smoke.
