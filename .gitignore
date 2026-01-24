@@ -14,6 +14,5 @@ workdir
 output_zips
 *.pt
 train_history.jsonl
-.workflow
 *.json*
 *.spec
