@@ -9,6 +9,15 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
+import sys
+from pathlib import Path as _Path
+
+APP_DIR = _Path(__file__).resolve().parent
+ROOT_DIR = APP_DIR.parent
+SERVER_DIR = ROOT_DIR / "yolo_server_gui"
+if str(SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(SERVER_DIR))
+
 from yolo_engine import YoloEngine
 
 

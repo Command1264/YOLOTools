@@ -5,19 +5,10 @@ import json
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
-
-import sys
-
-APP_DIR = Path(__file__).resolve().parent
-ROOT_DIR = APP_DIR.parent
-VALIDATOR_DIR = ROOT_DIR / "yolo_validator_gui"
-if str(VALIDATOR_DIR) not in sys.path:
-    sys.path.insert(0, str(VALIDATOR_DIR))
 
 from yolo_engine import YoloEngine
 
