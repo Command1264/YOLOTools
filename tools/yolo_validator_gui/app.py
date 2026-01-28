@@ -1,8 +1,12 @@
+import base64
 import json
 import threading
 import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import tkinter as tk
@@ -23,7 +27,123 @@ from yolo_engine import YoloEngine
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VID_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
+DEFAULT_HTTP_URL = "http://127.0.0.1:60922/detect"
 
+
+class HttpInferError(Exception):
+    """HTTP 推論錯誤。"""
+
+
+@dataclass
+class HttpInferRequest:
+    """HTTP 推論請求資料。"""
+
+    image_b64: str
+    thread_name: str
+
+
+@dataclass
+class HttpDetection:
+    """HTTP 回傳的偵測結果。"""
+
+    class_name: str
+    conf: float
+    xyxy: Tuple[int, int, int, int]
+
+
+@dataclass
+class HttpInferResponse:
+    """HTTP 回傳的推論結果。"""
+
+    classify_type: str
+    percentage: float
+    detections: List[HttpDetection]
+
+
+class YoloHttpClient:
+    """YOLO HTTP 推論用戶端。"""
+
+    def __init__(self, url: str, timeout_sec: float = 8.0):
+        self._url = url
+        self._timeout_sec = timeout_sec
+
+    def infer(self, frame_bgr) -> HttpInferResponse:
+        """
+        Send an image to the server for inference.
+
+        Args:
+            frame_bgr: BGR image array.
+
+        Returns:
+            HttpInferResponse: Inference result.
+
+        Raises:
+            HttpInferError: If HTTP or decoding fails.
+        """
+        try:
+            image_b64 = _encode_image_to_base64(frame_bgr)
+            request_data = HttpInferRequest(image_b64=image_b64, thread_name="yolo_validator_gui")
+            payload = {"threadName": request_data.thread_name, "image": request_data.image_b64}
+            raw = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+            req = urllib.request.Request(
+                self._url,
+                data=raw,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            with urllib.request.urlopen(req, timeout=self._timeout_sec) as resp:
+                data = resp.read()
+            decoded = json.loads(data.decode("utf-8"))
+            if not isinstance(decoded, dict):
+                raise HttpInferError("回傳格式錯誤。")
+            result = decoded.get("result")
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            if not isinstance(result, dict):
+                raise HttpInferError("回傳內容錯誤。")
+            return _parse_http_response(result)
+        except HttpInferError:
+            raise
+        except urllib.error.HTTPError as exc:
+            raise HttpInferError(f"HTTP 錯誤: {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise HttpInferError(f"連線失敗: {exc.reason}") from exc
+        except Exception as exc:
+            raise HttpInferError(f"HTTP 推論失敗: {exc}") from exc
+
+
+def _encode_image_to_base64(frame_bgr) -> str:
+    ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise HttpInferError("圖片編碼失敗。")
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def _parse_http_response(payload: Dict[str, object]) -> HttpInferResponse:
+    classify_type = str(payload.get("classifyType", "none"))
+    try:
+        percentage = float(payload.get("percentage", 0.0))
+    except Exception:
+        percentage = 0.0
+    detections: List[HttpDetection] = []
+    raw_dets = payload.get("detections", [])
+    if isinstance(raw_dets, list):
+        for item in raw_dets:
+            if not isinstance(item, dict):
+                continue
+            class_name = str(item.get("className", ""))
+            try:
+                conf = float(item.get("conf", 0.0))
+            except Exception:
+                conf = 0.0
+            xyxy_raw = item.get("xyxy", [])
+            if not isinstance(xyxy_raw, list) or len(xyxy_raw) != 4:
+                continue
+            try:
+                xyxy = tuple(int(v) for v in xyxy_raw)
+            except Exception:
+                continue
+            detections.append(HttpDetection(class_name=class_name, conf=conf, xyxy=xyxy))
+    return HttpInferResponse(classify_type=classify_type, percentage=percentage, detections=detections)
 
 class App(tk.Tk):
     def __init__(self):
@@ -44,6 +164,8 @@ class App(tk.Tk):
         self.var_ignore_iou = tk.BooleanVar(value=False)
         self.var_interval = tk.DoubleVar(value=1.0)
         self.var_order = tk.StringVar(value="圖片優先")
+        self.var_use_http = tk.BooleanVar(value=False)
+        self.var_http_url = tk.StringVar(value=DEFAULT_HTTP_URL)
         self._order_map = {
             "圖片優先": "images_first",
             "影片優先": "videos_first",
@@ -153,7 +275,20 @@ class App(tk.Tk):
         self.cmb_order.grid(row=2, column=3, sticky="w", padx=8, pady=6)
         self.cmb_order.bind("<<ComboboxSelected>>", lambda _e: self._save_config())
 
+        ttk.Checkbutton(
+            opt_box,
+            text="使用 HTTP 推論",
+            variable=self.var_use_http,
+            command=self._on_toggle_http,
+        ).grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ttk.Label(opt_box, text="HTTP URL:").grid(row=3, column=2, sticky="w", padx=8, pady=6)
+        self.ent_http_url = ttk.Entry(opt_box, textvariable=self.var_http_url)
+        self.ent_http_url.grid(row=3, column=3, columnspan=3, sticky="ew", padx=8, pady=6)
+        self.ent_http_url.bind("<FocusOut>", lambda _e: self._on_http_url_entry())
+        self.ent_http_url.bind("<Return>", lambda _e: self._on_http_url_entry())
+
         opt_box.columnconfigure(1, weight=1)
+        opt_box.columnconfigure(3, weight=1)
         opt_box.columnconfigure(4, weight=1)
 
         act = ttk.Frame(root)
@@ -258,11 +393,22 @@ class App(tk.Tk):
             messagebox.showwarning("執行中", "目前正在執行。")
             return
 
-        model_path = Path(self.var_model.get().strip())
+        use_http = self.var_use_http.get()
+        model_path = None
+        if not use_http:
+            model_path = Path(self.var_model.get().strip())
+            if not model_path.exists():
+                messagebox.showerror("錯誤", "模型檔不存在。")
+                return
+        http_url = ""
+        if use_http:
+            http_url = self._normalize_http_url(self.var_http_url.get())
+            if not http_url:
+                messagebox.showerror("錯誤", "HTTP URL 無效。")
+                return
+            self.var_http_url.set(http_url)
+
         input_path = Path(self.var_input.get().strip())
-        if not model_path.exists():
-            messagebox.showerror("錯誤", "模型檔不存在。")
-            return
         if not input_path.exists():
             messagebox.showerror("錯誤", "輸入檔不存在。")
             return
@@ -284,42 +430,79 @@ class App(tk.Tk):
         token = self._ui_token
         self._worker = threading.Thread(
             target=self._run,
-            args=(model_path, input_path, self.var_device.get(), token),
+            args=(model_path, input_path, self.var_device.get(), token, use_http, http_url),
             daemon=True,
         )
         self._worker.start()
 
-    def _run(self, model_path: Path, input_path: Path, device: str, token: int):
+    def _run(
+        self,
+        model_path: Optional[Path],
+        input_path: Path,
+        device: str,
+        token: int,
+        use_http: bool,
+        http_url: str,
+    ):
         try:
-            engine = YoloEngine(str(model_path), device=device.strip())
-            engine.load()
-            self._ui_device(engine.device_name)
-            if engine.cuda_available and engine.device_name.startswith("cpu"):
-                self.log("偵測到 CUDA 可用，但模型仍在 CPU。可嘗試 device=cuda:0。")
-            if input_path.is_dir():
-                self._run_folder(engine, input_path, token)
-            else:
-                suffix = input_path.suffix.lower()
-                if suffix in IMG_EXTS:
-                    self._run_image(engine, input_path, token)
-                elif suffix in VID_EXTS:
-                    self._run_video(engine, input_path, token)
+            if use_http:
+                client = YoloHttpClient(http_url)
+                self._ui_device("http")
+                if input_path.is_dir():
+                    self._run_folder(None, client, input_path, token)
                 else:
-                    self._ui_error("不支援的檔案格式。")
+                    suffix = input_path.suffix.lower()
+                    if suffix in IMG_EXTS:
+                        self._run_image(None, client, input_path, token)
+                    elif suffix in VID_EXTS:
+                        self._run_video(None, client, input_path, token)
+                    else:
+                        self._ui_error("不支援的檔案格式。")
+            else:
+                if model_path is None:
+                    self._ui_error("模型路徑無效。")
+                    return
+                engine = YoloEngine(str(model_path), device=device.strip())
+                engine.load()
+                self._ui_device(engine.device_name)
+                if engine.cuda_available and engine.device_name.startswith("cpu"):
+                    self.log("偵測到 CUDA 可用，但模型仍在 CPU。可嘗試 device=cuda:0。")
+                if input_path.is_dir():
+                    self._run_folder(engine, None, input_path, token)
+                else:
+                    suffix = input_path.suffix.lower()
+                    if suffix in IMG_EXTS:
+                        self._run_image(engine, None, input_path, token)
+                    elif suffix in VID_EXTS:
+                        self._run_video(engine, None, input_path, token)
+                    else:
+                        self._ui_error("不支援的檔案格式。")
         except Exception as e:
             self._ui_error(f"執行失敗: {e}")
         finally:
             self._ui_done()
 
-    def _run_image(self, engine: YoloEngine, path: Path, token: int):
+    def _run_image(
+        self,
+        engine: Optional[YoloEngine],
+        http_client: Optional[YoloHttpClient],
+        path: Path,
+        token: int,
+    ):
         frame = cv2.imread(str(path))
         if frame is None:
             self._ui_error("讀取圖片失敗。")
             return
 
-        self._process_and_show(engine, frame, token)
+        self._process_and_show(engine, http_client, frame, token)
 
-    def _run_video(self, engine: YoloEngine, path: Path, token: int):
+    def _run_video(
+        self,
+        engine: Optional[YoloEngine],
+        http_client: Optional[YoloHttpClient],
+        path: Path,
+        token: int,
+    ):
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
             self._ui_error("讀取影片失敗。")
@@ -332,12 +515,18 @@ class App(tk.Tk):
             ok, frame = cap.read()
             if not ok:
                 break
-            self._process_and_show(engine, frame, token)
+            self._process_and_show(engine, http_client, frame, token)
             time.sleep(delay)
 
         cap.release()
 
-    def _run_folder(self, engine: YoloEngine, folder: Path, token: int):
+    def _run_folder(
+        self,
+        engine: Optional[YoloEngine],
+        http_client: Optional[YoloHttpClient],
+        folder: Path,
+        token: int,
+    ):
         images, videos = self._collect_folder_items(folder)
         if not images and not videos:
             self._ui_error("資料夾內沒有可用的圖片或影片。")
@@ -353,10 +542,10 @@ class App(tk.Tk):
             if self._stop_event.is_set() or token != self._ui_token:
                 return
             if kind == "image":
-                self._run_image(engine, path, token)
+                self._run_image(engine, http_client, path, token)
                 self._sleep_interval(interval, token)
             else:
-                self._run_video(engine, path, token)
+                self._run_video(engine, http_client, path, token)
                 self._sleep_interval(interval, token)
 
     def _collect_folder_items(self, folder: Path):
@@ -373,23 +562,40 @@ class App(tk.Tk):
                 return
             time.sleep(0.05)
 
-    def _process_and_show(self, engine: YoloEngine, frame_bgr, token: int):
+    def _process_and_show(
+        self,
+        engine: Optional[YoloEngine],
+        http_client: Optional[YoloHttpClient],
+        frame_bgr,
+        token: int,
+    ):
         if token != self._ui_token:
             return
         if self.var_show.get():
-            conf = float(self.var_conf.get())
-            iou = float(self.var_iou.get())
-            if self.var_ignore_conf.get():
-                conf = 0.01
-            if self.var_ignore_iou.get():
-                iou = 1.0
-            result, dets = engine.infer(frame_bgr, conf=conf, iou=iou)
-            if result is not None:
-                annotated = result.plot()
+            if http_client is not None:
+                try:
+                    response = http_client.infer(frame_bgr)
+                except HttpInferError as exc:
+                    self._ui_error(f"HTTP 推論失敗: {exc}")
+                    self._stop_event.set()
+                    return
+                annotated = self._draw_http_dets(frame_bgr.copy(), response.detections)
+                info = self._format_http_dets(response.detections)
+                self._ui_update(annotated, info, token)
             else:
-                annotated = frame_bgr
-            info = self._format_dets(dets)
-            self._ui_update(annotated, info, token)
+                conf = float(self.var_conf.get())
+                iou = float(self.var_iou.get())
+                if self.var_ignore_conf.get():
+                    conf = 0.01
+                if self.var_ignore_iou.get():
+                    iou = 1.0
+                result, dets = engine.infer(frame_bgr, conf=conf, iou=iou)
+                if result is not None:
+                    annotated = result.plot()
+                else:
+                    annotated = frame_bgr
+                info = self._format_dets(dets)
+                self._ui_update(annotated, info, token)
         else:
             self._ui_update(frame_bgr, "顯示原始影像（未顯示判斷）", token)
 
@@ -399,6 +605,30 @@ class App(tk.Tk):
         top = dets[:5]
         summary = ", ".join([f"{d.class_name} {d.conf:.2f}" for d in top])
         return f"偵測 {len(dets)} 個: {summary}"
+
+    def _format_http_dets(self, dets: List[HttpDetection]) -> str:
+        if not dets:
+            return "未偵測到物件"
+        top = dets[:5]
+        summary = ", ".join([f"{d.class_name} {d.conf:.2f}" for d in top])
+        return f"偵測 {len(dets)} 個: {summary}"
+
+    def _draw_http_dets(self, frame_bgr, dets: List[HttpDetection]):
+        for d in dets:
+            x1, y1, x2, y2 = d.xyxy
+            label = f"{d.class_name} {d.conf:.2f}"
+            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                frame_bgr,
+                label,
+                (x1, max(0, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                2,
+                lineType=cv2.LINE_AA,
+            )
+        return frame_bgr
 
     def _ui_update(self, frame_bgr, info: str, token: Optional[int] = None):
         self._last_frame_bgr = frame_bgr
@@ -533,6 +763,16 @@ class App(tk.Tk):
     def _on_toggle_show(self):
         self._save_config()
 
+    def _on_toggle_http(self):
+        self._save_config()
+
+    def _on_http_url_entry(self):
+        raw = self.var_http_url.get()
+        normalized = self._normalize_http_url(raw)
+        if normalized:
+            self.var_http_url.set(normalized)
+        self._save_config()
+
     def _on_interval_entry(self):
         try:
             v = float(self.var_interval.get())
@@ -640,6 +880,8 @@ class App(tk.Tk):
             self.var_interval.set(interval)
             order_raw = data.get("order", self._order_map.get(self.var_order.get(), "images_first"))
             self.var_order.set(self._order_map_rev.get(order_raw, "圖片優先"))
+            self.var_use_http.set(bool(data.get("use_http", self.var_use_http.get())))
+            self.var_http_url.set(data.get("http_url", self.var_http_url.get()))
 
             if self.var_ignore_conf.get():
                 self._conf_prev = conf
@@ -680,6 +922,8 @@ class App(tk.Tk):
                 "ignore_iou": bool(self.var_ignore_iou.get()),
                 "interval_sec": float(self.var_interval.get()),
                 "order": self._order_map.get(self.var_order.get(), "images_first"),
+                "use_http": bool(self.var_use_http.get()),
+                "http_url": self.var_http_url.get(),
             }
             self._config_path.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
         except Exception:
@@ -698,6 +942,18 @@ class App(tk.Tk):
         except Exception:
             pass
         return str(Path.cwd())
+
+    @staticmethod
+    def _normalize_http_url(raw: str) -> str:
+        text = (raw or "").strip()
+        if not text:
+            return ""
+        if not text.startswith("http://") and not text.startswith("https://"):
+            text = f"http://{text}"
+        text = text.rstrip("/")
+        if not text.endswith("/detect"):
+            text = f"{text}/detect"
+        return text
 
     def _set_log_height(self, paned: tk.PanedWindow, log_frame: ttk.LabelFrame, lines: int):
         try:
