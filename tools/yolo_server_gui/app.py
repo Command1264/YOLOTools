@@ -13,6 +13,8 @@ from tkinter import ttk, filedialog, messagebox
 
 import yaml
 
+from log_manager import setup_logging
+from log_viewer import LogViewer
 from server import YoloServer
 from tray import TrayIcon
 
@@ -155,9 +157,14 @@ class App(tk.Tk):
         self.geometry("720x360")
         self.minsize(640, 320)
 
+        self.log_context = setup_logging(APP_DIR)
+        self.logger = self.log_context.logger
+        self.logger.info("GUI 啟動")
+
         self.cfg = AppConfig.load(CONFIG_PATH)
         self.server: Optional[YoloServer] = None
         self._tray_queue: queue.Queue[str] = queue.Queue()
+        self._log_viewer: Optional[LogViewer] = None
         self.tray = TrayIcon(
             tooltip="YOLO Server",
             on_exit=self._enqueue_tray_exit,
@@ -213,9 +220,10 @@ class App(tk.Tk):
 
     def _build_menu(self):
         menubar = tk.Menu(self)
-        menu_settings = tk.Menu(menubar, tearoff=0)
-        menu_settings.add_command(label="設定...", command=self._open_settings)
-        menubar.add_cascade(label="設定", menu=menu_settings)
+        menu_more = tk.Menu(menubar, tearoff=0)
+        menu_more.add_command(label="瀏覽運行日誌", command=self._open_log_viewer)
+        menu_more.add_command(label="設定...", command=self._open_settings)
+        menubar.add_cascade(label="更多功能", menu=menu_more)
         self.config(menu=menubar)
 
     def _apply_config_to_ui(self):
@@ -283,14 +291,22 @@ class App(tk.Tk):
         port = int(self.cfg.port)
         model_path = self.cfg.model_path
         try:
-            self.server = YoloServer(model_path, host, port)
+            self.server = YoloServer(model_path, host, port, logger=self.logger)
             self.server.start()
         except Exception as e:
             self.server = None
+            try:
+                self.logger.exception("啟動伺服器失敗。")
+            except Exception:
+                pass
             messagebox.showerror("啟動失敗", f"無法啟動伺服器：\n{e}")
             return
         self._set_running_state(True)
         self.var_status.set(f"狀態：執行中 http://{host}:{port}")
+        try:
+            self.logger.info("伺服器已啟動。host=%s port=%s", host, port)
+        except Exception:
+            pass
 
     def _stop_server(self):
         try:
@@ -300,6 +316,10 @@ class App(tk.Tk):
             self.server = None
         self._set_running_state(False)
         self.var_status.set("狀態：未啟動")
+        try:
+            self.logger.info("伺服器已停止。")
+        except Exception:
+            pass
 
     def _set_running_state(self, running: bool):
         state = "disabled" if running else "normal"
@@ -308,6 +328,23 @@ class App(tk.Tk):
         self.ent_port.configure(state=state)
         self.btn_pick_model.configure(state=state)
         self.btn_toggle.configure(text="停止伺服器" if running else "啟動伺服器")
+
+    def _open_log_viewer(self):
+        if self._log_viewer is not None:
+            try:
+                self._log_viewer.lift()
+                return
+            except Exception:
+                pass
+
+        def _on_close():
+            self._log_viewer = None
+
+        try:
+            self.logger.info("開啟運行日誌視窗。")
+        except Exception:
+            pass
+        self._log_viewer = LogViewer(self, on_close=_on_close)
 
     def _open_settings(self):
         if getattr(self, "_settings_win", None) is not None:
@@ -461,6 +498,10 @@ class App(tk.Tk):
             pass
         try:
             self.tray.stop()
+        except Exception:
+            pass
+        try:
+            self.logger.info("GUI 結束。")
         except Exception:
             pass
         self.destroy()

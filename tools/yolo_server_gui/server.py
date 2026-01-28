@@ -4,12 +4,14 @@ import base64
 import json
 import threading
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+from flask import Flask, Response, request
+from werkzeug.serving import make_server
 
+from log_manager import get_logger
 from yolo_engine import YoloEngine
 
 
@@ -39,15 +41,41 @@ def _pick_top1(dets) -> Tuple[str, float]:
     best = max(dets, key=lambda d: d.conf)
     return best.class_name, float(best.conf)
 
+def _dets_to_payload(dets) -> list[Dict[str, Any]]:
+    payload = []
+    for d in dets or []:
+        payload.append(
+            {
+                "classId": int(d.class_id),
+                "className": d.class_name,
+                "conf": float(d.conf),
+                "xyxy": [int(v) for v in d.xyxy],
+            }
+        )
+    return payload
+
 
 class YoloServer:
-    def __init__(self, model_path: str, host: str, port: int, conf: float = 0.25):
+    """YOLO inference HTTP server based on Flask."""
+
+    def __init__(
+        self,
+        model_path: str,
+        host: str,
+        port: int,
+        conf: float = 0.25,
+        logger=None,
+    ):
         self.model_path = model_path
         self.host = host
         self.port = port
         self.conf = conf
+        self._logger = logger or get_logger()
         self._engine = YoloEngine(model_path)
-        self._server: Optional[ThreadingHTTPServer] = None
+        self._app = Flask(__name__)
+        self._app.add_url_rule("/", "index", self._handle_index, methods=["GET"])
+        self._app.add_url_rule("/detect", "detect", self._handle_detect, methods=["POST"])
+        self._server = None
         self._thread: Optional[threading.Thread] = None
 
     def is_running(self) -> bool:
@@ -56,10 +84,13 @@ class YoloServer:
     def start(self) -> None:
         if self._server is not None:
             return
-        handler_cls = self._make_handler()
-        self._server = ThreadingHTTPServer((self.host, self.port), handler_cls)
+        self._server = self._create_server()
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+        try:
+            self._logger.info("Server started. host=%s port=%s", self.host, self.port)
+        except Exception:
+            pass
 
     def stop(self) -> None:
         if self._server is None:
@@ -70,87 +101,77 @@ class YoloServer:
         finally:
             self._server = None
             self._thread = None
+        try:
+            self._logger.info("Server stopped.")
+        except Exception:
+            pass
 
     def update_model(self, model_path: str) -> None:
         self.model_path = model_path
         self._engine = YoloEngine(model_path, conf=self.conf)
+        try:
+            self._logger.info("Model updated. model_path=%s", model_path)
+        except Exception:
+            pass
 
-    def _make_handler(self):
-        server_ref = self
+    def _create_server(self):
+        try:
+            return make_server(self.host, self.port, self._app, threaded=True)
+        except TypeError:
+            return make_server(self.host, self.port, self._app)
 
-        class Handler(BaseHTTPRequestHandler):
-            def _send_json(self, status: HTTPStatus, payload: Dict[str, Any]) -> None:
-                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                self.send_response(status.value)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+    def _text_response(self, status: HTTPStatus, text: str) -> Response:
+        return Response(text.encode("utf-8"), status=status.value, content_type="text/plain; charset=utf-8")
 
-            def _send_text(self, status: HTTPStatus, text: str) -> None:
-                data = text.encode("utf-8")
-                self.send_response(status.value)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+    def _json_response(self, status: HTTPStatus, payload: Dict[str, Any]) -> Response:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return Response(data, status=status.value, content_type="application/json; charset=utf-8")
 
-            def _read_json(self) -> Optional[Dict[str, Any]]:
+    def _handle_index(self) -> Response:
+        return self._text_response(HTTPStatus.OK, "YOLO Server is running...")
+
+    def _handle_detect(self) -> Response:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            try:
+                self._logger.warning("Detect request with invalid JSON.")
+            except Exception:
+                pass
+            return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
+
+        thread_name = payload.get("threadName", "")
+        if "image" in payload:
+            result = self._infer_single(payload.get("image", ""), self.conf)
+            return self._json_response(HTTPStatus.OK, {"threadName": thread_name, "result": result})
+
+        if "images" in payload:
+            images = payload.get("images", [])
+            if not isinstance(images, list):
                 try:
-                    length = int(self.headers.get("Content-Length", "0"))
+                    self._logger.warning("Detect request with invalid images list.")
                 except Exception:
-                    length = 0
-                if length <= 0:
-                    return None
-                try:
-                    raw = self.rfile.read(length)
-                    return json.loads(raw.decode("utf-8"))
-                except Exception:
-                    return None
+                    pass
+                return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "images must be list"})
+            results = [self._infer_single(img, self.conf) for img in images]
+            return self._json_response(HTTPStatus.OK, {"threadName": thread_name, "result": results})
 
-            def do_GET(self):
-                path = self.path.rstrip("/") or "/"
-                if path == "/":
-                    self._send_text(HTTPStatus.OK, "YOLO Server is running...")
-                else:
-                    self._send_text(HTTPStatus.NOT_FOUND, "Not Found")
+        return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "missing image or images"})
 
-            def do_POST(self):
-                path = self.path.rstrip("/") or "/"
-                if path != "/detect":
-                    self._send_text(HTTPStatus.NOT_FOUND, "Not Found")
-                    return
-                payload = self._read_json()
-                if not isinstance(payload, dict):
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
-                    return
-                thread_name = payload.get("threadName", "")
-                if "image" in payload:
-                    result = self._infer_single(payload.get("image", ""), server_ref.conf)
-                    self._send_json(HTTPStatus.OK, {"threadName": thread_name, "result": result})
-                    return
-                if "images" in payload:
-                    images = payload.get("images", [])
-                    if not isinstance(images, list):
-                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "images must be list"})
-                        return
-                    results = [self._infer_single(img, server_ref.conf) for img in images]
-                    self._send_json(HTTPStatus.OK, {"threadName": thread_name, "result": results})
-                    return
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing image or images"})
-
-            def _infer_single(self, image_b64: str, conf: float) -> Dict[str, Any]:
-                img = _decode_base64_image(image_b64)
-                if img is None:
-                    return {"classifyType": "none", "percentage": 0.0}
-                try:
-                    _, dets = server_ref._engine.infer(img, conf=conf)
-                except Exception:
-                    return {"classifyType": "none", "percentage": 0.0}
-                cls_name, score = _pick_top1(dets)
-                return {"classifyType": cls_name, "percentage": score}
-
-            def log_message(self, format, *args):
-                return
-
-        return Handler
+    def _infer_single(self, image_b64: str, conf: float) -> Dict[str, Any]:
+        img = _decode_base64_image(image_b64)
+        if img is None:
+            return {"classifyType": "none", "percentage": 0.0, "detections": []}
+        try:
+            _, dets = self._engine.infer(img, conf=conf)
+        except Exception:
+            try:
+                self._logger.exception("Inference failed.")
+            except Exception:
+                pass
+            return {"classifyType": "none", "percentage": 0.0, "detections": []}
+        cls_name, score = _pick_top1(dets)
+        return {
+            "classifyType": cls_name,
+            "percentage": score,
+            "detections": _dets_to_payload(dets),
+        }
