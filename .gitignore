@@ -16,3 +16,6 @@ output_zips
 train_history.jsonl
 *.json*
 *.spec
+
+log
+*.log
