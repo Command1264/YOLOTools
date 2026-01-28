@@ -4,18 +4,37 @@
 out
 gen
 
-build
-dist
-install
-models
+# Python 環境，詳細請看 requiremeents.txt
 TaichungFireYoloEnv
-trainingData
-workdir
-output_zips
+
+# 使用 YOLO 模型需要安裝應用程式
+install
+
+# YOLO 模型
+models
+# 模型副檔名
 *.pt
-train_history.jsonl
+
+# 訓練資料
+trainingData
+
+# YOLO Trainer 訓練資料夾
+workdir
+# YOLO Trainer 輸出資料r86
+output_zips
+# YOLO Trainer 訓練歷史
+#train_history.jsonl
+
+# 避免將可生成的資料上傳
 *.json*
+
+# pyinstaller 建置應用程式資料夾
+build
+# pyinstaller 輸出應用程式資料夾
+dist
+# pyinstaller 建置應用程式設定檔案
 *.spec
 
+# 日誌
 log
 *.log
