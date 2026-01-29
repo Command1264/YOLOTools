@@ -56,11 +56,21 @@ If an action is read-only and reversible, DO NOT ask for approval.
 Just do it and report the result.
 如果動作是唯讀且可逆，不要要求批准，直接執行並回報結果。
 
-Use ./read.py to read any file.
-讀任何檔案請使用 ./read.py。
+Use ./workflow/read.exe to read any file.
+讀任何檔案請使用 ./workflow/read.exe。
 
-Before starting any task, re-read this SYSTEM.md using ./workflow/read.py.
-每次開始任何任務前，必須用 ./workflow/read.py 重新讀取本 SYSTEM.md。
+## read.exe 使用說明 (Usage)
+
+使用 `./workflow/read.exe` 時，請遵循以下用法：  
+When using `./workflow/read.exe, please follow the usage below:
+
+```bash
+usage: read.exe [-h] [--recursive] [--json] [--max-bytes MAX_BYTES] [--separator SEPARATOR] path
+```
+
+
+Before starting any task, re-read this SYSTEM.md using ./workflow/read.exe.
+每次開始任何任務前，必須用 ./workflow/read.exe 重新讀取本 SYSTEM.md。
 
 Communicate in Traditional Chinese with me.
 與我用繁體中文溝通。
