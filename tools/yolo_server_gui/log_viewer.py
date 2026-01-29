@@ -24,13 +24,16 @@ class LogViewer(tk.Toplevel):
         self._live_file: Optional[Path] = get_active_log_file()
         self._loading_thread: Optional[threading.Thread] = None
         self._loading = False
+        self._loading_message_visible = False
+        self._load_seq = 0
+        self._pending_live_lines: list[str] = []
+        self._load_lines: list[str] = []
 
         self.title("運行日誌")
         self.geometry("820x520")
         self.minsize(720, 420)
 
         self._build_ui()
-        self._refresh_files(select_latest=True)
         self._poll_log_queue()
 
         self.transient(parent)
@@ -44,6 +47,8 @@ class LogViewer(tk.Toplevel):
                 self._center_on_screen()
         except Exception:
             pass
+
+        self.after(0, self._deferred_load)
 
     def _build_ui(self) -> None:
         top_bar = ttk.Frame(self, padding=10)
@@ -109,55 +114,57 @@ class LogViewer(tk.Toplevel):
             self._set_current_file(target)
         self._update_nav_buttons()
 
+    def _deferred_load(self) -> None:
+        self._set_loading(True)
+        self._refresh_files(select_latest=True)
+
     def _set_current_file(self, path: Path) -> None:
         self._current_file = path
         self._live_file = get_active_log_file()
         self._var_file.set(path.name)
-        self._drain_log_queue()
         self._load_file_async(path)
         self._update_nav_buttons()
 
-    def _load_file(self, path: Path) -> None:
-        if not path.exists():
-            self._set_text("日誌檔案不存在。")
-            return
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            self._set_text("無法讀取日誌檔案。")
-            return
-        self._set_text("")
-        for line in content.splitlines():
-            self._append_line(line)
-        self._scroll_to_end()
-
     def _load_file_async(self, path: Path) -> None:
-        if self._loading:
-            return
+        self._load_seq += 1
+        load_id = self._load_seq
+        self._pending_live_lines = []
         self._set_loading(True)
+        self._load_lines = []
 
         def _worker():
             if not path.exists():
-                self.after(0, lambda: self._finish_loading("日誌檔案不存在。"))
+                self.after(0, lambda: self._finish_loading(load_id, "日誌檔案不存在。"))
                 return
             try:
-                content = path.read_text(encoding="utf-8", errors="replace")
+                with path.open("r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if load_id != self._load_seq:
+                            return
+                        self._load_lines.append(line.rstrip("\n"))
             except Exception:
-                self.after(0, lambda: self._finish_loading("無法讀取日誌檔案。"))
+                self.after(0, lambda: self._finish_loading(load_id, "無法讀取日誌檔案。"))
                 return
-            self.after(0, lambda: self._finish_loading(content))
+            self.after(0, lambda: self._finish_loading(load_id, ""))
 
         self._loading_thread = threading.Thread(target=_worker, daemon=True)
         self._loading_thread.start()
 
-    def _finish_loading(self, content: str) -> None:
-        self._set_text("")
-        if content in {"日誌檔案不存在。", "無法讀取日誌檔案。"}:
+    def _finish_loading(self, load_id: int, content: str) -> None:
+        if load_id != self._load_seq:
+            return
+        self._loading_message_visible = False
+        if content:
             self._set_text(content)
             self._set_loading(False)
             return
-        for line in content.splitlines():
-            self._append_line(line)
+        full_text = "\n".join(self._load_lines)
+        if self._pending_live_lines:
+            full_text = "\n".join([full_text, *self._pending_live_lines]) if full_text else "\n".join(
+                self._pending_live_lines
+            )
+            self._pending_live_lines = []
+        self._set_text(full_text)
         self._scroll_to_end()
         self._set_loading(False)
 
@@ -177,10 +184,14 @@ class LogViewer(tk.Toplevel):
     def _set_loading(self, loading: bool) -> None:
         self._loading = loading
         if loading:
+            self._loading_message_visible = True
             self._set_center_text("正在載入中")
-        self.btn_prev.configure(state="disabled" if loading else self.btn_prev["state"])
-        self.btn_next.configure(state="disabled" if loading else self.btn_next["state"])
-        self.cmb_files.configure(state="disabled" if loading else "readonly")
+            self.btn_prev.configure(state="disabled")
+            self.btn_next.configure(state="disabled")
+            self.cmb_files.configure(state="disabled")
+            return
+        self.cmb_files.configure(state="readonly")
+        self._update_nav_buttons()
 
     def _set_center_text(self, text: str) -> None:
         self.txt_log.configure(state="normal")
@@ -194,7 +205,7 @@ class LogViewer(tk.Toplevel):
         self.txt_log.see("1.0")
 
     def _on_text_resize(self, _event=None) -> None:
-        if self._loading:
+        if self._loading and self._loading_message_visible:
             self._set_center_text("正在載入中")
 
     def _visible_lines(self) -> int:
@@ -221,7 +232,9 @@ class LogViewer(tk.Toplevel):
         try:
             while True:
                 line = self._log_queue.get_nowait()
-                if self._current_file and self._live_file and self._current_file == self._live_file:
+                if self._loading and self._current_file and self._live_file and self._current_file == self._live_file:
+                    self._pending_live_lines.append(line)
+                elif self._current_file and self._live_file and self._current_file == self._live_file:
                     self._append_line(line)
                     self._scroll_to_end()
         except queue.Empty:
@@ -265,13 +278,6 @@ class LogViewer(tk.Toplevel):
         idx = self._files.index(self._current_file)
         self.btn_prev.configure(state="disabled" if idx <= 0 else "normal")
         self.btn_next.configure(state="disabled" if idx >= len(self._files) - 1 else "normal")
-
-    def _drain_log_queue(self) -> None:
-        try:
-            while True:
-                self._log_queue.get_nowait()
-        except queue.Empty:
-            pass
 
     def _copy_all(self) -> None:
         text = self.txt_log.get("1.0", "end-1c")
