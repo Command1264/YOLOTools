@@ -56,21 +56,30 @@ If an action is read-only and reversible, DO NOT ask for approval.
 Just do it and report the result.
 如果動作是唯讀且可逆，不要要求批准，直接執行並回報結果。
 
-Use ./workflow/read.exe to read any file.
-讀任何檔案請使用 ./workflow/read.exe。
+Use `Get-Content -Encoding utf8 -Raw` to read any file.
+If the output is garbled, retry in this order: `utf8BOM`, `utf16`, `big5`.
+讀任何檔案請使用 `Get-Content -Encoding utf8 -Raw`。
+若出現亂碼，請依序改用 `utf8BOM`、`utf16`、`big5` 再讀一次。
 
-## read.exe 使用說明 (Usage)
+## Get-Content 使用說明 (Usage)
 
-使用 `./workflow/read.exe` 時，請遵循以下用法：  
-When using `./workflow/read.exe, please follow the usage below:
+使用 `Get-Content -Encoding utf8 -Raw` 時，請遵循以下用法：  
+When using `Get-Content -Encoding utf8 -Raw`, please follow the usage below:
 
-```bash
-usage: read.exe [-h] [--recursive] [--json] [--max-bytes MAX_BYTES] [--separator SEPARATOR] path
+```powershell
+Get-Content -Path "<path>" -Encoding utf8 -Raw
 ```
 
+```powershell
+Get-Content -Path "<path>" -Encoding utf8BOM -Raw
+Get-Content -Path "<path>" -Encoding utf16 -Raw
+Get-Content -Path "<path>" -Encoding big5 -Raw
+```
 
-Before starting any task, re-read this SYSTEM.md using ./workflow/read.exe.
-每次開始任何任務前，必須用 ./workflow/read.exe 重新讀取本 SYSTEM.md。
+Before starting any task, re-read this SYSTEM.md using `Get-Content -Encoding utf8 -Raw`.
+If garbled, retry using the fallback order above.
+每次開始任何任務前，必須用 `Get-Content -Encoding utf8 -Raw` 重新讀取本 SYSTEM.md。
+若出現亂碼，請依上方順序改用其他編碼再讀一次。
 
 Communicate in Traditional Chinese with me.
 與我用繁體中文溝通。
