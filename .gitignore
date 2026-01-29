@@ -5,7 +5,7 @@ out
 gen
 
 # Python 環境，詳細請看 requiremeents.txt
-TaichungFireYoloEnv
+YOLOToolsEnv
 
 # 使用 YOLO 模型需要安裝應用程式
 install
