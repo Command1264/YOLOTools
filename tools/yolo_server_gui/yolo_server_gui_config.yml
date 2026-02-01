@@ -1,6 +1,0 @@
-model_path: D:/Code/python/TaichungFireYolo/models/D_Fire_Dataset-26-x.pt
-host: 127.0.0.1
-port: 60922
-auto_start_server: false
-launch_on_startup: false
-close_behavior: minimize

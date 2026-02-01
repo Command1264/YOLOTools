@@ -22,9 +22,9 @@ trainingData
 workdir
 # YOLO Trainer 輸出資料r86
 output_zips
-# YOLO Trainer 訓練歷史
-#train_history.jsonl
 
+# 各種設定檔
+*config*
 # 避免將可生成的資料上傳
 *.json*
 
