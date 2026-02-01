@@ -5,6 +5,9 @@ import os
 from typing import Callable, Optional
 
 try:
+    import pystray
+    from PIL import Image, ImageDraw
+    """
     if os.name != "nt":
         import pystray
         from PIL import Image, ImageDraw
@@ -12,6 +15,7 @@ try:
         pystray = None
         Image = None
         ImageDraw = None
+    """
 except Exception:
     pystray = None
     Image = None

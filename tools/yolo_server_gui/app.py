@@ -21,6 +21,7 @@ from tray import TrayIcon
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "yolo_server_gui_config.yml"
 STARTUP_FILE = "yolo_server_gui_startup.cmd"
+ICON_PATH = APP_DIR / "yolo_server_icon.png"
 
 CLOSE_LABELS = {
     "ask": "詢問",
@@ -156,6 +157,8 @@ class App(tk.Tk):
         self.title("YOLO Server")
         self.geometry("720x360")
         self.minsize(640, 320)
+        self._app_icon = tk.PhotoImage(file=str(ICON_PATH))
+        self.iconphoto(True, self._app_icon)
 
         self.log_context = setup_logging(APP_DIR)
         self.logger = self.log_context.logger
@@ -169,6 +172,7 @@ class App(tk.Tk):
             tooltip="YOLO Server",
             on_exit=self._enqueue_tray_exit,
             on_show=self._enqueue_tray_show,
+            icon_path=str(ICON_PATH),
         )
 
         self._build_ui()
