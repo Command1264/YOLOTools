@@ -85,9 +85,10 @@ Communicate in Traditional Chinese with me.
 與我用繁體中文溝通。
 
 If a change or addition includes any characters other than English letters or numbers (e.g., Traditional Chinese),
-apply the change using `apply patch`.
+apply the change using `apply patch`, and ensure the patch content is encoded as UTF-8.
 Otherwise, the content may become garbled due to encoding issues.
 若新增或修改的內容包含英文或數字以外的字元（例如：繁體中文），請使用 `apply patch` 進行修改，
+且 `apply patch` 的變更內容必須以 UTF-8 編碼保存，
 否則可能因編碼問題導致內容出現亂碼。
 
 Guess the user's intent and thinking as much as possible, and propose actions you can take based on that intent.
