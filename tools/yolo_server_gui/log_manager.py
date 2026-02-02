@@ -10,9 +10,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import List, Optional
 
-LOGGER_NAME = "yolo_server_gui"
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOGGER_NAME: str = "yolo_server_gui"
+LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+LOG_DATE_FORMAT: str = "%Y-%m-%d %H:%M:%S"
 WERKZEUG_TIME_PATTERN = re.compile(r"\s\[[0-9]{2}/[A-Za-z]{3}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}\]")
 
 _LOG_CONTEXT: Optional["LogContext"] = None
@@ -91,21 +91,21 @@ def setup_logging(app_dir: Path) -> LogContext:
     if _LOG_CONTEXT is not None:
         return _LOG_CONTEXT
 
-    start_time = datetime.now()
-    date_dir = start_time.strftime("%Y-%m-%d")
-    log_dir = app_dir / "log" / date_dir
+    start_time: datetime = datetime.now()
+    date_dir: str = start_time.strftime("%Y-%m-%d")
+    log_dir: Path = app_dir / "log" / date_dir
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"yolo_server_log_{start_time.strftime('%Y%m%d_%H%M%S')}.log"
+    log_file: Path = log_dir / f"yolo_server_log_{start_time.strftime('%Y%m%d_%H%M%S')}.log"
 
     log_queue: queue.Queue[str] = queue.Queue(maxsize=5000)
 
-    logger = logging.getLogger(LOGGER_NAME)
+    logger: logging.Logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    formatter = MillisecondFormatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+    formatter: MillisecondFormatter = MillisecondFormatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
-    file_handler = RotatingFileHandler(
+    file_handler: RotatingFileHandler = RotatingFileHandler(
         log_file,
         maxBytes=5 * 1024 * 1024,
         backupCount=10,
@@ -114,18 +114,18 @@ def setup_logging(app_dir: Path) -> LogContext:
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
-    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler: logging.StreamHandler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
-    gui_handler = GuiLogHandler(log_queue)
+    gui_handler: GuiLogHandler = GuiLogHandler(log_queue)
     gui_handler.setLevel(logging.INFO)
     gui_handler.setFormatter(formatter)
 
     if logger.handlers:
         logger.handlers.clear()
 
-    clean_filter = WerkzeugCleanFilter()
+    clean_filter: WerkzeugCleanFilter = WerkzeugCleanFilter()
     file_handler.addFilter(clean_filter)
     console_handler.addFilter(clean_filter)
     gui_handler.addFilter(clean_filter)

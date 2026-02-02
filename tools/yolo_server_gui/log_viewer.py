@@ -16,16 +16,16 @@ class LogViewer(tk.Toplevel):
 
     def __init__(self, parent: tk.Tk, on_close: Optional[Callable[[], None]] = None) -> None:
         super().__init__(parent)
-        self._parent = parent
-        self._on_close = on_close
+        self._parent: tk.Tk = parent
+        self._on_close: Optional[Callable[[], None]] = on_close
         self._log_queue: queue.Queue[str] = get_log_queue()
         self._files: list[Path] = []
         self._current_file: Optional[Path] = None
         self._live_file: Optional[Path] = get_active_log_file()
         self._loading_thread: Optional[threading.Thread] = None
-        self._loading = False
-        self._loading_message_visible = False
-        self._load_seq = 0
+        self._loading: bool = False
+        self._loading_message_visible: bool = False
+        self._load_seq: int = 0
         self._pending_live_lines: list[str] = []
         self._load_lines: list[str] = []
 
@@ -51,35 +51,35 @@ class LogViewer(tk.Toplevel):
         self.after(0, self._deferred_load)
 
     def _build_ui(self) -> None:
-        top_bar = ttk.Frame(self, padding=10)
+        top_bar: ttk.Frame = ttk.Frame(self, padding=10)
         top_bar.pack(fill="x")
 
         ttk.Label(top_bar, text="檔案").pack(side="left")
-        self._var_file = tk.StringVar()
-        self.cmb_files = ttk.Combobox(top_bar, textvariable=self._var_file, state="readonly", width=40)
+        self._var_file: tk.StringVar = tk.StringVar()
+        self.cmb_files: ttk.Combobox = ttk.Combobox(top_bar, textvariable=self._var_file, state="readonly", width=40)
         self.cmb_files.pack(side="left", padx=(6, 8))
         self.cmb_files.bind("<<ComboboxSelected>>", self._on_file_selected)
 
-        self.btn_prev = ttk.Button(top_bar, text="上一頁", command=self._prev_file)
+        self.btn_prev: ttk.Button = ttk.Button(top_bar, text="上一頁", command=self._prev_file)
         self.btn_prev.pack(side="left", padx=4)
-        self.btn_next = ttk.Button(top_bar, text="下一頁", command=self._next_file)
+        self.btn_next: ttk.Button = ttk.Button(top_bar, text="下一頁", command=self._next_file)
         self.btn_next.pack(side="left", padx=4)
         ttk.Button(top_bar, text="重新整理", command=lambda: self._refresh_files(select_latest=False)).pack(
             side="left", padx=4
         )
 
-        btns = ttk.Frame(top_bar)
+        btns: ttk.Frame = ttk.Frame(top_bar)
         btns.pack(side="right")
         ttk.Button(btns, text="複製選取", command=self._copy_selection).pack(side="right", padx=4)
         ttk.Button(btns, text="複製全部", command=self._copy_all).pack(side="right", padx=4)
 
-        body = ttk.Frame(self, padding=(10, 0, 10, 10))
+        body: ttk.Frame = ttk.Frame(self, padding=(10, 0, 10, 10))
         body.pack(fill="both", expand=True)
 
-        self.txt_log = tk.Text(body, wrap="none", state="disabled")
+        self.txt_log: tk.Text = tk.Text(body, wrap="none", state="disabled")
         self.txt_log.pack(side="left", fill="both", expand=True)
 
-        y_scroll = ttk.Scrollbar(body, orient="vertical", command=self.txt_log.yview)
+        y_scroll: ttk.Scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.txt_log.yview)
         y_scroll.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=y_scroll.set)
 
@@ -92,7 +92,7 @@ class LogViewer(tk.Toplevel):
 
     def _refresh_files(self, select_latest: bool) -> None:
         self._files = list_log_files()
-        display = [p.name for p in self._files]
+        display: list[str] = [p.name for p in self._files]
         self.cmb_files["values"] = display
 
         if not self._files:
@@ -100,11 +100,11 @@ class LogViewer(tk.Toplevel):
             self._update_nav_buttons()
             return
 
-        target = None
+        target: Optional[Path] = None
         if select_latest:
             target = self._files[-1]
         else:
-            current = self._current_file
+            current: Optional[Path] = self._current_file
             if current and current in self._files:
                 target = current
             else:
@@ -127,12 +127,12 @@ class LogViewer(tk.Toplevel):
 
     def _load_file_async(self, path: Path) -> None:
         self._load_seq += 1
-        load_id = self._load_seq
+        load_id: int = self._load_seq
         self._pending_live_lines = []
         self._set_loading(True)
         self._load_lines = []
 
-        def _worker():
+        def _worker() -> None:
             if not path.exists():
                 self.after(0, lambda: self._finish_loading(load_id, "日誌檔案不存在。"))
                 return
@@ -158,7 +158,7 @@ class LogViewer(tk.Toplevel):
             self._set_text(content)
             self._set_loading(False)
             return
-        full_text = "\n".join(self._load_lines)
+        full_text: str = "\n".join(self._load_lines)
         if self._pending_live_lines:
             full_text = "\n".join([full_text, *self._pending_live_lines]) if full_text else "\n".join(
                 self._pending_live_lines
@@ -169,7 +169,7 @@ class LogViewer(tk.Toplevel):
         self._set_loading(False)
 
     def _append_line(self, line: str) -> None:
-        tag = self._level_tag(line)
+        tag: str = self._level_tag(line)
         self.txt_log.configure(state="normal")
         self.txt_log.insert("end", line + "\n", tag)
         self.txt_log.configure(state="disabled")
@@ -196,8 +196,8 @@ class LogViewer(tk.Toplevel):
     def _set_center_text(self, text: str) -> None:
         self.txt_log.configure(state="normal")
         self.txt_log.delete("1.0", "end")
-        total_lines = self._visible_lines()
-        pad_lines = max(0, (total_lines // 2) - 1)
+        total_lines: int = self._visible_lines()
+        pad_lines: int = max(0, (total_lines // 2) - 1)
         if pad_lines:
             self.txt_log.insert("1.0", "\n" * pad_lines)
         self.txt_log.insert("end", text, "LOADING")
@@ -210,8 +210,8 @@ class LogViewer(tk.Toplevel):
 
     def _visible_lines(self) -> int:
         try:
-            height = max(1, self.txt_log.winfo_height())
-            line_px = max(1, int(self.txt_log.dlineinfo("1.0")[3]))
+            height: int = max(1, self.txt_log.winfo_height())
+            line_px: int = max(1, int(self.txt_log.dlineinfo("1.0")[3]))
             return max(1, height // line_px)
         except Exception:
             return 1
@@ -231,7 +231,7 @@ class LogViewer(tk.Toplevel):
     def _poll_log_queue(self) -> None:
         try:
             while True:
-                line = self._log_queue.get_nowait()
+                line: str = self._log_queue.get_nowait()
                 if self._loading and self._current_file and self._live_file and self._current_file == self._live_file:
                     self._pending_live_lines.append(line)
                 elif self._current_file and self._live_file and self._current_file == self._live_file:
@@ -242,7 +242,7 @@ class LogViewer(tk.Toplevel):
         self.after(200, self._poll_log_queue)
 
     def _on_file_selected(self, _event=None) -> None:
-        name = self._var_file.get()
+        name: str = self._var_file.get()
         for path in self._files:
             if path.name == name:
                 self._set_current_file(path)
@@ -275,17 +275,17 @@ class LogViewer(tk.Toplevel):
             self.btn_prev.configure(state="disabled")
             self.btn_next.configure(state="disabled")
             return
-        idx = self._files.index(self._current_file)
+        idx: int = self._files.index(self._current_file)
         self.btn_prev.configure(state="disabled" if idx <= 0 else "normal")
         self.btn_next.configure(state="disabled" if idx >= len(self._files) - 1 else "normal")
 
     def _copy_all(self) -> None:
-        text = self.txt_log.get("1.0", "end-1c")
+        text: str = self.txt_log.get("1.0", "end-1c")
         self._copy_to_clipboard(text)
 
     def _copy_selection(self) -> None:
         try:
-            text = self.txt_log.get("sel.first", "sel.last")
+            text: str = self.txt_log.get("sel.first", "sel.last")
         except Exception:
             messagebox.showinfo("複製", "請先選取要複製的文字。")
             return
@@ -298,10 +298,10 @@ class LogViewer(tk.Toplevel):
 
     def _center_on_screen(self) -> None:
         self.update_idletasks()
-        w = self.winfo_reqwidth()
-        h = self.winfo_reqheight()
-        x = (self.winfo_screenwidth() - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
+        w: int = self.winfo_reqwidth()
+        h: int = self.winfo_reqheight()
+        x: int = (self.winfo_screenwidth() - w) // 2
+        y: int = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _close(self) -> None:
