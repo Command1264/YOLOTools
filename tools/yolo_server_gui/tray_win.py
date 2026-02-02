@@ -7,7 +7,7 @@ import threading
 from ctypes import wintypes
 from typing import Callable, Optional
 
-from tray import TrayBase
+from tray_base import TrayBase
 
 PTR_SIZE: int = ctypes.sizeof(ctypes.c_void_p)
 ULONG_PTR = wintypes.ULONG if PTR_SIZE == 4 else ctypes.c_uint64

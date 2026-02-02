@@ -18,7 +18,8 @@ import yaml
 from log_manager import LogContext, setup_logging
 from log_viewer import LogViewer
 from server import YoloServer
-from tray import TrayBase, create_tray_icon
+from tray import create_tray_icon
+from tray_base import TrayBase
 
 APP_DIR: Path = Path(__file__).resolve().parent
 CONFIG_PATH: Path = APP_DIR / "yolo_server_gui_config.yml"
