@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 from http import HTTPStatus
+from logging import Logger
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
@@ -12,7 +14,7 @@ from flask import Flask, Response, request
 from werkzeug.serving import make_server
 
 from log_manager import get_logger
-from yolo_engine import YoloEngine
+from yolo_engine import Detection, YoloEngine
 
 
 def _strip_data_url(data: str) -> str:
@@ -35,14 +37,14 @@ def _decode_base64_image(b64_str: str) -> Optional[np.ndarray]:
         return None
 
 
-def _pick_top1(dets) -> Tuple[str, float]:
+def _pick_top1(dets: list[Detection]) -> Tuple[str, float]:
     if not dets:
         return "none", 0.0
-    best = max(dets, key=lambda d: d.conf)
+    best: Detection = max(dets, key=lambda d: d.conf)
     return best.class_name, float(best.conf)
 
-def _dets_to_payload(dets) -> list[Dict[str, Any]]:
-    payload = []
+def _dets_to_payload(dets: list[Detection]) -> list[Dict[str, Any]]:
+    payload: list[Dict[str, Any]] = []
     for d in dets or []:
         payload.append(
             {
@@ -64,18 +66,21 @@ class YoloServer:
         host: str,
         port: int,
         conf: float = 0.25,
-        logger=None,
-    ):
-        self.model_path = model_path
-        self.host = host
-        self.port = port
-        self.conf = conf
-        self._logger = logger or get_logger()
-        self._engine = YoloEngine(model_path)
-        self._app = Flask(__name__)
+        logger: Optional[Logger] = None,
+        icon_path: Optional[str] = None,
+    ) -> None:
+        self.model_path: str = model_path
+        self.host: str = host
+        self.port: int = port
+        self.conf: float = conf
+        self._logger: Logger = logger or get_logger()
+        self._icon_path: Optional[str] = icon_path
+        self._engine: YoloEngine = YoloEngine(model_path)
+        self._app: Flask = Flask(__name__)
         self._app.add_url_rule("/", "index", self._handle_index, methods=["GET"])
+        self._app.add_url_rule("/favicon.ico", "favicon", self._handle_favicon, methods=["GET"])
         self._app.add_url_rule("/detect", "detect", self._handle_detect, methods=["POST"])
-        self._server = None
+        self._server: Optional[object] = None
         self._thread: Optional[threading.Thread] = None
 
     def is_running(self) -> bool:
@@ -88,7 +93,9 @@ class YoloServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         try:
-            self._logger.info("Server started. host=%s port=%s", self.host, self.port)
+            self._logger.info(
+                "Server started. host=%s port=%s", self.host, self.port
+            )
         except Exception:
             pass
 
@@ -114,6 +121,13 @@ class YoloServer:
         except Exception:
             pass
 
+    def get_device_name(self) -> str:
+        try:
+            self._engine.load()
+            return self._engine.device_name
+        except Exception:
+            return "unknown"
+
     def _create_server(self):
         try:
             return make_server(self.host, self.port, self._app, threaded=True)
@@ -130,8 +144,18 @@ class YoloServer:
     def _handle_index(self) -> Response:
         return self._text_response(HTTPStatus.OK, "YOLO Server is running...")
 
+    def _handle_favicon(self) -> Response:
+        if self._icon_path and os.path.exists(self._icon_path):
+            try:
+                with open(self._icon_path, "rb") as f:
+                    data = f.read()
+                return Response(data, status=HTTPStatus.OK.value, content_type="image/png")
+            except Exception:
+                return self._text_response(HTTPStatus.INTERNAL_SERVER_ERROR, "favicon load error")
+        return self._text_response(HTTPStatus.NOT_FOUND, "favicon not found")
+
     def _handle_detect(self) -> Response:
-        payload = request.get_json(silent=True)
+        payload: Any = request.get_json(silent=True)
         if not isinstance(payload, dict):
             try:
                 self._logger.warning("Detect request with invalid JSON.")
@@ -139,26 +163,26 @@ class YoloServer:
                 pass
             return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
 
-        thread_name = payload.get("threadName", "")
+        thread_name: str = payload.get("threadName", "")
         if "image" in payload:
-            result = self._infer_single(payload.get("image", ""), self.conf)
+            result: Dict[str, Any] = self._infer_single(payload.get("image", ""), self.conf)
             return self._json_response(HTTPStatus.OK, {"threadName": thread_name, "result": result})
 
         if "images" in payload:
-            images = payload.get("images", [])
+            images: Any = payload.get("images", [])
             if not isinstance(images, list):
                 try:
                     self._logger.warning("Detect request with invalid images list.")
                 except Exception:
                     pass
                 return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "images must be list"})
-            results = [self._infer_single(img, self.conf) for img in images]
+            results: list[Dict[str, Any]] = [self._infer_single(img, self.conf) for img in images]
             return self._json_response(HTTPStatus.OK, {"threadName": thread_name, "result": results})
 
         return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "missing image or images"})
 
     def _infer_single(self, image_b64: str, conf: float) -> Dict[str, Any]:
-        img = _decode_base64_image(image_b64)
+        img: Optional[np.ndarray] = _decode_base64_image(image_b64)
         if img is None:
             return {"classifyType": "none", "percentage": 0.0, "detections": []}
         try:
