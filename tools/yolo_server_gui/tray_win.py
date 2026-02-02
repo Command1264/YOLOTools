@@ -7,7 +7,9 @@ import threading
 from ctypes import wintypes
 from typing import Callable, Optional
 
-PTR_SIZE = ctypes.sizeof(ctypes.c_void_p)
+from tray import TrayBase
+
+PTR_SIZE: int = ctypes.sizeof(ctypes.c_void_p)
 ULONG_PTR = wintypes.ULONG if PTR_SIZE == 4 else ctypes.c_uint64
 HWND = getattr(wintypes, "HWND", ctypes.c_void_p)
 HICON = getattr(wintypes, "HICON", ctypes.c_void_p)
@@ -44,22 +46,19 @@ class _MSG(ctypes.Structure):
 
 MSG = getattr(wintypes, "MSG", _MSG)
 
-class TrayIcon:
+class TrayIcon(TrayBase):
     def __init__(
         self,
         tooltip: str,
         on_exit: Optional[Callable[[], None]] = None,
         on_show: Optional[Callable[[], None]] = None,
         icon_path: Optional[str] = None,
-    ):
-        self.tooltip = tooltip
-        self.on_exit = on_exit
-        self.on_show = on_show
-        self.icon_path = icon_path
+    ) -> None:
+        super().__init__(tooltip, on_exit=on_exit, on_show=on_show, icon_path=icon_path)
         self._thread: Optional[threading.Thread] = None
-        self._ready = threading.Event()
-        self._hwnd = None
-        self._wndproc = None
+        self._ready: threading.Event = threading.Event()
+        self._hwnd: Optional[int] = None
+        self._wndproc: Optional[Callable[..., int]] = None
 
     def start(self) -> None:
         if os.name != "nt":
@@ -94,23 +93,23 @@ class TrayIcon:
         user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
         user32.DispatchMessageW.restype = LRESULT
 
-        WM_USER = 0x0400
-        WM_COMMAND = 0x0111
-        WM_DESTROY = 0x0002
-        WM_LBUTTONDBLCLK = 0x0203
-        WM_RBUTTONUP = 0x0205
+        WM_USER: int = 0x0400
+        WM_COMMAND: int = 0x0111
+        WM_DESTROY: int = 0x0002
+        WM_LBUTTONDBLCLK: int = 0x0203
+        WM_RBUTTONUP: int = 0x0205
 
-        NIF_MESSAGE = 0x0001
-        NIF_ICON = 0x0002
-        NIF_TIP = 0x0004
-        NIM_ADD = 0x0000
-        NIM_DELETE = 0x0002
+        NIF_MESSAGE: int = 0x0001
+        NIF_ICON: int = 0x0002
+        NIF_TIP: int = 0x0004
+        NIM_ADD: int = 0x0000
+        NIM_DELETE: int = 0x0002
 
-        TPM_LEFTALIGN = 0x0000
-        TPM_BOTTOMALIGN = 0x0020
+        TPM_LEFTALIGN: int = 0x0000
+        TPM_BOTTOMALIGN: int = 0x0020
 
-        ID_TRAY_EXIT = 1001
-        CALLBACK_MESSAGE = WM_USER + 20
+        ID_TRAY_EXIT: int = 1001
+        CALLBACK_MESSAGE: int = WM_USER + 20
 
         class WNDCLASS(ctypes.Structure):
             _fields_ = [
@@ -137,13 +136,13 @@ class TrayIcon:
                 ("szTip", WCHAR * 128),
             ]
 
-        def _load_icon():
+        def _load_icon() -> int:
             if self.icon_path and os.path.exists(self.icon_path):
                 return user32.LoadImageW(0, self.icon_path, 1, 0, 0, 0x00000010)
             return user32.LoadIconW(0, 0x7F00)
 
         @WNDPROC
-        def _wndproc(hwnd, msg, wparam, lparam):
+        def _wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
             if msg == CALLBACK_MESSAGE:
                 if lparam == WM_RBUTTONUP:
                     self._show_menu(hwnd, ID_TRAY_EXIT)
@@ -157,7 +156,7 @@ class TrayIcon:
                         self.on_exit()
                 return 0
             if msg == WM_DESTROY:
-                nid = NOTIFYICONDATA()
+                nid: NOTIFYICONDATA = NOTIFYICONDATA()
                 nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
                 nid.hWnd = hwnd
                 nid.uID = 1
@@ -167,15 +166,15 @@ class TrayIcon:
             return user32.DefWindowProcW(HWND(hwnd), UINT(msg), WPARAM(wparam), LPARAM(lparam))
 
         self._wndproc = _wndproc
-        hinst = kernel32.GetModuleHandleW(None)
-        class_name = "YoloServerTrayWindow"
-        wndclass = WNDCLASS()
+        hinst: int = kernel32.GetModuleHandleW(None)
+        class_name: str = "YoloServerTrayWindow"
+        wndclass: WNDCLASS = WNDCLASS()
         wndclass.lpfnWndProc = _wndproc
         wndclass.hInstance = hinst
         wndclass.lpszClassName = class_name
         user32.RegisterClassW(ctypes.byref(wndclass))
 
-        hwnd = user32.CreateWindowExW(
+        hwnd: int = user32.CreateWindowExW(
             0,
             class_name,
             class_name,
@@ -191,7 +190,7 @@ class TrayIcon:
         )
         self._hwnd = hwnd
 
-        nid = NOTIFYICONDATA()
+        nid: NOTIFYICONDATA = NOTIFYICONDATA()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
         nid.hWnd = hwnd
         nid.uID = 1
@@ -203,7 +202,7 @@ class TrayIcon:
 
         self._ready.set()
 
-        msg = MSG()
+        msg: MSG = MSG()
         while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
@@ -212,9 +211,9 @@ class TrayIcon:
 
     def _show_menu(self, hwnd, exit_id: int) -> None:
         user32 = ctypes.windll.user32
-        menu = user32.CreatePopupMenu()
+        menu: int = user32.CreatePopupMenu()
         user32.AppendMenuW(menu, 0x0000, exit_id, "關閉")
-        pt = POINT()
+        pt: POINT = POINT()
         user32.GetCursorPos(ctypes.byref(pt))
         user32.SetForegroundWindow(hwnd)
         user32.TrackPopupMenu(
