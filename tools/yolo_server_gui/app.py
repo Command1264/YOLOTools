@@ -4,7 +4,9 @@ import ipaddress
 import os
 import queue
 import sys
+import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from logging import Logger
 from pathlib import Path
@@ -13,6 +15,7 @@ from typing import Any, Optional, Tuple
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import portalocker
 import yaml
 
 from log_manager import LogContext, LogController, setup_logging
@@ -33,6 +36,7 @@ CLOSE_LABELS: dict[str, str] = {
 }
 
 APP_LOG_CTRL: LogController = LogController()
+LOCK_FILE_NAME: str = "yolo_server_gui.lock"
 
 
 def normalize_path(path_str: str) -> str:
@@ -156,8 +160,72 @@ def build_startup_command() -> str:
     return f'"{sys.executable}" "{Path(__file__).resolve()}"'
 
 
+class SingleInstanceLock:
+    def __init__(self, lock_path: Path, log_ctrl: LogController) -> None:
+        self._lock_path: Path = lock_path
+        self._log_ctrl: LogController = log_ctrl
+        self._lock = threading.Lock()
+        self._file: Optional[object] = None
+        self._stop_event = threading.Event()
+        self._retainer: Optional[threading.Thread] = None
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._file is not None:
+                return True
+            try:
+                handle = open(self._lock_path, "a+")
+                portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
+                self._file = handle
+                return True
+            except portalocker.exceptions.LockException:
+                try:
+                    handle.close()
+                except Exception:
+                    self._log_ctrl.exception("關閉鎖檔失敗。path=%s", str(self._lock_path))
+                return False
+            except Exception:
+                self._log_ctrl.exception("取得鎖失敗。path=%s", str(self._lock_path))
+                try:
+                    handle.close()
+                except Exception:
+                    self._log_ctrl.exception("關閉鎖檔失敗。path=%s", str(self._lock_path))
+                return False
+
+    def start_retainer(self, interval_sec: float = 3.0) -> None:
+        if self._retainer and self._retainer.is_alive():
+            return
+
+        def _worker() -> None:
+            while not self._stop_event.is_set():
+                if self._file is None:
+                    self.try_acquire()
+                time.sleep(interval_sec)
+
+        self._retainer = threading.Thread(target=_worker, daemon=True)
+        self._retainer.start()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._file is None:
+                return
+            try:
+                portalocker.unlock(self._file)
+            except Exception:
+                self._log_ctrl.exception("釋放鎖失敗。path=%s", str(self._lock_path))
+            try:
+                self._file.close()
+            except Exception:
+                self._log_ctrl.exception("關閉鎖檔失敗。path=%s", str(self._lock_path))
+            self._file = None
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.release()
+
+
 class App(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, instance_lock: Optional[SingleInstanceLock] = None) -> None:
         super().__init__()
         self.title("YOLO Server")
         self.geometry("720x360")
@@ -175,6 +243,7 @@ class App(tk.Tk):
         self._tray_queue: queue.Queue[str] = queue.Queue()
         self._log_viewer: Optional[LogViewer] = None
         self._settings_win: Optional[tk.Toplevel] = None
+        self._instance_lock: Optional[SingleInstanceLock] = instance_lock
         self.tray: TrayBase = create_tray_icon(
             tooltip="YOLO Server",
             on_exit=self._enqueue_tray_exit,
@@ -506,6 +575,11 @@ class App(tk.Tk):
             self.tray.stop()
         except Exception:
             self.log_ctrl.exception("停止 tray 時發生錯誤。")
+        try:
+            if self._instance_lock is not None:
+                self._instance_lock.stop()
+        except Exception:
+            self.log_ctrl.exception("釋放執行鎖失敗。")
         self.log_ctrl.info("GUI 結束。")
         self.destroy()
 
@@ -530,5 +604,16 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = App()
+    lock_path = Path(tempfile.gettempdir()) / LOCK_FILE_NAME
+    instance_lock = SingleInstanceLock(lock_path, APP_LOG_CTRL)
+    allow_start = True
+    if not instance_lock.try_acquire():
+        temp_root = tk.Tk()
+        temp_root.withdraw()
+        allow_start = messagebox.askyesno("已在執行", "偵測到已有程式在執行。\n仍要開啟新的視窗嗎？")
+        temp_root.destroy()
+    if not allow_start:
+        sys.exit(0)
+    instance_lock.start_retainer()
+    app = App(instance_lock=instance_lock)
     app.mainloop()
