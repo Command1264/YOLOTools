@@ -8,7 +8,7 @@ from typing import Callable, Optional
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from log_manager import get_active_log_file, get_log_queue, list_log_files
+from log_manager import LogController, get_active_log_file, get_log_queue, get_logger, list_log_files
 
 
 class LogViewer(tk.Toplevel):
@@ -18,6 +18,7 @@ class LogViewer(tk.Toplevel):
         super().__init__(parent)
         self._parent: tk.Tk = parent
         self._on_close: Optional[Callable[[], None]] = on_close
+        self._log_ctrl: LogController = LogController(get_logger())
         self._log_queue: queue.Queue[str] = get_log_queue()
         self._files: list[Path] = []
         self._current_file: Optional[Path] = None
@@ -46,7 +47,7 @@ class LogViewer(tk.Toplevel):
             else:
                 self._center_on_screen()
         except Exception:
-            pass
+            self._log_ctrl.exception("日誌視窗置中失敗。")
 
         self.after(0, self._deferred_load)
 
@@ -309,5 +310,5 @@ class LogViewer(tk.Toplevel):
             try:
                 self._on_close()
             except Exception:
-                pass
+                self._log_ctrl.exception("日誌視窗關閉回呼失敗。")
         self.destroy()

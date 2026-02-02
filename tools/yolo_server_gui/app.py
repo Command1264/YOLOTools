@@ -15,7 +15,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import yaml
 
-from log_manager import LogContext, setup_logging
+from log_manager import LogContext, LogController, setup_logging
 from log_viewer import LogViewer
 from server import YoloServer
 from tray import create_tray_icon
@@ -31,6 +31,8 @@ CLOSE_LABELS: dict[str, str] = {
     "minimize": "縮到工具列",
     "exit": "直接關閉",
 }
+
+APP_LOG_CTRL: LogController = LogController()
 
 
 def normalize_path(path_str: str) -> str:
@@ -113,7 +115,7 @@ class AppConfig:
                 encoding="utf-8",
             )
         except Exception:
-            pass
+            APP_LOG_CTRL.exception("儲存設定失敗。path=%s", str(path))
 
 
 def validate_host(value: str) -> Tuple[bool, str]:
@@ -165,7 +167,8 @@ class App(tk.Tk):
 
         self.log_context: LogContext = setup_logging(APP_DIR)
         self.logger: Logger = self.log_context.logger
-        self.logger.info("GUI 啟動")
+        self.log_ctrl: LogController = LogController(self.logger)
+        self.log_ctrl.info("GUI 啟動")
 
         self.cfg: AppConfig = AppConfig.load(CONFIG_PATH)
         self.server: Optional[YoloServer] = None
@@ -307,20 +310,14 @@ class App(tk.Tk):
             self.server.start()
         except Exception as e:
             self.server = None
-            try:
-                self.logger.exception("啟動伺服器失敗。")
-            except Exception:
-                pass
+            self.log_ctrl.exception("啟動伺服器失敗。")
             messagebox.showerror("啟動失敗", f"無法啟動伺服器：\n{e}")
             return
         self._set_running_state(True)
         self.var_status.set(f"狀態：執行中 http://{host}:{port}")
         self.var_device.set("裝置：載入中...")
         self._load_device_async()
-        try:
-            self.logger.info("伺服器已啟動。host=%s port=%s", host, port)
-        except Exception:
-            pass
+        self.log_ctrl.info("伺服器已啟動。host=%s port=%s", host, port)
 
     def _stop_server(self) -> None:
         try:
@@ -331,10 +328,7 @@ class App(tk.Tk):
         self._set_running_state(False)
         self.var_status.set("狀態：未啟動")
         self.var_device.set("裝置：未啟動")
-        try:
-            self.logger.info("伺服器已停止。")
-        except Exception:
-            pass
+        self.log_ctrl.info("伺服器已停止。")
 
     def _set_running_state(self, running: bool) -> None:
         state: str = "disabled" if running else "normal"
@@ -350,15 +344,12 @@ class App(tk.Tk):
                 self._log_viewer.lift()
                 return
             except Exception:
-                pass
+                self.log_ctrl.exception("無法提升日誌視窗。")
 
         def _on_close() -> None:
             self._log_viewer = None
 
-        try:
-            self.logger.info("開啟運行日誌視窗。")
-        except Exception:
-            pass
+        self.log_ctrl.info("開啟運行日誌視窗。")
         self._log_viewer = LogViewer(self, on_close=_on_close)
 
     def _open_settings(self) -> None:
@@ -367,7 +358,7 @@ class App(tk.Tk):
                 self._settings_win.lift()
                 return
             except Exception:
-                pass
+                self.log_ctrl.exception("無法提升設定視窗。")
         top: tk.Toplevel = tk.Toplevel(self)
         self._settings_win = top
         top.title("設定")
@@ -424,13 +415,13 @@ class App(tk.Tk):
         try:
             self._tray_queue.put_nowait("show")
         except Exception:
-            pass
+            self.log_ctrl.exception("加入顯示事件到 tray 佇列失敗。")
 
     def _enqueue_tray_exit(self) -> None:
         try:
             self._tray_queue.put_nowait("exit")
         except Exception:
-            pass
+            self.log_ctrl.exception("加入退出事件到 tray 佇列失敗。")
 
     def _poll_tray_queue(self) -> None:
         try:
@@ -504,21 +495,18 @@ class App(tk.Tk):
             self.lift()
             self.focus_force()
         except Exception:
-            pass
+            self.log_ctrl.exception("還原視窗失敗。")
 
     def _exit_app(self) -> None:
         try:
             self._stop_server()
         except Exception:
-            pass
+            self.log_ctrl.exception("停止伺服器時發生錯誤。")
         try:
             self.tray.stop()
         except Exception:
-            pass
-        try:
-            self.logger.info("GUI 結束。")
-        except Exception:
-            pass
+            self.log_ctrl.exception("停止 tray 時發生錯誤。")
+        self.log_ctrl.info("GUI 結束。")
         self.destroy()
 
     def _load_device_async(self) -> None:
@@ -538,10 +526,7 @@ class App(tk.Tk):
         if not self.server:
             return
         self.var_device.set(f"裝置：{device_name}")
-        try:
-            self.logger.info("使用裝置：%s", device_name)
-        except Exception:
-            pass
+        self.log_ctrl.info("使用裝置：%s", device_name)
 
 
 if __name__ == "__main__":

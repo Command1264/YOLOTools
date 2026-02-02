@@ -12,8 +12,11 @@ except Exception:
     Image = None
     ImageDraw = None
 
+from log_manager import LogController, get_logger
 from tray_base import TrayBase
 from tray_win import TrayIcon as _WinTrayIcon
+
+TRAY_LOG_CTRL: LogController = LogController(get_logger())
 
 
 class _NoopTray(TrayBase):
@@ -82,7 +85,7 @@ class _PystrayTray(TrayBase):
             try:
                 return Image.open(self.icon_path)
             except Exception:
-                pass
+                TRAY_LOG_CTRL.exception("Tray 圖示載入失敗。path=%s", self.icon_path)
         return self._default_image()
 
     @staticmethod

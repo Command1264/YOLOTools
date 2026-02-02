@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple
 
 LOGGER_NAME: str = "yolo_server_gui"
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -180,6 +180,59 @@ def get_logger() -> logging.Logger:
     if not logger.handlers:
         logger.addHandler(logging.NullHandler())
     return logger
+
+
+class LogController:
+    """Provide safe logging APIs to avoid scattered try/except blocks."""
+
+    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+        self._logger: logging.Logger = logger or get_logger()
+
+    @staticmethod
+    def _handle_error(method: str, exc: Exception) -> None:
+        try:
+            print(f"[LogController] {method} failed: {exc}", file=sys.stderr)
+        except Exception:
+            return
+
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        try:
+            self._logger.info(msg, *args, **kwargs)
+        except Exception as exc:
+            self._handle_error("info", exc)
+
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        try:
+            self._logger.warning(msg, *args, **kwargs)
+        except Exception as exc:
+            self._handle_error("warning", exc)
+
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        try:
+            self._logger.error(msg, *args, **kwargs)
+        except Exception as exc:
+            self._handle_error("error", exc)
+
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        try:
+            self._logger.exception(msg, *args, **kwargs)
+        except Exception as exc:
+            self._handle_error("exception", exc)
+
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        try:
+            self._logger.debug(msg, *args, **kwargs)
+        except Exception as exc:
+            self._handle_error("debug", exc)
+
+    def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None:
+        try:
+            self._logger.log(level, msg, *args, **kwargs)
+        except Exception as exc:
+            self._handle_error("log", exc)
+
+    def get_logger(self) -> logging.Logger:
+        return self._logger
 
 
 def get_log_queue() -> queue.Queue[str]:

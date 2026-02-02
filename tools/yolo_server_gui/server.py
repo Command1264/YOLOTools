@@ -13,7 +13,7 @@ import numpy as np
 from flask import Flask, Response, request
 from werkzeug.serving import make_server
 
-from log_manager import get_logger
+from log_manager import LogController, get_logger
 from yolo_engine import Detection, YoloEngine
 
 
@@ -74,6 +74,7 @@ class YoloServer:
         self.port: int = port
         self.conf: float = conf
         self._logger: Logger = logger or get_logger()
+        self._log_ctrl: LogController = LogController(self._logger)
         self._icon_path: Optional[str] = icon_path
         self._engine: YoloEngine = YoloEngine(model_path)
         self._app: Flask = Flask(__name__)
@@ -92,12 +93,7 @@ class YoloServer:
         self._server = self._create_server()
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
-        try:
-            self._logger.info(
-                "Server started. host=%s port=%s", self.host, self.port
-            )
-        except Exception:
-            pass
+        self._log_ctrl.info("Server started. host=%s port=%s", self.host, self.port)
 
     def stop(self) -> None:
         if self._server is None:
@@ -108,18 +104,12 @@ class YoloServer:
         finally:
             self._server = None
             self._thread = None
-        try:
-            self._logger.info("Server stopped.")
-        except Exception:
-            pass
+        self._log_ctrl.info("Server stopped.")
 
     def update_model(self, model_path: str) -> None:
         self.model_path = model_path
         self._engine = YoloEngine(model_path, conf=self.conf)
-        try:
-            self._logger.info("Model updated. model_path=%s", model_path)
-        except Exception:
-            pass
+        self._log_ctrl.info("Model updated. model_path=%s", model_path)
 
     def get_device_name(self) -> str:
         try:
@@ -157,10 +147,7 @@ class YoloServer:
     def _handle_detect(self) -> Response:
         payload: Any = request.get_json(silent=True)
         if not isinstance(payload, dict):
-            try:
-                self._logger.warning("Detect request with invalid JSON.")
-            except Exception:
-                pass
+            self._log_ctrl.warning("Detect request with invalid JSON.")
             return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
 
         thread_name: str = payload.get("threadName", "")
@@ -171,10 +158,7 @@ class YoloServer:
         if "images" in payload:
             images: Any = payload.get("images", [])
             if not isinstance(images, list):
-                try:
-                    self._logger.warning("Detect request with invalid images list.")
-                except Exception:
-                    pass
+                self._log_ctrl.warning("Detect request with invalid images list.")
                 return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "images must be list"})
             results: list[Dict[str, Any]] = [self._infer_single(img, self.conf) for img in images]
             return self._json_response(HTTPStatus.OK, {"threadName": thread_name, "result": results})
@@ -188,10 +172,7 @@ class YoloServer:
         try:
             _, dets = self._engine.infer(img, conf=conf)
         except Exception:
-            try:
-                self._logger.exception("Inference failed.")
-            except Exception:
-                pass
+            self._log_ctrl.exception("Inference failed.")
             return {"classifyType": "none", "percentage": 0.0, "detections": []}
         cls_name, score = _pick_top1(dets)
         return {

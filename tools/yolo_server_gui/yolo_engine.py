@@ -6,6 +6,7 @@ import torch
 from ultralytics import YOLO
 from ultralytics.utils.plotting import Colors
 
+from log_manager import LogController, get_logger
 
 @dataclass
 class Detection:
@@ -26,6 +27,7 @@ class YoloEngine:
         self._cuda_available: bool = False
         self._device_name: str = "unknown"
         self._colors: Colors = Colors()
+        self._log_ctrl: LogController = LogController(get_logger())
 
     def load(self) -> None:
         self._cuda_available = torch.cuda.is_available()
@@ -38,7 +40,7 @@ class YoloEngine:
                 try:
                     self._model.to(self.device)
                 except Exception:
-                    pass
+                    self._log_ctrl.exception("模型載入後切換裝置失敗。device=%s", self.device)
         # Resolve actual device after model is loaded.
         self._device_name = self._resolve_device_name()
 
