@@ -4,7 +4,9 @@ import ipaddress
 import os
 import queue
 import sys
+import threading
 from dataclasses import dataclass
+from logging import Logger
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -13,17 +15,17 @@ from tkinter import ttk, filedialog, messagebox
 
 import yaml
 
-from log_manager import setup_logging
+from log_manager import LogContext, setup_logging
 from log_viewer import LogViewer
 from server import YoloServer
-from tray import TrayIcon
+from tray import TrayBase, create_tray_icon
 
-APP_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = APP_DIR / "yolo_server_gui_config.yml"
-STARTUP_FILE = "yolo_server_gui_startup.cmd"
-ICON_PATH = APP_DIR / "yolo_server_icon.png"
+APP_DIR: Path = Path(__file__).resolve().parent
+CONFIG_PATH: Path = APP_DIR / "yolo_server_gui_config.yml"
+STARTUP_FILE: str = "yolo_server_gui_startup.cmd"
+ICON_PATH: Path = APP_DIR / "yolo_server_icon.png"
 
-CLOSE_LABELS = {
+CLOSE_LABELS: dict[str, str] = {
     "ask": "詢問",
     "minimize": "縮到工具列",
     "exit": "直接關閉",
@@ -152,23 +154,24 @@ def build_startup_command() -> str:
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.title("YOLO Server")
         self.geometry("720x360")
         self.minsize(640, 320)
-        self._app_icon = tk.PhotoImage(file=str(ICON_PATH))
+        self._app_icon: tk.PhotoImage = tk.PhotoImage(file=str(ICON_PATH))
         self.iconphoto(True, self._app_icon)
 
-        self.log_context = setup_logging(APP_DIR)
-        self.logger = self.log_context.logger
+        self.log_context: LogContext = setup_logging(APP_DIR)
+        self.logger: Logger = self.log_context.logger
         self.logger.info("GUI 啟動")
 
-        self.cfg = AppConfig.load(CONFIG_PATH)
+        self.cfg: AppConfig = AppConfig.load(CONFIG_PATH)
         self.server: Optional[YoloServer] = None
         self._tray_queue: queue.Queue[str] = queue.Queue()
         self._log_viewer: Optional[LogViewer] = None
-        self.tray = TrayIcon(
+        self._settings_win: Optional[tk.Toplevel] = None
+        self.tray: TrayBase = create_tray_icon(
             tooltip="YOLO Server",
             on_exit=self._enqueue_tray_exit,
             on_show=self._enqueue_tray_show,
@@ -185,58 +188,62 @@ class App(tk.Tk):
         if self.cfg.auto_start_server:
             self.after(200, self._start_server)
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         self._build_menu()
 
-        wrap = ttk.Frame(self, padding=16)
+        wrap: ttk.Frame = ttk.Frame(self, padding=16)
         wrap.pack(fill="both", expand=True)
 
-        r = 0
+        r: int = 0
         ttk.Label(wrap, text="模型路徑").grid(row=r, column=0, sticky="w", pady=6)
-        self.var_model_path = tk.StringVar()
-        self.ent_model = ttk.Entry(wrap, textvariable=self.var_model_path)
+        self.var_model_path: tk.StringVar = tk.StringVar()
+        self.ent_model: ttk.Entry = ttk.Entry(wrap, textvariable=self.var_model_path)
         self.ent_model.grid(row=r, column=1, sticky="we", padx=8)
-        self.btn_pick_model = ttk.Button(wrap, text="選擇...", command=self._pick_model)
+        self.btn_pick_model: ttk.Button = ttk.Button(wrap, text="選擇...", command=self._pick_model)
         self.btn_pick_model.grid(row=r, column=2, sticky="e")
 
         r += 1
         ttk.Label(wrap, text="IP").grid(row=r, column=0, sticky="w", pady=6)
-        self.var_host = tk.StringVar()
-        self.var_port = tk.StringVar()
-        ip_row = ttk.Frame(wrap)
+        self.var_host: tk.StringVar = tk.StringVar()
+        self.var_port: tk.StringVar = tk.StringVar()
+        ip_row: ttk.Frame = ttk.Frame(wrap)
         ip_row.grid(row=r, column=1, sticky="we", padx=8)
-        self.ent_host = ttk.Entry(ip_row, textvariable=self.var_host)
+        self.ent_host: ttk.Entry = ttk.Entry(ip_row, textvariable=self.var_host)
         self.ent_host.pack(side="left", fill="x", expand=True)
         ttk.Label(ip_row, text="Port").pack(side="left", padx=(12, 6))
-        self.ent_port = ttk.Entry(ip_row, textvariable=self.var_port, width=10)
+        self.ent_port: ttk.Entry = ttk.Entry(ip_row, textvariable=self.var_port, width=10)
         self.ent_port.pack(side="left")
 
         r += 1
-        self.btn_toggle = ttk.Button(wrap, text="啟動伺服器", command=self._toggle_server)
+        self.btn_toggle: ttk.Button = ttk.Button(wrap, text="啟動伺服器", command=self._toggle_server)
         self.btn_toggle.grid(row=r, column=0, sticky="w", pady=12)
-        self.var_status = tk.StringVar(value="狀態：未啟動")
+        self.var_status: tk.StringVar = tk.StringVar(value="狀態：未啟動")
         ttk.Label(wrap, textvariable=self.var_status).grid(row=r, column=1, sticky="w", padx=8)
+
+        r += 1
+        self.var_device: tk.StringVar = tk.StringVar(value="裝置：未啟動")
+        ttk.Label(wrap, textvariable=self.var_device).grid(row=r, column=1, sticky="w", padx=8)
 
         wrap.grid_columnconfigure(1, weight=1)
 
         self.ent_host.bind("<FocusOut>", lambda _e: self._apply_quick_settings(False))
         self.ent_port.bind("<FocusOut>", lambda _e: self._apply_quick_settings(False))
 
-    def _build_menu(self):
-        menubar = tk.Menu(self)
-        menu_more = tk.Menu(menubar, tearoff=0)
+    def _build_menu(self) -> None:
+        menubar: tk.Menu = tk.Menu(self)
+        menu_more: tk.Menu = tk.Menu(menubar, tearoff=0)
         menu_more.add_command(label="瀏覽運行日誌", command=self._open_log_viewer)
         menu_more.add_command(label="設定...", command=self._open_settings)
         menubar.add_cascade(label="更多功能", menu=menu_more)
         self.config(menu=menubar)
 
-    def _apply_config_to_ui(self):
+    def _apply_config_to_ui(self) -> None:
         self.var_model_path.set(self.cfg.model_path)
         self.var_host.set(self.cfg.host)
         self.var_port.set(str(self.cfg.port))
 
-    def _pick_model(self):
-        path = filedialog.askopenfilename(
+    def _pick_model(self) -> None:
+        path: str = filedialog.askopenfilename(
             title="選擇模型",
             initialdir=APP_DIR,
             filetypes=[("YOLO weights", "*.pt"), ("All files", "*.*")],
@@ -282,20 +289,20 @@ class App(tk.Tk):
         self.var_port.set(str(port_val))
         return True
 
-    def _toggle_server(self):
+    def _toggle_server(self) -> None:
         if self.server and self.server.is_running():
             self._stop_server()
         else:
             self._start_server()
 
-    def _start_server(self):
+    def _start_server(self) -> None:
         if not self._apply_quick_settings(True):
             return
-        host = self.cfg.host
-        port = int(self.cfg.port)
-        model_path = self.cfg.model_path
+        host: str = self.cfg.host
+        port: int = int(self.cfg.port)
+        model_path: str = self.cfg.model_path
         try:
-            self.server = YoloServer(model_path, host, port, logger=self.logger)
+            self.server = YoloServer(model_path, host, port, logger=self.logger, icon_path=str(ICON_PATH))
             self.server.start()
         except Exception as e:
             self.server = None
@@ -307,12 +314,14 @@ class App(tk.Tk):
             return
         self._set_running_state(True)
         self.var_status.set(f"狀態：執行中 http://{host}:{port}")
+        self.var_device.set("裝置：載入中...")
+        self._load_device_async()
         try:
             self.logger.info("伺服器已啟動。host=%s port=%s", host, port)
         except Exception:
             pass
 
-    def _stop_server(self):
+    def _stop_server(self) -> None:
         try:
             if self.server:
                 self.server.stop()
@@ -320,20 +329,21 @@ class App(tk.Tk):
             self.server = None
         self._set_running_state(False)
         self.var_status.set("狀態：未啟動")
+        self.var_device.set("裝置：未啟動")
         try:
             self.logger.info("伺服器已停止。")
         except Exception:
             pass
 
-    def _set_running_state(self, running: bool):
-        state = "disabled" if running else "normal"
+    def _set_running_state(self, running: bool) -> None:
+        state: str = "disabled" if running else "normal"
         self.ent_model.configure(state=state)
         self.ent_host.configure(state=state)
         self.ent_port.configure(state=state)
         self.btn_pick_model.configure(state=state)
         self.btn_toggle.configure(text="停止伺服器" if running else "啟動伺服器")
 
-    def _open_log_viewer(self):
+    def _open_log_viewer(self) -> None:
         if self._log_viewer is not None:
             try:
                 self._log_viewer.lift()
@@ -341,7 +351,7 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        def _on_close():
+        def _on_close() -> None:
             self._log_viewer = None
 
         try:
@@ -350,27 +360,27 @@ class App(tk.Tk):
             pass
         self._log_viewer = LogViewer(self, on_close=_on_close)
 
-    def _open_settings(self):
+    def _open_settings(self) -> None:
         if getattr(self, "_settings_win", None) is not None:
             try:
                 self._settings_win.lift()
                 return
             except Exception:
                 pass
-        top = tk.Toplevel(self)
+        top: tk.Toplevel = tk.Toplevel(self)
         self._settings_win = top
         top.title("設定")
         top.resizable(False, False)
         top.transient(self)
         top.grab_set()
 
-        wrap = ttk.Frame(top, padding=16)
+        wrap: ttk.Frame = ttk.Frame(top, padding=16)
         wrap.pack(fill="both", expand=True)
 
-        var_auto_start = tk.BooleanVar(value=bool(self.cfg.auto_start_server))
-        var_launch_startup = tk.BooleanVar(value=bool(self.cfg.launch_on_startup))
-        close_key = self.cfg.close_behavior
-        var_close_behavior = tk.StringVar(value=CLOSE_LABELS.get(close_key, "詢問"))
+        var_auto_start: tk.BooleanVar = tk.BooleanVar(value=bool(self.cfg.auto_start_server))
+        var_launch_startup: tk.BooleanVar = tk.BooleanVar(value=bool(self.cfg.launch_on_startup))
+        close_key: str = self.cfg.close_behavior
+        var_close_behavior: tk.StringVar = tk.StringVar(value=CLOSE_LABELS.get(close_key, "詢問"))
 
         ttk.Checkbutton(
             wrap, text="啟動時自動開啟伺服器", variable=var_auto_start
@@ -380,7 +390,7 @@ class App(tk.Tk):
         ).grid(row=1, column=0, sticky="w", pady=6)
 
         ttk.Label(wrap, text="關閉按鈕行為").grid(row=3, column=0, sticky="w", pady=6)
-        cmb_close = ttk.Combobox(
+        cmb_close: ttk.Combobox = ttk.Combobox(
             wrap,
             textvariable=var_close_behavior,
             state="readonly",
@@ -389,12 +399,12 @@ class App(tk.Tk):
         )
         cmb_close.grid(row=3, column=1, sticky="w", padx=6)
 
-        btns = ttk.Frame(wrap)
+        btns: ttk.Frame = ttk.Frame(wrap)
         btns.grid(row=4, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(btns, text="取消", command=lambda: _close(False)).pack(side="right")
         ttk.Button(btns, text="儲存", command=lambda: _close(True)).pack(side="right", padx=6)
 
-        def _close(save_ok: bool):
+        def _close(save_ok: bool) -> None:
             if save_ok:
                 self.cfg.auto_start_server = bool(var_auto_start.get())
                 self.cfg.launch_on_startup = bool(var_launch_startup.get())
@@ -409,22 +419,22 @@ class App(tk.Tk):
         top.protocol("WM_DELETE_WINDOW", lambda: _close(False))
         self._center_dialog(top)
 
-    def _enqueue_tray_show(self):
+    def _enqueue_tray_show(self) -> None:
         try:
             self._tray_queue.put_nowait("show")
         except Exception:
             pass
 
-    def _enqueue_tray_exit(self):
+    def _enqueue_tray_exit(self) -> None:
         try:
             self._tray_queue.put_nowait("exit")
         except Exception:
             pass
 
-    def _poll_tray_queue(self):
+    def _poll_tray_queue(self) -> None:
         try:
             while True:
-                action = self._tray_queue.get_nowait()
+                action: str = self._tray_queue.get_nowait()
                 if action == "show":
                     self._restore_window()
                 elif action == "exit":
@@ -433,24 +443,24 @@ class App(tk.Tk):
             pass
         self.after(200, self._poll_tray_queue)
 
-    def _center_dialog(self, top: tk.Toplevel):
+    def _center_dialog(self, top: tk.Toplevel) -> None:
         top.update_idletasks()
-        w = top.winfo_reqwidth()
-        h = top.winfo_reqheight()
-        x = self.winfo_rootx() + (self.winfo_width() - w) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - h) // 2
+        w: int = top.winfo_reqwidth()
+        h: int = top.winfo_reqheight()
+        x: int = self.winfo_rootx() + (self.winfo_width() - w) // 2
+        y: int = self.winfo_rooty() + (self.winfo_height() - h) // 2
         top.geometry(f"{w}x{h}+{x}+{y}")
 
-    def _apply_startup_setting(self):
+    def _apply_startup_setting(self) -> None:
         if os.name != "nt":
             return
-        enabled = bool(self.cfg.launch_on_startup)
-        path = startup_cmd_path()
+        enabled: bool = bool(self.cfg.launch_on_startup)
+        path: Optional[Path] = startup_cmd_path()
         if not path:
             return
         try:
             if enabled:
-                cmd = build_startup_command()
+                cmd: str = build_startup_command()
                 path.write_text(f"@echo off\n{cmd}\n", encoding="utf-8")
             else:
                 if path.exists():
@@ -458,10 +468,10 @@ class App(tk.Tk):
         except Exception:
             messagebox.showwarning("設定提醒", "無法更新開機啟動設定")
 
-    def _on_close_request(self):
-        behavior = self.cfg.close_behavior
+    def _on_close_request(self) -> None:
+        behavior: str = self.cfg.close_behavior
         if behavior == "ask":
-            res = messagebox.askyesnocancel(
+            res: Optional[bool] = messagebox.askyesnocancel(
                 "關閉", "要縮到工具列嗎？\n是：縮到工具列\n否：直接關閉\n取消：不動作"
             )
             if res is None:
@@ -480,14 +490,14 @@ class App(tk.Tk):
         else:
             self._exit_app()
 
-    def _minimize_to_tray(self):
+    def _minimize_to_tray(self) -> None:
         if os.name != "nt":
             self._exit_app()
             return
         self.withdraw()
         self.tray.start()
 
-    def _restore_window(self):
+    def _restore_window(self) -> None:
         try:
             self.deiconify()
             self.lift()
@@ -495,7 +505,7 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    def _exit_app(self):
+    def _exit_app(self) -> None:
         try:
             self._stop_server()
         except Exception:
@@ -509,6 +519,28 @@ class App(tk.Tk):
         except Exception:
             pass
         self.destroy()
+
+    def _load_device_async(self) -> None:
+        def _worker() -> None:
+            device_name: str = "unknown"
+            try:
+                if self.server:
+                    device_name = self.server.get_device_name()
+            except Exception:
+                device_name = "unknown"
+            self.after(0, lambda: self._apply_device_name(device_name))
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+    def _apply_device_name(self, device_name: str) -> None:
+        if not self.server:
+            return
+        self.var_device.set(f"裝置：{device_name}")
+        try:
+            self.logger.info("使用裝置：%s", device_name)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
