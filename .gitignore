@@ -24,7 +24,7 @@ workdir
 output_zips
 
 # 各種設定檔
-*config*
+*config.*
 # 避免將可生成的資料上傳
 *.json*
 
