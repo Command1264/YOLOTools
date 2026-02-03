@@ -24,10 +24,23 @@ from server import YoloServer
 from tray import create_tray_icon
 from tray_base import TrayBase
 
-APP_DIR: Path = Path(__file__).resolve().parent
-CONFIG_PATH: Path = APP_DIR / "yolo_server_gui_config.yml"
+def _resolve_exec_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _resolve_resource_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)).resolve()
+    return Path(__file__).resolve().parent
+
+
+EXEC_DIR: Path = _resolve_exec_dir()
+RESOURCE_DIR: Path = _resolve_resource_dir()
+CONFIG_PATH: Path = EXEC_DIR / "yolo_server_gui_config.yml"
 STARTUP_FILE: str = "yolo_server_gui_startup.cmd"
-ICON_PATH: Path = APP_DIR / "yolo_server_icon.png"
+ICON_PATH: Path = RESOURCE_DIR / "yolo_server_icon.png"
 
 CLOSE_LABELS: dict[str, str] = {
     "ask": "詢問",
@@ -233,7 +246,7 @@ class App(tk.Tk):
         self._app_icon: tk.PhotoImage = tk.PhotoImage(file=str(ICON_PATH))
         self.iconphoto(True, self._app_icon)
 
-        self.log_context: LogContext = setup_logging(APP_DIR)
+        self.log_context: LogContext = setup_logging(EXEC_DIR)
         self.logger: Logger = self.log_context.logger
         self.log_ctrl: LogController = LogController(self.logger)
         self.log_ctrl.info("GUI 啟動")
@@ -318,7 +331,7 @@ class App(tk.Tk):
     def _pick_model(self) -> None:
         path: str = filedialog.askopenfilename(
             title="選擇模型",
-            initialdir=APP_DIR,
+            initialdir=EXEC_DIR,
             filetypes=[("YOLO weights", "*.pt"), ("All files", "*.*")],
         )
         if path:
