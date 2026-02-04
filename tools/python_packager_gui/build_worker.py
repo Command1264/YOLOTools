@@ -32,6 +32,9 @@ class BuildSettings:
     debug: bool
     runtime_tmp: str
     lto: bool
+    show_progress: bool
+    show_memory: bool
+    show_scons: bool
     plugins: str
 
 
@@ -59,11 +62,14 @@ class BuildWorker(QtCore.QThread):
                 encoding="utf-8",
             )
         except Exception as exc:
-            self.output_line.emit(f"[ERROR] 無法啟動 PyInstaller：{exc}")
+            self.output_line.emit(f"[ERROR] 無法啟動打包程序：{exc}")
             self.finished_ok.emit(False)
             return
 
-        assert self._proc.stdout is not None
+        if self._proc.stdout is None:
+            self.output_line.emit("[ERROR] 無法取得輸出串流。")
+            self.finished_ok.emit(False)
+            return
         for line in self._proc.stdout:
             self.output_line.emit(line.rstrip())
             if self._stop_requested:
@@ -175,6 +181,12 @@ class BuildWorker(QtCore.QThread):
         cmd = [sys.executable, "-m", "nuitka", "--mode=onefile" if s.onefile else "--mode=standalone"]
         if s.lto:
             cmd.append("--lto")
+        if s.show_progress:
+            cmd.append("--show-progress")
+        if s.show_memory:
+            cmd.append("--show-memory")
+        if s.show_scons:
+            cmd.append("--show-scons")
         if s.plugins:
             for p in s.plugins.split(","):
                 p = p.strip()

@@ -96,13 +96,20 @@ class BuildLogDialog(QtWidgets.QDialog):
         self.text.setFont(font)
         self._line_no = 0
         self._line_prefix_width = 0
+        self._elapsed_start: Optional[QtCore.QElapsedTimer] = None
+        self._elapsed_timer = QtCore.QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
         self.chk_wrap = QtWidgets.QCheckBox("自動換行")
         self.chk_wrap.toggled.connect(self._toggle_wrap)
+        self.chk_wrap.setChecked(True)
+        self.lbl_elapsed = QtWidgets.QLabel("經過時間：00:00:00")
         self.input = QtWidgets.QLineEdit()
         self.input.setPlaceholderText("輸入指令（例如: y）")
         self.btn_send = QtWidgets.QPushButton("送出")
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.chk_wrap)
+        row.addWidget(self.lbl_elapsed)
         row.addStretch(1)
         row.addWidget(self.input, 1)
         row.addWidget(self.btn_send)
@@ -119,6 +126,10 @@ class BuildLogDialog(QtWidgets.QDialog):
     def clear(self) -> None:
         self.text.clear()
         self._line_no = 0
+        self._elapsed_start = QtCore.QElapsedTimer()
+        self._elapsed_start.start()
+        self._elapsed_timer.start()
+        self._update_elapsed()
 
     def _toggle_wrap(self, enabled: bool) -> None:
         mode = QtWidgets.QPlainTextEdit.WidgetWidth if enabled else QtWidgets.QPlainTextEdit.NoWrap
@@ -136,6 +147,7 @@ class BuildLogDialog(QtWidgets.QDialog):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.stop_requested.emit()
+        self._elapsed_timer.stop()
         event.accept()
 
     def _emit_send(self) -> None:
@@ -165,6 +177,25 @@ class BuildLogDialog(QtWidgets.QDialog):
         self.text.setTextCursor(cursor)
         self.text.ensureCursorVisible()
         self.text.horizontalScrollBar().setValue(h_scroll)
+
+    def _update_elapsed(self) -> None:
+        if not self._elapsed_start:
+            return
+        total_seconds = int(self._elapsed_start.elapsed() / 1000)
+        days, rem = divmod(total_seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, seconds = divmod(rem, 60)
+        years = days // 365
+        days = days % 365
+        months = days // 30
+        days = days % 30
+        if years or months or days:
+            self.lbl_elapsed.setText(f"經過時間：{years:04d}:{months:02d}:{days:02d} {hours:02d}:{minutes:02d}:{seconds:02d}")
+        else:
+            self.lbl_elapsed.setText(f"經過時間：{hours:02d}:{minutes:02d}:{seconds:02d}")
+
+    def stop_elapsed(self) -> None:
+        self._elapsed_timer.stop()
 
     def _split_ansi(self, text: str):
         import re
@@ -236,8 +267,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker: Optional[BuildWorker] = None
         self.build_log = BuildLogDialog(self)
         self.advanced = AdvancedDialog(self)
+        self.current_config_name: str = ""
 
-        self.setWindowTitle("PyInstaller 打包工具")
+        self.setWindowTitle("Python 打包工具")
         self.resize(840, 620)
 
         self._build_ui()
@@ -252,13 +284,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_config.currentIndexChanged.connect(self._load_selected_config)
         btn_save_cfg = QtWidgets.QPushButton("儲存設定")
         btn_save_cfg.clicked.connect(self._save_config)
+        btn_save_as_cfg = QtWidgets.QPushButton("另存設定")
+        btn_save_as_cfg.clicked.connect(self._save_as_config)
+        btn_delete_cfg = QtWidgets.QPushButton("刪除設定")
+        btn_delete_cfg.clicked.connect(self._delete_config)
         btn_refresh_cfg = QtWidgets.QPushButton("重新整理")
         btn_refresh_cfg.clicked.connect(self._refresh_config_list)
-
         cfg_row = QtWidgets.QHBoxLayout()
         cfg_row.addWidget(QtWidgets.QLabel("設定檔"))
         cfg_row.addWidget(self.cmb_config, 1)
         cfg_row.addWidget(btn_save_cfg)
+        cfg_row.addWidget(btn_save_as_cfg)
+        cfg_row.addWidget(btn_delete_cfg)
         cfg_row.addWidget(btn_refresh_cfg)
         layout.addLayout(cfg_row)
 
@@ -282,11 +319,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_bundle.addItem("單一檔案 (onefile)", "onefile")
         self.chk_noconsole = QtWidgets.QCheckBox("不顯示 Console")
         self.chk_clean = QtWidgets.QCheckBox("清理 (--clean)")
+        self.chk_show_progress = QtWidgets.QCheckBox("顯示進度")
+        self.chk_show_memory = QtWidgets.QCheckBox("顯示記憶體")
+        self.chk_show_scons = QtWidgets.QCheckBox("顯示 Scons 輸出")
+        self.chk_show_progress.setChecked(True)
+        self.chk_show_memory.setChecked(True)
         opts_row = QtWidgets.QHBoxLayout()
         opts_row.addWidget(QtWidgets.QLabel("打包模式"))
         opts_row.addWidget(self.cmb_bundle)
         opts_row.addWidget(self.chk_noconsole)
         opts_row.addWidget(self.chk_clean)
+        opts_row.addWidget(self.chk_show_progress)
+        opts_row.addWidget(self.chk_show_memory)
+        opts_row.addWidget(self.chk_show_scons)
         opts_row.addStretch(1)
         form.addRow("常用選項", opts_row)
 
@@ -312,20 +357,23 @@ class MainWindow(QtWidgets.QMainWindow):
         hidden_label = self._stack_label(self.lbl_hidden, self.lbl_hidden_hint)
         form.addRow(hidden_label, self.txt_hidden)
 
-        self.txt_build = QtWidgets.QLineEdit(str(self.exec_dir / "build"))
-        btn_build = QtWidgets.QPushButton("選擇")
-        btn_build.clicked.connect(lambda: self._pick_dir(self.txt_build))
-        form.addRow("Build 路徑", self._with_btn(self.txt_build, btn_build))
+        self.lbl_build = QtWidgets.QLabel("Build 路徑")
+        self.txt_build = QtWidgets.QLineEdit(self._normalize_path(str(self.exec_dir / "build")))
+        self.btn_build_pick = QtWidgets.QPushButton("選擇")
+        self.btn_build_pick.clicked.connect(lambda: self._pick_dir(self.txt_build))
+        form.addRow(self.lbl_build, self._with_btn(self.txt_build, self.btn_build_pick))
 
-        self.txt_dist = QtWidgets.QLineEdit(str(self.exec_dir / "dist"))
-        btn_dist = QtWidgets.QPushButton("選擇")
-        btn_dist.clicked.connect(lambda: self._pick_dir(self.txt_dist))
-        form.addRow("Dist 路徑", self._with_btn(self.txt_dist, btn_dist))
+        self.lbl_dist = QtWidgets.QLabel("Dist 路徑")
+        self.txt_dist = QtWidgets.QLineEdit(self._normalize_path(str(self.exec_dir / "dist")))
+        self.btn_dist_pick = QtWidgets.QPushButton("選擇")
+        self.btn_dist_pick.clicked.connect(lambda: self._pick_dir(self.txt_dist))
+        form.addRow(self.lbl_dist, self._with_btn(self.txt_dist, self.btn_dist_pick))
 
-        self.txt_spec = QtWidgets.QLineEdit(str(self.exec_dir / "spec"))
-        btn_spec = QtWidgets.QPushButton("選擇")
-        btn_spec.clicked.connect(lambda: self._pick_dir(self.txt_spec))
-        form.addRow("Spec 路徑", self._with_btn(self.txt_spec, btn_spec))
+        self.lbl_spec = QtWidgets.QLabel("Spec 路徑")
+        self.txt_spec = QtWidgets.QLineEdit(self._normalize_path(str(self.exec_dir / "spec")))
+        self.btn_spec_pick = QtWidgets.QPushButton("選擇")
+        self.btn_spec_pick.clicked.connect(lambda: self._pick_dir(self.txt_spec))
+        form.addRow(self.lbl_spec, self._with_btn(self.txt_spec, self.btn_spec_pick))
 
         layout.addLayout(form)
 
@@ -339,8 +387,11 @@ class MainWindow(QtWidgets.QMainWindow):
         btns.addStretch(1)
         layout.addLayout(btns)
 
+        self.lbl_current_cfg = QtWidgets.QLabel("目前設定：未選擇")
+        self.status_bar = self.statusBar()
+        self.status_bar.addWidget(self.lbl_current_cfg, 1)
         self.status = QtWidgets.QLabel("")
-        layout.addWidget(self.status)
+        self.status_bar.addPermanentWidget(self.status)
 
         self._on_packager_changed()
 
@@ -364,17 +415,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _pick_script(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "選擇入口腳本", str(self.exec_dir), "Python (*.py)")
         if path:
-            self.txt_script.setText(path)
+            self.txt_script.setText(self._normalize_path(path))
 
     def _pick_icon(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "選擇 Icon", str(self.exec_dir), "Icon (*.ico)")
         if path:
-            self.txt_icon.setText(path)
+            self.txt_icon.setText(self._normalize_path(path))
 
     def _pick_dir(self, target: QtWidgets.QLineEdit) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇資料夾", target.text() or str(self.exec_dir))
         if path:
-            target.setText(path)
+            target.setText(self._normalize_path(path))
 
     def _open_advanced(self) -> None:
         self.advanced.set_packager(self.cmb_packager.currentText())
@@ -415,11 +466,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_build.setEnabled(True)
         self.btn_advanced.setEnabled(True)
         self.status.setText("完成" if ok else "失敗或停止")
+        self.build_log.stop_elapsed()
         self.build_log.on_send = None
         try:
             self.build_log.stop_requested.disconnect(self._stop_build_from_dialog)
         except Exception:
             pass
+        QtWidgets.QMessageBox.information(
+            self,
+            "打包完成" if ok else "打包失敗",
+            "打包完成" if ok else "打包失敗或停止",
+        )
 
     def _send_build_input(self, text: str) -> None:
         if self.worker:
@@ -430,20 +487,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.stop()
 
     def _collect_settings(self) -> BuildSettings:
-        add_data = self.txt_add_data.toPlainText().splitlines()
+        add_data = self._normalize_path_lines(self.txt_add_data.toPlainText())
         hidden = self.txt_hidden.toPlainText().splitlines()
         return BuildSettings(
             packager=self.cmb_packager.currentText(),
-            script_path=self.txt_script.text().strip(),
+            script_path=self._normalize_path(self.txt_script.text().strip()),
             name=self.txt_name.text().strip(),
             onefile=self.cmb_bundle.currentData() == "onefile",
             no_console=self.chk_noconsole.isChecked(),
-            icon_path=self.txt_icon.text().strip(),
+            icon_path=self._normalize_path(self.txt_icon.text().strip()),
             add_data=add_data,
             hidden_imports=hidden,
-            work_path=self.txt_build.text().strip(),
-            dist_path=self.txt_dist.text().strip(),
-            spec_path=self.txt_spec.text().strip(),
+            work_path=self._normalize_path(self.txt_build.text().strip()),
+            dist_path=self._normalize_path(self.txt_dist.text().strip()),
+            spec_path=self._normalize_path(self.txt_spec.text().strip()),
             clean=self.chk_clean.isChecked(),
             extra_args=self.advanced.get_extra_args(),
             strip=bool(self.advanced.to_dict().get("strip", False)),
@@ -452,6 +509,9 @@ class MainWindow(QtWidgets.QMainWindow):
             debug=bool(self.advanced.to_dict().get("debug", False)),
             runtime_tmp=str(self.advanced.to_dict().get("runtime_tmp", "")),
             lto=bool(self.advanced.to_dict().get("lto", False)),
+            show_progress=self.chk_show_progress.isChecked(),
+            show_memory=self.chk_show_memory.isChecked(),
+            show_scons=self.chk_show_scons.isChecked(),
             plugins=str(self.advanced.to_dict().get("plugins", "")),
         )
 
@@ -464,18 +524,85 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_config.blockSignals(False)
 
     def _save_config(self) -> None:
+        if self.current_config_name:
+            name = self.current_config_name
+            data = self._settings_to_dict()
+            try:
+                self.config_store.save(name, data)
+                self._refresh_config_list()
+                idx = self.cmb_config.findText(name)
+                if idx >= 0:
+                    self.cmb_config.setCurrentIndex(idx)
+                self._update_current_config_label()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "儲存失敗", f"儲存設定失敗：{exc}")
+                return
+            QtWidgets.QMessageBox.information(self, "儲存完成", "儲存設定完成")
+            return
         name, ok = QtWidgets.QInputDialog.getText(self, "儲存設定", "名稱")
         if not ok or not name.strip():
             return
         data = self._settings_to_dict()
-        self.config_store.save(name.strip(), data)
-        self._refresh_config_list()
-        idx = self.cmb_config.findText(name.strip())
-        if idx >= 0:
-            self.cmb_config.setCurrentIndex(idx)
+        try:
+            self.config_store.save(name.strip(), data)
+            self.current_config_name = name.strip()
+            self._refresh_config_list()
+            idx = self.cmb_config.findText(name.strip())
+            if idx >= 0:
+                self.cmb_config.setCurrentIndex(idx)
+            self._update_current_config_label()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "儲存失敗", f"儲存設定失敗：{exc}")
+            return
+        QtWidgets.QMessageBox.information(self, "儲存完成", "儲存設定完成")
+
+    def _save_as_config(self) -> None:
+        preset = self.current_config_name
+        name, ok = QtWidgets.QInputDialog.getText(self, "另存設定", "名稱", text=preset)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        data = self._settings_to_dict()
+        try:
+            self.config_store.save(name, data)
+            self.current_config_name = name
+            self._refresh_config_list()
+            idx = self.cmb_config.findText(name)
+            if idx >= 0:
+                self.cmb_config.setCurrentIndex(idx)
+            self._update_current_config_label()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "另存失敗", f"另存設定失敗：{exc}")
+            return
+        QtWidgets.QMessageBox.information(self, "另存完成", "另存設定完成")
+
+    def _delete_config(self) -> None:
+        name = self.current_config_name.strip()
+        if not name:
+            QtWidgets.QMessageBox.information(self, "刪除設定", "尚未選擇設定檔")
+            return
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "刪除設定",
+            f"確定要刪除「{name}」嗎？",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if confirm != QtWidgets.QMessageBox.Yes:
+            return
+        removed = self.config_store.delete(name)
+        if removed:
+            self.current_config_name = ""
+            self.cmb_config.setCurrentIndex(0)
+            self._refresh_config_list()
+            self._update_current_config_label()
+            QtWidgets.QMessageBox.information(self, "刪除設定", "已刪除設定")
+        else:
+            QtWidgets.QMessageBox.information(self, "刪除設定", "找不到對應的設定檔")
 
     def _load_selected_config(self) -> None:
         name = self.cmb_config.currentText().strip()
+        self.current_config_name = name
+        self._update_current_config_label()
         if not name:
             return
         data = self.config_store.load(name)
@@ -485,28 +612,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cmb_bundle.setCurrentIndex(1 if data.get("onefile") else 0)
 
     def _settings_to_dict(self) -> Dict[str, object]:
-        return {
+        data = {
             "packager": self.cmb_packager.currentText(),
-            "script_path": self.txt_script.text().strip(),
+            "script_path": self._normalize_path(self.txt_script.text().strip()),
             "name": self.txt_name.text().strip(),
             "bundle_mode": self.cmb_bundle.currentData(),
             "noconsole": self.chk_noconsole.isChecked(),
             "clean": self.chk_clean.isChecked(),
-            "icon_path": self.txt_icon.text().strip(),
-            "add_data": self.txt_add_data.toPlainText(),
+            "icon_path": self._normalize_path(self.txt_icon.text().strip()),
+            "add_data": "\n".join(self._normalize_path_lines(self.txt_add_data.toPlainText())),
             "hidden_imports": self.txt_hidden.toPlainText(),
-            "work_path": self.txt_build.text().strip(),
-            "dist_path": self.txt_dist.text().strip(),
-            "spec_path": self.txt_spec.text().strip(),
+            "work_path": self._normalize_path(self.txt_build.text().strip()),
+            "dist_path": self._normalize_path(self.txt_dist.text().strip()),
+            "spec_path": self._normalize_path(self.txt_spec.text().strip()),
             **self.advanced.to_dict(),
         }
+        data["show_progress"] = self.chk_show_progress.isChecked()
+        data["show_memory"] = self.chk_show_memory.isChecked()
+        data["show_scons"] = self.chk_show_scons.isChecked()
+        return data
 
     def _apply_settings(self, data: Dict[str, object]) -> None:
         packager = str(data.get("packager", "pyinstaller")) or "pyinstaller"
         idx = self.cmb_packager.findText(packager)
         if idx >= 0:
             self.cmb_packager.setCurrentIndex(idx)
-        self.txt_script.setText(str(data.get("script_path", "")))
+        self.txt_script.setText(self._normalize_path(str(data.get("script_path", ""))))
         self.txt_name.setText(str(data.get("name", "")))
         bundle = str(data.get("bundle_mode", "onedir"))
         idx = self.cmb_bundle.findData(bundle)
@@ -514,20 +645,42 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cmb_bundle.setCurrentIndex(idx)
         self.chk_noconsole.setChecked(bool(data.get("noconsole", False)))
         self.chk_clean.setChecked(bool(data.get("clean", False)))
-        self.txt_icon.setText(str(data.get("icon_path", "")))
-        self.txt_add_data.setPlainText(str(data.get("add_data", "")))
+        self.chk_show_progress.setChecked(bool(data.get("show_progress", False)))
+        self.chk_show_memory.setChecked(bool(data.get("show_memory", True)))
+        self.chk_show_scons.setChecked(bool(data.get("show_scons", False)))
+        self.txt_icon.setText(self._normalize_path(str(data.get("icon_path", ""))))
+        self.txt_add_data.setPlainText("\n".join(self._normalize_path_lines(str(data.get("add_data", "")))))
         self.txt_hidden.setPlainText(str(data.get("hidden_imports", "")))
-        self.txt_build.setText(str(data.get("work_path", "")) or str(self.exec_dir / "build"))
-        self.txt_dist.setText(str(data.get("dist_path", "")) or str(self.exec_dir / "dist"))
-        self.txt_spec.setText(str(data.get("spec_path", "")) or str(self.exec_dir / "spec"))
+        self.txt_build.setText(
+            self._normalize_path(str(data.get("work_path", "")) or str(self.exec_dir / "build"))
+        )
+        self.txt_dist.setText(
+            self._normalize_path(str(data.get("dist_path", "")) or str(self.exec_dir / "dist"))
+        )
+        self.txt_spec.setText(
+            self._normalize_path(str(data.get("spec_path", "")) or str(self.exec_dir / "spec"))
+        )
         self.advanced.apply_dict(data)
 
     def _on_packager_changed(self) -> None:
         is_py = self.cmb_packager.currentText() == "pyinstaller"
+        self.lbl_build.setEnabled(is_py)
         self.txt_build.setEnabled(is_py)
+        self.btn_build_pick.setEnabled(is_py)
+        self.lbl_spec.setEnabled(is_py)
         self.txt_spec.setEnabled(is_py)
+        self.btn_spec_pick.setEnabled(is_py)
         self.chk_clean.setEnabled(is_py)
+        self.chk_show_progress.setVisible(not is_py)
+        self.chk_show_memory.setVisible(not is_py)
+        self.chk_show_scons.setVisible(not is_py)
         self._update_packager_hints(is_py)
+
+    def _update_current_config_label(self) -> None:
+        if self.current_config_name:
+            self.lbl_current_cfg.setText(f"目前設定：{self.current_config_name}")
+        else:
+            self.lbl_current_cfg.setText("目前設定：未選擇")
 
     def _update_packager_hints(self, is_py: bool) -> None:
         if is_py:
@@ -544,3 +697,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.txt_hidden.setPlaceholderText("每行一個 module/package")
             self.lbl_icon.setText("Icon")
             self.chk_noconsole.setText("不顯示 Console")
+
+    def _normalize_path(self, text: str) -> str:
+        return text.replace("\\", "/")
+
+    def _normalize_path_lines(self, text: str) -> List[str]:
+        return [self._normalize_path(line.strip()) for line in text.splitlines()]

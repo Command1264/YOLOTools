@@ -77,9 +77,9 @@ class AdvancedDialog(QtWidgets.QDialog):
         return {
             "strip": self.chk_strip.isChecked(),
             "upx": self.chk_upx.isChecked(),
-            "upx_dir": self.txt_upx_dir.text().strip(),
+            "upx_dir": self._normalize_path(self.txt_upx_dir.text().strip()),
             "debug": self.chk_debug.isChecked(),
-            "runtime_tmp": self.txt_runtime_tmp.text().strip(),
+            "runtime_tmp": self._normalize_path(self.txt_runtime_tmp.text().strip()),
             "lto": self.chk_lto.isChecked(),
             "plugins": self.txt_plugin.text().strip(),
             "extra_args": self.txt_extra.text().strip(),
@@ -88,9 +88,12 @@ class AdvancedDialog(QtWidgets.QDialog):
     def apply_dict(self, data: Dict[str, object]) -> None:
         self.chk_strip.setChecked(bool(data.get("strip", False)))
         self.chk_upx.setChecked(bool(data.get("upx", False)))
-        self.txt_upx_dir.setText(str(data.get("upx_dir", "")))
+        self.txt_upx_dir.setText(self._normalize_path(str(data.get("upx_dir", ""))))
         self.chk_debug.setChecked(bool(data.get("debug", False)))
-        self.txt_runtime_tmp.setText(str(data.get("runtime_tmp", "")))
+        self.txt_runtime_tmp.setText(self._normalize_path(str(data.get("runtime_tmp", ""))))
         self.chk_lto.setChecked(bool(data.get("lto", False)))
         self.txt_plugin.setText(str(data.get("plugins", "")))
         self.txt_extra.setText(str(data.get("extra_args", "")))
+
+    def _normalize_path(self, text: str) -> str:
+        return text.replace("\\", "/")

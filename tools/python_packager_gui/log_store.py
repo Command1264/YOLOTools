@@ -10,9 +10,9 @@ class LogStore:
         self.exec_dir = exec_dir
         self.log_dir = exec_dir / "log"
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        name = f"pyinstaller_gui_{datetime.now().strftime('%Y%m%d')}.log"
+        name = f"python_packager_gui_{datetime.now().strftime('%Y%m%d')}.log"
         self.log_path = self.log_dir / name
-        self.logger = logging.getLogger("pyinstaller_gui")
+        self.logger = logging.getLogger("python_packager_gui")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
         if not self.logger.handlers:
