@@ -36,6 +36,8 @@ Project guidelines: see `AGENTS.md`.
 - 不要做大型變更。
 - Never change files without explicit approval (CHANGE mode only).
 - 未明確批准不得改檔（僅 CHANGE 模式可改）。
+- If not explicitly instructed, do not delete files. If deletion is needed, re-confirm the deletion list.
+- 如果沒有明確說明，不要擅自刪除檔案，如需刪除，請重複確認刪除名單。
 
 ### AUTO-EXECUTE RULE
 The following actions DO NOT require approval and should be executed immediately:
