@@ -40,7 +40,8 @@ EXEC_DIR: Path = _resolve_exec_dir()
 RESOURCE_DIR: Path = _resolve_resource_dir()
 CONFIG_PATH: Path = EXEC_DIR / "yolo_server_gui_config.yml"
 STARTUP_FILE: str = "yolo_server_gui_startup.cmd"
-ICON_PATH: Path = RESOURCE_DIR / "yolo_server_icon.png"
+ICON_ICO_PATH: Path = RESOURCE_DIR / "yolo_server_icon.ico"
+ICON_PNG_PATH: Path = RESOURCE_DIR / "yolo_server_icon.png"
 
 CLOSE_LABELS: dict[str, str] = {
     "ask": "詢問",
@@ -50,6 +51,23 @@ CLOSE_LABELS: dict[str, str] = {
 
 APP_LOG_CTRL: LogController = LogController()
 LOCK_FILE_NAME: str = "yolo_server_gui.lock"
+
+
+def _select_icon_path() -> Optional[Path]:
+    if os.name == "nt":
+        primary, secondary = ICON_ICO_PATH, ICON_PNG_PATH
+    else:
+        primary, secondary = ICON_PNG_PATH, ICON_ICO_PATH
+    if primary.exists():
+        return primary
+    if secondary.exists():
+        APP_LOG_CTRL.warning(
+            "找不到主要圖示，改用備援圖示。primary=%s fallback=%s",
+            str(primary),
+            str(secondary),
+        )
+        return secondary
+    return None
 
 
 def normalize_path(path_str: str) -> str:
@@ -243,13 +261,25 @@ class App(tk.Tk):
         self.title("YOLO Server")
         self.geometry("720x360")
         self.minsize(640, 320)
-        self._app_icon: tk.PhotoImage = tk.PhotoImage(file=str(ICON_PATH))
-        self.iconphoto(True, self._app_icon)
 
         self.log_context: LogContext = setup_logging(EXEC_DIR)
         self.logger: Logger = self.log_context.logger
         self.log_ctrl: LogController = LogController(self.logger)
         self.log_ctrl.info("GUI 啟動")
+
+        self._app_icon: Optional[tk.PhotoImage] = None
+        icon_path = _select_icon_path()
+        if icon_path is None:
+            self.log_ctrl.warning("找不到應用程式圖示檔案。")
+        else:
+            try:
+                if icon_path.suffix.lower() == ".ico" and os.name == "nt":
+                    self.iconbitmap(default=str(icon_path))
+                else:
+                    self._app_icon = tk.PhotoImage(file=str(icon_path))
+                    self.iconphoto(True, self._app_icon)
+            except Exception:
+                self.log_ctrl.exception("載入應用程式圖示失敗。path=%s", str(icon_path))
 
         self.cfg: AppConfig = AppConfig.load(CONFIG_PATH)
         self.server: Optional[YoloServer] = None
@@ -257,11 +287,12 @@ class App(tk.Tk):
         self._log_viewer: Optional[LogViewer] = None
         self._settings_win: Optional[tk.Toplevel] = None
         self._instance_lock: Optional[SingleInstanceLock] = instance_lock
+        tray_icon_path = _select_icon_path()
         self.tray: TrayBase = create_tray_icon(
             tooltip="YOLO Server",
             on_exit=self._enqueue_tray_exit,
             on_show=self._enqueue_tray_show,
-            icon_path=str(ICON_PATH),
+            icon_path=str(tray_icon_path) if tray_icon_path else None,
         )
 
         self._build_ui()
@@ -388,7 +419,14 @@ class App(tk.Tk):
         port: int = int(self.cfg.port)
         model_path: str = self.cfg.model_path
         try:
-            self.server = YoloServer(model_path, host, port, logger=self.logger, icon_path=str(ICON_PATH))
+            server_icon_path = _select_icon_path()
+            self.server = YoloServer(
+                model_path,
+                host,
+                port,
+                logger=self.logger,
+                icon_path=str(server_icon_path) if server_icon_path else None,
+            )
             self.server.start()
         except Exception as e:
             self.server = None

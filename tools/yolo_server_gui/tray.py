@@ -81,11 +81,16 @@ class _PystrayTray(TrayBase):
             self.on_exit()
 
     def _load_image(self) -> Optional[object]:
-        if self.icon_path and os.path.exists(self.icon_path):
-            try:
-                return Image.open(self.icon_path)
-            except Exception:
-                TRAY_LOG_CTRL.exception("Tray 圖示載入失敗。path=%s", self.icon_path)
+        if not self.icon_path:
+            TRAY_LOG_CTRL.warning("未設定 Tray 圖示路徑。")
+            return self._default_image()
+        if not os.path.exists(self.icon_path):
+            TRAY_LOG_CTRL.warning("Tray 圖示不存在。path=%s", self.icon_path)
+            return self._default_image()
+        try:
+            return Image.open(self.icon_path)
+        except Exception:
+            TRAY_LOG_CTRL.exception("Tray 圖示載入失敗。path=%s", self.icon_path)
         return self._default_image()
 
     @staticmethod

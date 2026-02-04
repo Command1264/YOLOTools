@@ -139,9 +139,13 @@ class YoloServer:
             try:
                 with open(self._icon_path, "rb") as f:
                     data = f.read()
-                return Response(data, status=HTTPStatus.OK.value, content_type="image/png")
+                content_type = "image/x-icon" if self._icon_path.lower().endswith(".ico") else "image/png"
+                return Response(data, status=HTTPStatus.OK.value, content_type=content_type)
             except Exception:
+                self._log_ctrl.exception("favicon 載入失敗。path=%s", self._icon_path)
                 return self._text_response(HTTPStatus.INTERNAL_SERVER_ERROR, "favicon load error")
+        if self._icon_path:
+            self._log_ctrl.warning("favicon 檔案不存在。path=%s", self._icon_path)
         return self._text_response(HTTPStatus.NOT_FOUND, "favicon not found")
 
     def _handle_detect(self) -> Response:
