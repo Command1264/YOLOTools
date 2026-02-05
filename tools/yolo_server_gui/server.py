@@ -108,8 +108,25 @@ class YoloServer:
 
     def update_model(self, model_path: str) -> None:
         self.model_path = model_path
-        self._engine = YoloEngine(model_path, conf=self.conf)
+        self._engine.update_model_path(model_path)
         self._log_ctrl.info("Model updated. model_path=%s", model_path)
+
+    def update_settings(
+        self,
+        model_path: str,
+        host: str,
+        port: int,
+        icon_path: Optional[str] = None,
+    ) -> None:
+        self.model_path = model_path
+        self.host = host
+        self.port = port
+        if icon_path is not None:
+            self._icon_path = icon_path
+        self._engine.update_model_path(model_path)
+        self._log_ctrl.info(
+            "Settings updated. model_path=%s host=%s port=%s", model_path, host, port
+        )
 
     def get_device_name(self) -> str:
         try:

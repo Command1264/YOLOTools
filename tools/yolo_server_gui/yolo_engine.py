@@ -1,12 +1,16 @@
+import importlib
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from types import ModuleType
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import cv2
-import torch
-from ultralytics import YOLO
-from ultralytics.utils.plotting import Colors
 
 from log_manager import LogController, get_logger
+
+if TYPE_CHECKING:
+    import torch
+    from ultralytics import YOLO
+    from ultralytics.utils.plotting import Colors
 
 @dataclass
 class Detection:
@@ -17,24 +21,51 @@ class Detection:
 
 
 class YoloEngine:
+    @staticmethod
+    def preload_dependencies() -> None:
+        importlib.import_module("torch")
+        importlib.import_module("ultralytics")
+        importlib.import_module("ultralytics.utils.plotting")
+
     def __init__(self, model_path: str, conf: float = 0.25, iou: float = 0.45, device: str = "") -> None:
         self.model_path: str = model_path
         self.conf: float = conf
         self.iou: float = iou
         self.device: str = device
-        self._model: Optional[YOLO] = None
+        self._model: Optional["YOLO"] = None
         self._names: Optional[dict[int, str]] = None
         self._cuda_available: bool = False
         self._device_name: str = "unknown"
-        self._colors: Colors = Colors()
+        self._colors: Optional["Colors"] = None
+        self._torch_mod: Optional[ModuleType] = None
         self._log_ctrl: LogController = LogController(get_logger())
 
+    def update_model_path(self, model_path: str) -> None:
+        self.model_path = model_path
+        self._model = None
+        self._names = None
+        self._device_name = "unknown"
+        self._log_ctrl.info("模型路徑已更新。model_path=%s", model_path)
+
+    def _ensure_torch(self) -> ModuleType:
+        if self._torch_mod is None:
+            self._torch_mod = importlib.import_module("torch")
+        return self._torch_mod
+
+    def _ensure_colors(self) -> "Colors":
+        if self._colors is None:
+            colors_mod = importlib.import_module("ultralytics.utils.plotting")
+            self._colors = colors_mod.Colors()
+        return self._colors
+
     def load(self) -> None:
-        self._cuda_available = torch.cuda.is_available()
+        torch_mod = self._ensure_torch()
+        self._cuda_available = torch_mod.cuda.is_available()
         if not self.device:
             self.device = "cuda:0" if self._cuda_available else "cpu"
         if self._model is None:
-            self._model = YOLO(self.model_path)
+            yolo_mod = importlib.import_module("ultralytics")
+            self._model = yolo_mod.YOLO(self.model_path)
             self._names = self._model.model.names
             if self.device:
                 try:
@@ -91,6 +122,7 @@ class YoloEngine:
 
     def _resolve_device_name(self) -> str:
         try:
+            torch_mod = self._ensure_torch()
             dev: Optional[str] = None
             if self._model is not None and getattr(self._model, "model", None) is not None:
                 try:
@@ -107,7 +139,7 @@ class YoloEngine:
                     idx: int = 0
                     if ":" in dev:
                         idx = int(dev.split(":")[1])
-                    gpu_name: str = torch.cuda.get_device_name(idx)
+                    gpu_name: str = torch_mod.cuda.get_device_name(idx)
                     return f"{dev} ({gpu_name})"
                 except Exception:
                     return dev
@@ -130,6 +162,7 @@ class YoloEngine:
             scale = max(0.5, min(h, w) / 640)
         thickness: int = max(1, int(round(scale)))
         font_scale: float = 0.5 * scale
+        colors = self._ensure_colors()
         for d in dets:
             x1: int
             y1: int
@@ -137,7 +170,7 @@ class YoloEngine:
             y2: int
             x1, y1, x2, y2 = d.xyxy
             label: str = f"{d.class_name} {d.conf:.2f}"
-            color: tuple[int, int, int] = self._colors(d.class_id, bgr=True)
+            color: tuple[int, int, int] = colors(d.class_id, bgr=True)
             cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, thickness)
             cv2.putText(
                 frame_bgr,

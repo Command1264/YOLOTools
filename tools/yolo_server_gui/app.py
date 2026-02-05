@@ -21,6 +21,7 @@ import yaml
 from log_manager import LogContext, LogController, setup_logging
 from log_viewer import LogViewer
 from server import YoloServer
+from yolo_engine import YoloEngine
 from tray import create_tray_icon
 from tray_base import TrayBase
 
@@ -283,6 +284,9 @@ class App(tk.Tk):
 
         self.cfg: AppConfig = AppConfig.load(CONFIG_PATH)
         self.server: Optional[YoloServer] = None
+        self._deps_ready: bool = False
+        self._deps_loading: bool = False
+        self._deps_token: int = 0
         self._tray_queue: queue.Queue[str] = queue.Queue()
         self._log_viewer: Optional[LogViewer] = None
         self._settings_win: Optional[tk.Toplevel] = None
@@ -299,11 +303,12 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
 
         self._apply_config_to_ui()
+        self._init_dep_status()
         self._apply_startup_setting()
         self.after(200, self._poll_tray_queue)
         self.tray.start()
         if self.cfg.auto_start_server:
-            self.after(200, self._start_server)
+            self.after(200, self._try_auto_start)
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -345,6 +350,11 @@ class App(tk.Tk):
 
         self.ent_host.bind("<FocusOut>", lambda _e: self._apply_quick_settings(False))
         self.ent_port.bind("<FocusOut>", lambda _e: self._apply_quick_settings(False))
+
+        status_bar: ttk.Frame = ttk.Frame(self, padding=(12, 6))
+        status_bar.pack(side="bottom", fill="x")
+        self.var_dep_status: tk.StringVar = tk.StringVar(value="核心套件：尚未載入")
+        ttk.Label(status_bar, textvariable=self.var_dep_status).pack(side="left")
 
     def _build_menu(self) -> None:
         menubar: tk.Menu = tk.Menu(self)
@@ -420,13 +430,22 @@ class App(tk.Tk):
         model_path: str = self.cfg.model_path
         try:
             server_icon_path = _select_icon_path()
-            self.server = YoloServer(
-                model_path,
-                host,
-                port,
-                logger=self.logger,
-                icon_path=str(server_icon_path) if server_icon_path else None,
-            )
+            icon_path = str(server_icon_path) if server_icon_path else None
+            if self.server is None:
+                self.server = YoloServer(
+                    model_path,
+                    host,
+                    port,
+                    logger=self.logger,
+                    icon_path=icon_path,
+                )
+            else:
+                self.server.update_settings(
+                    model_path=model_path,
+                    host=host,
+                    port=port,
+                    icon_path=icon_path,
+                )
             self.server.start()
         except Exception as e:
             self.server = None
@@ -457,6 +476,7 @@ class App(tk.Tk):
         self.ent_port.configure(state=state)
         self.btn_pick_model.configure(state=state)
         self.btn_toggle.configure(text="停止伺服器" if running else "啟動伺服器")
+        self._update_toggle_state()
 
     def _open_log_viewer(self) -> None:
         if self._log_viewer is not None:
@@ -579,6 +599,61 @@ class App(tk.Tk):
                     path.unlink()
         except Exception:
             messagebox.showwarning("設定提醒", "無法更新開機啟動設定")
+
+    def _try_auto_start(self) -> None:
+        if self.server and self.server.is_running():
+            return
+        if self._deps_ready:
+            self._start_server()
+            return
+        if self._deps_loading:
+            self.after(300, self._try_auto_start)
+            return
+        self.log_ctrl.warning("自動啟動失敗：核心套件未就緒。")
+
+    def _init_dep_status(self) -> None:
+        self._start_dep_preload()
+
+    def _set_dep_status(self, text: str) -> None:
+        self.var_dep_status.set(text)
+        self._update_toggle_state()
+
+    def _update_toggle_state(self) -> None:
+        if self.server and self.server.is_running():
+            self.btn_toggle.configure(state="normal")
+            return
+        self.btn_toggle.configure(state="normal" if self._deps_ready else "disabled")
+
+    def _start_dep_preload(self) -> None:
+        if self._deps_loading:
+            return
+        self._deps_token += 1
+        token = self._deps_token
+        self._deps_loading = True
+        self._deps_ready = False
+        self._set_dep_status("核心套件：載入中...")
+
+        def _worker() -> None:
+            error_msg: Optional[str] = None
+            try:
+                YoloEngine.preload_dependencies()
+            except Exception as exc:
+                error_msg = str(exc) or "unknown error"
+            self.after(0, lambda: self._on_dep_preload_done(token, error_msg))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_dep_preload_done(self, token: int, error_msg: Optional[str]) -> None:
+        if token != self._deps_token:
+            return
+        self._deps_loading = False
+        if error_msg:
+            self._deps_ready = False
+            self._set_dep_status("核心套件：載入失敗")
+            self.log_ctrl.warning("核心套件載入失敗：%s", error_msg)
+            return
+        self._deps_ready = True
+        self._set_dep_status("核心套件：就緒")
 
     def _on_close_request(self) -> None:
         behavior: str = self.cfg.close_behavior
