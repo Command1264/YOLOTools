@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -311,6 +312,11 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_script.clicked.connect(self._pick_script)
         form.addRow("入口腳本", self._with_btn(self.txt_script, btn_script))
 
+        self.txt_python = QtWidgets.QLineEdit()
+        btn_python = QtWidgets.QPushButton("選擇")
+        btn_python.clicked.connect(self._pick_python)
+        form.addRow("Python 路徑", self._with_btn(self.txt_python, btn_python))
+
         self.txt_name = QtWidgets.QLineEdit()
         form.addRow("程式名稱", self.txt_name)
 
@@ -422,6 +428,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.txt_icon.setText(self._normalize_path(path))
 
+    def _pick_python(self) -> None:
+        filters = "Python (python.exe);;All files (*)" if os.name == "nt" else "Python (*)"
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "選擇 Python", str(self.exec_dir), filters)
+        if path:
+            self.txt_python.setText(self._normalize_path(path))
+
     def _pick_dir(self, target: QtWidgets.QLineEdit) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇資料夾", target.text() or str(self.exec_dir))
         if path:
@@ -442,6 +454,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not settings.script_path:
             QtWidgets.QMessageBox.warning(self, "缺少腳本", "請選擇入口腳本")
             return
+        if not settings.python_path:
+            if getattr(sys, "frozen", False):
+                QtWidgets.QMessageBox.warning(self, "缺少 Python", "請設定 Python 路徑")
+                return
 
         self.build_log.clear()
         self.build_log.show()
@@ -491,6 +507,7 @@ class MainWindow(QtWidgets.QMainWindow):
         hidden = self.txt_hidden.toPlainText().splitlines()
         return BuildSettings(
             packager=self.cmb_packager.currentText(),
+            python_path=self._normalize_path(self.txt_python.text().strip()),
             script_path=self._normalize_path(self.txt_script.text().strip()),
             name=self.txt_name.text().strip(),
             onefile=self.cmb_bundle.currentData() == "onefile",
@@ -614,6 +631,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _settings_to_dict(self) -> Dict[str, object]:
         data = {
             "packager": self.cmb_packager.currentText(),
+            "python_path": self._normalize_path(self.txt_python.text().strip()),
             "script_path": self._normalize_path(self.txt_script.text().strip()),
             "name": self.txt_name.text().strip(),
             "bundle_mode": self.cmb_bundle.currentData(),
@@ -637,6 +655,7 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = self.cmb_packager.findText(packager)
         if idx >= 0:
             self.cmb_packager.setCurrentIndex(idx)
+        self.txt_python.setText(self._normalize_path(str(data.get("python_path", ""))))
         self.txt_script.setText(self._normalize_path(str(data.get("script_path", ""))))
         self.txt_name.setText(str(data.get("name", "")))
         bundle = str(data.get("bundle_mode", "onedir"))

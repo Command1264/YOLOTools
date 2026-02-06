@@ -14,6 +14,7 @@ from PySide6 import QtCore
 @dataclass
 class BuildSettings:
     packager: str
+    python_path: str
     script_path: str
     name: str
     onefile: bool
@@ -50,8 +51,13 @@ class BuildWorker(QtCore.QThread):
         self._stdin_lock = QtCore.QMutex()
 
     def run(self) -> None:
-        cmd = self._build_command()
-        self.output_line.emit(" ".join(cmd))
+        try:
+            cmd = self._build_command()
+        except Exception as exc:
+            self.output_line.emit(f"[ERROR] 無法建立打包指令：{exc}")
+            self.finished_ok.emit(False)
+            return
+        self.output_line.emit(subprocess.list2cmdline(cmd))
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -134,10 +140,18 @@ class BuildWorker(QtCore.QThread):
             return self._build_nuitka_command()
         return self._build_pyinstaller_command()
 
+    def _resolve_python_exe(self) -> str:
+        if self.settings.python_path:
+            return self.settings.python_path
+        if getattr(sys, "frozen", False):
+            raise RuntimeError("打包版本無預設 Python，請設定 Python 路徑。")
+        return sys.executable
+
     def _build_pyinstaller_command(self) -> List[str]:
         sep = ";" if os.name == "nt" else ":"
         s = self.settings
-        cmd = ["pyinstaller"]
+        python_exe = self._resolve_python_exe()
+        cmd = [python_exe, "-m", "PyInstaller"]
         if s.onefile:
             cmd.append("--onefile")
         if s.no_console:
@@ -178,7 +192,8 @@ class BuildWorker(QtCore.QThread):
     def _build_nuitka_command(self) -> List[str]:
         sep = ";" if os.name == "nt" else ":"
         s = self.settings
-        cmd = [sys.executable, "-m", "nuitka", "--mode=onefile" if s.onefile else "--mode=standalone"]
+        python_exe = self._resolve_python_exe()
+        cmd = [python_exe, "-m", "nuitka", "--mode=onefile" if s.onefile else "--mode=standalone"]
         if s.lto:
             cmd.append("--lto")
         if s.show_progress:
