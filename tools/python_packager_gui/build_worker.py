@@ -58,6 +58,7 @@ class BuildWorker(QtCore.QThread):
             self.finished_ok.emit(False)
             return
         self.output_line.emit(subprocess.list2cmdline(cmd))
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -66,6 +67,7 @@ class BuildWorker(QtCore.QThread):
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
+                creationflags=creationflags,
             )
         except Exception as exc:
             self.output_line.emit(f"[ERROR] 無法啟動打包程序：{exc}")
@@ -103,6 +105,7 @@ class BuildWorker(QtCore.QThread):
             return
         with QtCore.QMutexLocker(self._stdin_lock):
             try:
+                self.output_line.emit(f"[輸入] {text}")
                 self._proc.stdin.write(text + "\n")
                 self._proc.stdin.flush()
             except Exception:
