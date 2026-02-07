@@ -10,20 +10,38 @@ import time
 from dataclasses import dataclass
 from logging import Logger
 from pathlib import Path
-from typing import Any, Optional, Tuple
-
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from typing import Any, Optional
 
 import portalocker
 import yaml
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QAction, QCloseEvent, QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMenuBar,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from log_manager import LogContext, LogController, setup_logging
 from log_viewer import LogViewer
 from server import YoloServer
-from yolo_engine import YoloEngine
 from tray import create_tray_icon
 from tray_base import TrayBase
+from yolo_engine import YoloEngine
+
 
 def _resolve_exec_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -99,6 +117,8 @@ def _coerce_int(value: Any, default: int) -> int:
 
 @dataclass
 class AppConfig:
+    """儲存 GUI 與啟動相關設定。"""
+
     model_path: str = ""
     host: str = "127.0.0.1"
     port: int = 60922
@@ -154,7 +174,7 @@ class AppConfig:
             APP_LOG_CTRL.exception("儲存設定失敗。path=%s", str(path))
 
 
-def validate_host(value: str) -> Tuple[bool, str]:
+def validate_host(value: str) -> tuple[bool, str]:
     val = (value or "").strip()
     if not val:
         return False, "IP 不能空白"
@@ -167,7 +187,7 @@ def validate_host(value: str) -> Tuple[bool, str]:
         return False, f"無效 IP：{val}"
 
 
-def validate_port(value: str) -> Tuple[bool, Optional[int], str]:
+def validate_port(value: str) -> tuple[bool, Optional[int], str]:
     try:
         port = int(str(value).strip())
     except Exception:
@@ -193,6 +213,8 @@ def build_startup_command() -> str:
 
 
 class SingleInstanceLock:
+    """以 lock file 確保單一實例執行。"""
+
     def __init__(self, lock_path: Path, log_ctrl: LogController) -> None:
         self._lock_path: Path = lock_path
         self._log_ctrl: LogController = log_ctrl
@@ -205,23 +227,26 @@ class SingleInstanceLock:
         with self._lock:
             if self._file is not None:
                 return True
+            handle: Optional[object] = None
             try:
                 handle = open(self._lock_path, "a+")
                 portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
                 self._file = handle
                 return True
             except portalocker.exceptions.LockException:
-                try:
-                    handle.close()
-                except Exception:
-                    self._log_ctrl.exception("關閉鎖檔失敗。path=%s", str(self._lock_path))
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        self._log_ctrl.exception("關閉鎖檔失敗。path=%s", str(self._lock_path))
                 return False
             except Exception:
                 self._log_ctrl.exception("取得鎖失敗。path=%s", str(self._lock_path))
-                try:
-                    handle.close()
-                except Exception:
-                    self._log_ctrl.exception("關閉鎖檔失敗。path=%s", str(self._lock_path))
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        self._log_ctrl.exception("關閉鎖檔失敗。path=%s", str(self._lock_path))
                 return False
 
     def start_retainer(self, interval_sec: float = 3.0) -> None:
@@ -256,41 +281,38 @@ class SingleInstanceLock:
         self.release()
 
 
-class App(tk.Tk):
+class App(QMainWindow):
+    """YOLO 伺服器主視窗（PySide6 版本）。"""
+
     def __init__(self, instance_lock: Optional[SingleInstanceLock] = None) -> None:
         super().__init__()
-        self.title("YOLO Server")
-        self.geometry("720x360")
-        self.minsize(640, 320)
+        self.setWindowTitle("YOLO Server")
+        self.resize(720, 360)
+        self.setMinimumSize(640, 320)
 
         self.log_context: LogContext = setup_logging(EXEC_DIR)
         self.logger: Logger = self.log_context.logger
         self.log_ctrl: LogController = LogController(self.logger)
         self.log_ctrl.info("GUI 啟動")
 
-        self._app_icon: Optional[tk.PhotoImage] = None
         icon_path = _select_icon_path()
-        if icon_path is None:
-            self.log_ctrl.warning("找不到應用程式圖示檔案。")
+        if icon_path is not None:
+            self.setWindowIcon(QIcon(str(icon_path)))
         else:
-            try:
-                if icon_path.suffix.lower() == ".ico" and os.name == "nt":
-                    self.iconbitmap(default=str(icon_path))
-                else:
-                    self._app_icon = tk.PhotoImage(file=str(icon_path))
-                    self.iconphoto(True, self._app_icon)
-            except Exception:
-                self.log_ctrl.exception("載入應用程式圖示失敗。path=%s", str(icon_path))
+            self.log_ctrl.warning("找不到應用程式圖示檔案。")
 
         self.cfg: AppConfig = AppConfig.load(CONFIG_PATH)
         self.server: Optional[YoloServer] = None
         self._deps_ready: bool = False
         self._deps_loading: bool = False
         self._deps_token: int = 0
+        self._dep_result_queue: queue.Queue[tuple[int, Optional[str]]] = queue.Queue()
+        self._device_queue: queue.Queue[str] = queue.Queue()
         self._tray_queue: queue.Queue[str] = queue.Queue()
         self._log_viewer: Optional[LogViewer] = None
-        self._settings_win: Optional[tk.Toplevel] = None
         self._instance_lock: Optional[SingleInstanceLock] = instance_lock
+        self._quitting: bool = False
+
         tray_icon_path = _select_icon_path()
         self.tray: TrayBase = create_tray_icon(
             tooltip="YOLO Server",
@@ -300,120 +322,138 @@ class App(tk.Tk):
         )
 
         self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
-
         self._apply_config_to_ui()
         self._init_dep_status()
         self._apply_startup_setting()
-        self.after(200, self._poll_tray_queue)
         self.tray.start()
+
+        self._poll_timer: QTimer = QTimer(self)
+        self._poll_timer.setInterval(200)
+        self._poll_timer.timeout.connect(self._poll_background_queues)
+        self._poll_timer.start()
+
         if self.cfg.auto_start_server:
-            self.after(200, self._try_auto_start)
+            QTimer.singleShot(200, self._try_auto_start)
 
     def _build_ui(self) -> None:
-        self._build_menu()
+        menu_bar: QMenuBar = self.menuBar()
+        menu_more: QMenu = menu_bar.addMenu("更多功能")
+        action_log: QAction = QAction("瀏覽運行日誌", self)
+        action_log.triggered.connect(self._open_log_viewer)
+        menu_more.addAction(action_log)
+        action_settings: QAction = QAction("設定...", self)
+        action_settings.triggered.connect(self._open_settings)
+        menu_more.addAction(action_settings)
 
-        wrap: ttk.Frame = ttk.Frame(self, padding=16)
-        wrap.pack(fill="both", expand=True)
+        root: QWidget = QWidget(self)
+        self.setCentralWidget(root)
+        main_layout: QVBoxLayout = QVBoxLayout(root)
 
-        r: int = 0
-        ttk.Label(wrap, text="模型路徑").grid(row=r, column=0, sticky="w", pady=6)
-        self.var_model_path: tk.StringVar = tk.StringVar()
-        self.ent_model: ttk.Entry = ttk.Entry(wrap, textvariable=self.var_model_path)
-        self.ent_model.grid(row=r, column=1, sticky="we", padx=8)
-        self.btn_pick_model: ttk.Button = ttk.Button(wrap, text="選擇...", command=self._pick_model)
-        self.btn_pick_model.grid(row=r, column=2, sticky="e")
+        form: QFormLayout = QFormLayout()
+        main_layout.addLayout(form)
 
-        r += 1
-        ttk.Label(wrap, text="IP").grid(row=r, column=0, sticky="w", pady=6)
-        self.var_host: tk.StringVar = tk.StringVar()
-        self.var_port: tk.StringVar = tk.StringVar()
-        ip_row: ttk.Frame = ttk.Frame(wrap)
-        ip_row.grid(row=r, column=1, sticky="we", padx=8)
-        self.ent_host: ttk.Entry = ttk.Entry(ip_row, textvariable=self.var_host)
-        self.ent_host.pack(side="left", fill="x", expand=True)
-        ttk.Label(ip_row, text="Port").pack(side="left", padx=(12, 6))
-        self.ent_port: ttk.Entry = ttk.Entry(ip_row, textvariable=self.var_port, width=10)
-        self.ent_port.pack(side="left")
+        model_row: QWidget = QWidget(root)
+        model_layout: QHBoxLayout = QHBoxLayout(model_row)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        self.ent_model: QLineEdit = QLineEdit(model_row)
+        self.btn_pick_model: QPushButton = QPushButton("選擇...", model_row)
+        self.btn_pick_model.clicked.connect(self._pick_model)
+        model_layout.addWidget(self.ent_model, 1)
+        model_layout.addWidget(self.btn_pick_model)
+        form.addRow("模型路徑", model_row)
 
-        r += 1
-        self.btn_toggle: ttk.Button = ttk.Button(wrap, text="啟動伺服器", command=self._toggle_server)
-        self.btn_toggle.grid(row=r, column=0, sticky="w", pady=12)
-        self.var_status: tk.StringVar = tk.StringVar(value="狀態：未啟動")
-        ttk.Label(wrap, textvariable=self.var_status).grid(row=r, column=1, sticky="w", padx=8)
+        ip_row: QWidget = QWidget(root)
+        ip_layout: QHBoxLayout = QHBoxLayout(ip_row)
+        ip_layout.setContentsMargins(0, 0, 0, 0)
+        self.ent_host: QLineEdit = QLineEdit(ip_row)
+        self.ent_port: QLineEdit = QLineEdit(ip_row)
+        self.ent_port.setMaximumWidth(120)
+        ip_layout.addWidget(self.ent_host, 1)
+        ip_layout.addWidget(QLabel("Port", ip_row))
+        ip_layout.addWidget(self.ent_port)
+        form.addRow("IP", ip_row)
 
-        r += 1
-        self.var_device: tk.StringVar = tk.StringVar(value="裝置：未啟動")
-        ttk.Label(wrap, textvariable=self.var_device).grid(row=r, column=1, sticky="w", padx=8)
+        status_row: QWidget = QWidget(root)
+        status_layout: QHBoxLayout = QHBoxLayout(status_row)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_toggle: QPushButton = QPushButton("啟動伺服器", status_row)
+        self.btn_toggle.clicked.connect(self._toggle_server)
+        status_text_wrap: QWidget = QWidget(status_row)
+        status_text_layout: QVBoxLayout = QVBoxLayout(status_text_wrap)
+        status_text_layout.setContentsMargins(0, 0, 0, 0)
+        status_text_layout.setSpacing(4)
+        self.lbl_status: QLabel = QLabel("狀態：未啟動", status_text_wrap)
+        self.lbl_device: QLabel = QLabel("裝置：未啟動", status_text_wrap)
+        status_text_layout.addWidget(self.lbl_status)
+        status_text_layout.addWidget(self.lbl_device)
+        status_layout.addWidget(self.btn_toggle)
+        status_layout.addWidget(status_text_wrap, 1)
+        main_layout.addWidget(status_row)
 
-        wrap.grid_columnconfigure(1, weight=1)
+        main_layout.addStretch(1)
+        self.lbl_dep_status: QLabel = QLabel("核心套件：尚未載入", root)
+        main_layout.addWidget(self.lbl_dep_status)
 
-        self.ent_host.bind("<FocusOut>", lambda _e: self._apply_quick_settings(False))
-        self.ent_port.bind("<FocusOut>", lambda _e: self._apply_quick_settings(False))
-
-        status_bar: ttk.Frame = ttk.Frame(self, padding=(12, 6))
-        status_bar.pack(side="bottom", fill="x")
-        self.var_dep_status: tk.StringVar = tk.StringVar(value="核心套件：尚未載入")
-        ttk.Label(status_bar, textvariable=self.var_dep_status).pack(side="left")
-
-    def _build_menu(self) -> None:
-        menubar: tk.Menu = tk.Menu(self)
-        menu_more: tk.Menu = tk.Menu(menubar, tearoff=0)
-        menu_more.add_command(label="瀏覽運行日誌", command=self._open_log_viewer)
-        menu_more.add_command(label="設定...", command=self._open_settings)
-        menubar.add_cascade(label="更多功能", menu=menu_more)
-        self.config(menu=menubar)
+        self.ent_host.editingFinished.connect(lambda: self._apply_quick_settings(False))
+        self.ent_port.editingFinished.connect(lambda: self._apply_quick_settings(False))
 
     def _apply_config_to_ui(self) -> None:
-        self.var_model_path.set(self.cfg.model_path)
-        self.var_host.set(self.cfg.host)
-        self.var_port.set(str(self.cfg.port))
+        self.ent_model.setText(self.cfg.model_path)
+        self.ent_host.setText(self.cfg.host)
+        self.ent_port.setText(str(self.cfg.port))
 
     def _pick_model(self) -> None:
-        path: str = filedialog.askopenfilename(
-            title="選擇模型",
-            initialdir=EXEC_DIR,
-            filetypes=[("YOLO weights", "*.pt"), ("All files", "*.*")],
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "選擇模型",
+            str(EXEC_DIR),
+            "YOLO weights (*.pt);;All files (*.*)",
         )
         if path:
-            self.var_model_path.set(normalize_path(path))
+            self.ent_model.setText(normalize_path(path))
             self._apply_quick_settings(False)
 
+    def _show_error(self, title: str, text: str) -> None:
+        QMessageBox.critical(self, title, text)
+
+    def _show_warn(self, title: str, text: str) -> None:
+        QMessageBox.warning(self, title, text)
+
     def _apply_quick_settings(self, require_model: bool) -> bool:
-        model_path = normalize_path(self.var_model_path.get().strip())
+        model_path = normalize_path(self.ent_model.text().strip())
         if require_model:
             if not model_path:
-                messagebox.showerror("設定錯誤", "請選擇模型路徑")
-                self.var_model_path.set(self.cfg.model_path)
+                self._show_error("設定錯誤", "請選擇模型路徑")
+                self.ent_model.setText(self.cfg.model_path)
                 return False
             if not Path(model_path).exists():
-                messagebox.showerror("設定錯誤", "模型路徑不存在")
-                self.var_model_path.set(self.cfg.model_path)
+                self._show_error("設定錯誤", "模型路徑不存在")
+                self.ent_model.setText(self.cfg.model_path)
                 return False
         elif model_path and not Path(model_path).exists():
-            messagebox.showerror("設定錯誤", "模型路徑不存在")
-            self.var_model_path.set(self.cfg.model_path)
+            self._show_error("設定錯誤", "模型路徑不存在")
+            self.ent_model.setText(self.cfg.model_path)
             return False
 
-        host_ok, host_val = validate_host(self.var_host.get())
+        host_ok, host_val = validate_host(self.ent_host.text())
         if not host_ok:
-            messagebox.showerror("設定錯誤", host_val)
-            self.var_host.set(self.cfg.host)
+            self._show_error("設定錯誤", host_val)
+            self.ent_host.setText(self.cfg.host)
             return False
 
-        port_ok, port_val, port_msg = validate_port(self.var_port.get())
+        port_ok, port_val, port_msg = validate_port(self.ent_port.text())
         if not port_ok:
-            messagebox.showerror("設定錯誤", port_msg)
-            self.var_port.set(str(self.cfg.port))
+            self._show_error("設定錯誤", port_msg)
+            self.ent_port.setText(str(self.cfg.port))
             return False
 
         self.cfg.model_path = model_path
         self.cfg.host = host_val
-        self.cfg.port = port_val
+        self.cfg.port = int(port_val)
         self.cfg.save(CONFIG_PATH)
-        self.var_model_path.set(model_path)
-        self.var_host.set(host_val)
-        self.var_port.set(str(port_val))
+        self.ent_model.setText(model_path)
+        self.ent_host.setText(host_val)
+        self.ent_port.setText(str(port_val))
         return True
 
     def _toggle_server(self) -> None:
@@ -447,14 +487,14 @@ class App(tk.Tk):
                     icon_path=icon_path,
                 )
             self.server.start()
-        except Exception as e:
+        except Exception as exc:
             self.server = None
             self.log_ctrl.exception("啟動伺服器失敗。")
-            messagebox.showerror("啟動失敗", f"無法啟動伺服器：\n{e}")
+            self._show_error("啟動失敗", f"無法啟動伺服器：\n{exc}")
             return
         self._set_running_state(True)
-        self.var_status.set(f"狀態：執行中 http://{host}:{port}")
-        self.var_device.set("裝置：載入中...")
+        self.lbl_status.setText(f"狀態：執行中 http://{host}:{port}")
+        self.lbl_device.setText("裝置：載入中...")
         self._load_device_async()
         self.log_ctrl.info("伺服器已啟動。host=%s port=%s", host, port)
 
@@ -465,91 +505,88 @@ class App(tk.Tk):
         finally:
             self.server = None
         self._set_running_state(False)
-        self.var_status.set("狀態：未啟動")
-        self.var_device.set("裝置：未啟動")
+        self.lbl_status.setText("狀態：未啟動")
+        self.lbl_device.setText("裝置：未啟動")
         self.log_ctrl.info("伺服器已停止。")
 
     def _set_running_state(self, running: bool) -> None:
-        state: str = "disabled" if running else "normal"
-        self.ent_model.configure(state=state)
-        self.ent_host.configure(state=state)
-        self.ent_port.configure(state=state)
-        self.btn_pick_model.configure(state=state)
-        self.btn_toggle.configure(text="停止伺服器" if running else "啟動伺服器")
+        self.ent_model.setEnabled(not running)
+        self.ent_host.setEnabled(not running)
+        self.ent_port.setEnabled(not running)
+        self.btn_pick_model.setEnabled(not running)
+        self.btn_toggle.setText("停止伺服器" if running else "啟動伺服器")
         self._update_toggle_state()
 
     def _open_log_viewer(self) -> None:
-        if self._log_viewer is not None:
-            try:
-                self._log_viewer.lift()
-                return
-            except Exception:
-                self.log_ctrl.exception("無法提升日誌視窗。")
+        if self._log_viewer is not None and self._log_viewer.isVisible():
+            self._log_viewer.raise_()
+            self._log_viewer.activateWindow()
+            return
 
         def _on_close() -> None:
             self._log_viewer = None
 
         self.log_ctrl.info("開啟運行日誌視窗。")
         self._log_viewer = LogViewer(self, on_close=_on_close)
+        self._center_dialog(self._log_viewer)
+        self._log_viewer.show()
 
     def _open_settings(self) -> None:
-        if getattr(self, "_settings_win", None) is not None:
-            try:
-                self._settings_win.lift()
-                return
-            except Exception:
-                self.log_ctrl.exception("無法提升設定視窗。")
-        top: tk.Toplevel = tk.Toplevel(self)
-        self._settings_win = top
-        top.title("設定")
-        top.resizable(False, False)
-        top.transient(self)
-        top.grab_set()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("設定")
+        dialog.setModal(True)
 
-        wrap: ttk.Frame = ttk.Frame(top, padding=16)
-        wrap.pack(fill="both", expand=True)
+        layout: QVBoxLayout = QVBoxLayout(dialog)
+        chk_auto_start = QCheckBox("啟動時自動開啟伺服器", dialog)
+        chk_auto_start.setChecked(bool(self.cfg.auto_start_server))
+        chk_launch_startup = QCheckBox("開機自動啟動應用程式", dialog)
+        chk_launch_startup.setChecked(bool(self.cfg.launch_on_startup))
+        layout.addWidget(chk_auto_start)
+        layout.addWidget(chk_launch_startup)
 
-        var_auto_start: tk.BooleanVar = tk.BooleanVar(value=bool(self.cfg.auto_start_server))
-        var_launch_startup: tk.BooleanVar = tk.BooleanVar(value=bool(self.cfg.launch_on_startup))
-        close_key: str = self.cfg.close_behavior
-        var_close_behavior: tk.StringVar = tk.StringVar(value=CLOSE_LABELS.get(close_key, "詢問"))
+        close_row: QWidget = QWidget(dialog)
+        close_layout: QHBoxLayout = QHBoxLayout(close_row)
+        close_layout.setContentsMargins(0, 0, 0, 0)
+        close_layout.addWidget(QLabel("關閉按鈕行為", close_row))
+        cmb_close = QComboBox(close_row)
+        cmb_close.addItems(list(CLOSE_LABELS.values()))
+        cmb_close.setCurrentText(CLOSE_LABELS.get(self.cfg.close_behavior, "詢問"))
+        close_layout.addWidget(cmb_close, 1)
+        layout.addWidget(close_row)
 
-        ttk.Checkbutton(
-            wrap, text="啟動時自動開啟伺服器", variable=var_auto_start
-        ).grid(row=0, column=0, sticky="w", pady=6)
-        ttk.Checkbutton(
-            wrap, text="開機自動啟動應用程式", variable=var_launch_startup
-        ).grid(row=1, column=0, sticky="w", pady=6)
+        btn_row: QWidget = QWidget(dialog)
+        btn_layout: QHBoxLayout = QHBoxLayout(btn_row)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.addStretch(1)
+        btn_cancel = QPushButton("取消", btn_row)
+        btn_save = QPushButton("儲存", btn_row)
+        btn_layout.addWidget(btn_cancel)
+        btn_layout.addWidget(btn_save)
+        layout.addWidget(btn_row)
 
-        ttk.Label(wrap, text="關閉按鈕行為").grid(row=3, column=0, sticky="w", pady=6)
-        cmb_close: ttk.Combobox = ttk.Combobox(
-            wrap,
-            textvariable=var_close_behavior,
-            state="readonly",
-            values=list(CLOSE_LABELS.values()),
-            width=16,
-        )
-        cmb_close.grid(row=3, column=1, sticky="w", padx=6)
+        btn_cancel.clicked.connect(dialog.reject)
 
-        btns: ttk.Frame = ttk.Frame(wrap)
-        btns.grid(row=4, column=0, columnspan=3, sticky="e", pady=(10, 0))
-        ttk.Button(btns, text="取消", command=lambda: _close(False)).pack(side="right")
-        ttk.Button(btns, text="儲存", command=lambda: _close(True)).pack(side="right", padx=6)
+        def _save_and_close() -> None:
+            self.cfg.auto_start_server = chk_auto_start.isChecked()
+            self.cfg.launch_on_startup = chk_launch_startup.isChecked()
+            label_to_key = {v: k for k, v in CLOSE_LABELS.items()}
+            self.cfg.close_behavior = label_to_key.get(cmb_close.currentText(), "ask")
+            self.cfg.save(CONFIG_PATH)
+            self._apply_startup_setting()
+            self.tray.start()
+            dialog.accept()
 
-        def _close(save_ok: bool) -> None:
-            if save_ok:
-                self.cfg.auto_start_server = bool(var_auto_start.get())
-                self.cfg.launch_on_startup = bool(var_launch_startup.get())
-                label_to_key = {v: k for k, v in CLOSE_LABELS.items()}
-                self.cfg.close_behavior = label_to_key.get(var_close_behavior.get(), "ask")
-                self.cfg.save(CONFIG_PATH)
-                self._apply_startup_setting()
-                self.tray.start()
-            self._settings_win = None
-            top.destroy()
+        btn_save.clicked.connect(_save_and_close)
 
-        top.protocol("WM_DELETE_WINDOW", lambda: _close(False))
-        self._center_dialog(top)
+        self._center_dialog(dialog)
+        dialog.exec()
+
+    def _center_dialog(self, dialog: QWidget) -> None:
+        parent_geo = self.frameGeometry()
+        dialog.adjustSize()
+        dialog_geo = dialog.frameGeometry()
+        dialog_geo.moveCenter(parent_geo.center())
+        dialog.move(dialog_geo.topLeft())
 
     def _enqueue_tray_show(self) -> None:
         try:
@@ -563,6 +600,11 @@ class App(tk.Tk):
         except Exception:
             self.log_ctrl.exception("加入退出事件到 tray 佇列失敗。")
 
+    def _poll_background_queues(self) -> None:
+        self._poll_tray_queue()
+        self._poll_dep_queue()
+        self._poll_device_queue()
+
     def _poll_tray_queue(self) -> None:
         try:
             while True:
@@ -572,16 +614,23 @@ class App(tk.Tk):
                 elif action == "exit":
                     self._exit_app()
         except queue.Empty:
-            pass
-        self.after(200, self._poll_tray_queue)
+            return
 
-    def _center_dialog(self, top: tk.Toplevel) -> None:
-        top.update_idletasks()
-        w: int = top.winfo_reqwidth()
-        h: int = top.winfo_reqheight()
-        x: int = self.winfo_rootx() + (self.winfo_width() - w) // 2
-        y: int = self.winfo_rooty() + (self.winfo_height() - h) // 2
-        top.geometry(f"{w}x{h}+{x}+{y}")
+    def _poll_dep_queue(self) -> None:
+        try:
+            while True:
+                token, error_msg = self._dep_result_queue.get_nowait()
+                self._on_dep_preload_done(token, error_msg)
+        except queue.Empty:
+            return
+
+    def _poll_device_queue(self) -> None:
+        try:
+            while True:
+                device_name = self._device_queue.get_nowait()
+                self._apply_device_name(device_name)
+        except queue.Empty:
+            return
 
     def _apply_startup_setting(self) -> None:
         if os.name != "nt":
@@ -594,11 +643,10 @@ class App(tk.Tk):
             if enabled:
                 cmd: str = build_startup_command()
                 path.write_text(f"@echo off\n{cmd}\n", encoding="utf-8")
-            else:
-                if path.exists():
-                    path.unlink()
+            elif path.exists():
+                path.unlink()
         except Exception:
-            messagebox.showwarning("設定提醒", "無法更新開機啟動設定")
+            self._show_warn("設定提醒", "無法更新開機啟動設定")
 
     def _try_auto_start(self) -> None:
         if self.server and self.server.is_running():
@@ -607,7 +655,7 @@ class App(tk.Tk):
             self._start_server()
             return
         if self._deps_loading:
-            self.after(300, self._try_auto_start)
+            QTimer.singleShot(300, self._try_auto_start)
             return
         self.log_ctrl.warning("自動啟動失敗：核心套件未就緒。")
 
@@ -615,14 +663,14 @@ class App(tk.Tk):
         self._start_dep_preload()
 
     def _set_dep_status(self, text: str) -> None:
-        self.var_dep_status.set(text)
+        self.lbl_dep_status.setText(text)
         self._update_toggle_state()
 
     def _update_toggle_state(self) -> None:
         if self.server and self.server.is_running():
-            self.btn_toggle.configure(state="normal")
+            self.btn_toggle.setEnabled(True)
             return
-        self.btn_toggle.configure(state="normal" if self._deps_ready else "disabled")
+        self.btn_toggle.setEnabled(self._deps_ready)
 
     def _start_dep_preload(self) -> None:
         if self._deps_loading:
@@ -639,7 +687,7 @@ class App(tk.Tk):
                 YoloEngine.preload_dependencies()
             except Exception as exc:
                 error_msg = str(exc) or "unknown error"
-            self.after(0, lambda: self._on_dep_preload_done(token, error_msg))
+            self._dep_result_queue.put((token, error_msg))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -655,44 +703,22 @@ class App(tk.Tk):
         self._deps_ready = True
         self._set_dep_status("核心套件：就緒")
 
-    def _on_close_request(self) -> None:
-        behavior: str = self.cfg.close_behavior
-        if behavior == "ask":
-            res: Optional[bool] = messagebox.askyesnocancel(
-                "關閉", "要縮到工具列嗎？\n是：縮到工具列\n否：直接關閉\n取消：不動作"
-            )
-            if res is None:
-                return
-            if res:
-                self.cfg.close_behavior = "minimize"
-                self.cfg.save(CONFIG_PATH)
-                self._minimize_to_tray()
-            else:
-                self.cfg.close_behavior = "exit"
-                self.cfg.save(CONFIG_PATH)
-                self._exit_app()
-            return
-        if behavior == "minimize":
-            self._minimize_to_tray()
-        else:
-            self._exit_app()
-
     def _minimize_to_tray(self) -> None:
         if os.name != "nt":
             self._exit_app()
             return
-        self.withdraw()
+        self.hide()
         self.tray.start()
 
     def _restore_window(self) -> None:
-        try:
-            self.deiconify()
-            self.lift()
-            self.focus_force()
-        except Exception:
-            self.log_ctrl.exception("還原視窗失敗。")
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def _exit_app(self) -> None:
+        if self._quitting:
+            return
+        self._quitting = True
         try:
             self._stop_server()
         except Exception:
@@ -707,7 +733,11 @@ class App(tk.Tk):
         except Exception:
             self.log_ctrl.exception("釋放執行鎖失敗。")
         self.log_ctrl.info("GUI 結束。")
-        self.destroy()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+            return
+        self.close()
 
     def _load_device_async(self) -> None:
         def _worker() -> None:
@@ -717,7 +747,7 @@ class App(tk.Tk):
                     device_name = self.server.get_device_name()
             except Exception:
                 device_name = "unknown"
-            self.after(0, lambda: self._apply_device_name(device_name))
+            self._device_queue.put(device_name)
 
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
@@ -725,21 +755,71 @@ class App(tk.Tk):
     def _apply_device_name(self, device_name: str) -> None:
         if not self.server:
             return
-        self.var_device.set(f"裝置：{device_name}")
+        self.lbl_device.setText(f"裝置：{device_name}")
         self.log_ctrl.info("使用裝置：%s", device_name)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._quitting:
+            event.accept()
+            return
+        behavior: str = self.cfg.close_behavior
+        if behavior == "ask":
+            box = QMessageBox(self)
+            box.setWindowTitle("關閉")
+            box.setText("要縮到工具列嗎？\n是：縮到工具列\n否：直接關閉\n取消：不動作")
+            box.setIcon(QMessageBox.Question)
+            yes_btn = box.addButton("是", QMessageBox.YesRole)
+            no_btn = box.addButton("否", QMessageBox.NoRole)
+            cancel_btn = box.addButton("取消", QMessageBox.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is cancel_btn:
+                event.ignore()
+                return
+            if clicked is yes_btn:
+                self.cfg.close_behavior = "minimize"
+                self.cfg.save(CONFIG_PATH)
+                event.ignore()
+                self._minimize_to_tray()
+                return
+            if clicked is no_btn:
+                self.cfg.close_behavior = "exit"
+                self.cfg.save(CONFIG_PATH)
+                event.ignore()
+                self._exit_app()
+                return
+            event.ignore()
+            return
+        if behavior == "minimize":
+            event.ignore()
+            self._minimize_to_tray()
+            return
+        event.ignore()
+        self._exit_app()
 
 
 if __name__ == "__main__":
+    qt_app = QApplication(sys.argv)
+    icon_path = _select_icon_path()
+    if icon_path is not None:
+        qt_app.setWindowIcon(QIcon(str(icon_path)))
+
     lock_path = Path(tempfile.gettempdir()) / LOCK_FILE_NAME
     instance_lock = SingleInstanceLock(lock_path, APP_LOG_CTRL)
     allow_start = True
     if not instance_lock.try_acquire():
-        temp_root = tk.Tk()
-        temp_root.withdraw()
-        allow_start = messagebox.askyesno("已在執行", "偵測到已有程式在執行。\n仍要開啟新的視窗嗎？")
-        temp_root.destroy()
+        result = QMessageBox.question(
+            None,
+            "已在執行",
+            "偵測到已有程式在執行。\n仍要開啟新的視窗嗎？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        allow_start = result == QMessageBox.Yes
     if not allow_start:
         sys.exit(0)
+
     instance_lock.start_retainer()
     app = App(instance_lock=instance_lock)
-    app.mainloop()
+    app.show()
+    sys.exit(qt_app.exec())
