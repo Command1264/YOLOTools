@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 import hashlib
 
-import yaml
+from yaml_models import YamlMappingModel
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 LBL_EXT = ".txt"
@@ -60,13 +60,13 @@ def manifest_matches(root: Path, expected: Dict[str, Any]) -> bool:
         return False
 
 def write_manifest(path: Path, data: Dict[str, Any]) -> None:
-    path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    YamlMappingModel(data=dict(data)).save(path)
 
 def read_manifest(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        return yaml.safe_load(path.read_text(encoding="utf-8"))
+        return dict(YamlMappingModel.from_file(path).data)
     except Exception:
         return None
 
@@ -79,7 +79,7 @@ def find_data_yaml(root: Path) -> Optional[Path]:
     return None
 
 def load_data_yaml(path: Path) -> Dict[str, Any]:
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    return dict(YamlMappingModel.from_file(path).data)
 
 def _resolve_path(base_dir: Path, p: str) -> Path:
     # Ultralytics supports relative paths in yaml; treat relative to yaml directory
@@ -245,7 +245,7 @@ def rewrite_data_yaml_to_extracted_root(
             log_cb(f"  - normalize {split}: {v} => {data[split]}\n")
 
     # 3) save
-    patched_yaml.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    YamlMappingModel(data=dict(data)).save(patched_yaml)
     log_cb(f"[patched] data.yaml => {patched_yaml}\n")
     return patched_yaml
 

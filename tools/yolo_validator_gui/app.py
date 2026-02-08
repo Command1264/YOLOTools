@@ -1,17 +1,37 @@
+from __future__ import annotations
+
 import base64
 import json
+import queue
 import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import cv2
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QPlainTextEdit,
+    QSlider,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
 
 import sys
 from pathlib import Path as _Path
@@ -34,56 +54,20 @@ class HttpInferError(Exception):
     """HTTP 推論錯誤。"""
 
 
-@dataclass
-class HttpInferRequest:
-    """HTTP 推論請求資料。"""
-
-    image_b64: str
-    thread_name: str
-
-
-@dataclass
-class HttpDetection:
-    """HTTP 回傳的偵測結果。"""
-
-    class_name: str
-    conf: float
-    xyxy: Tuple[int, int, int, int]
-
-
-@dataclass
-class HttpInferResponse:
-    """HTTP 回傳的推論結果。"""
-
-    classify_type: str
-    percentage: float
-    detections: List[HttpDetection]
-
-
 class YoloHttpClient:
     """YOLO HTTP 推論用戶端。"""
 
-    def __init__(self, url: str, timeout_sec: float = 8.0):
+    def __init__(self, url: str, timeout_sec: float = 8.0) -> None:
         self._url = url
         self._timeout_sec = timeout_sec
 
-    def infer(self, frame_bgr) -> HttpInferResponse:
-        """
-        Send an image to the server for inference.
-
-        Args:
-            frame_bgr: BGR image array.
-
-        Returns:
-            HttpInferResponse: Inference result.
-
-        Raises:
-            HttpInferError: If HTTP or decoding fails.
-        """
+    def infer(self, frame_bgr) -> list[dict]:
         try:
-            image_b64 = _encode_image_to_base64(frame_bgr)
-            request_data = HttpInferRequest(image_b64=image_b64, thread_name="yolo_validator_gui")
-            payload = {"threadName": request_data.thread_name, "image": request_data.image_b64}
+            ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not ok:
+                raise HttpInferError("圖片編碼失敗。")
+            image_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            payload = {"threadName": "yolo_validator_gui", "image": image_b64}
             raw = json.dumps(payload, ensure_ascii=True).encode("utf-8")
             req = urllib.request.Request(
                 self._url,
@@ -100,7 +84,10 @@ class YoloHttpClient:
                 result = result[0] if result else {}
             if not isinstance(result, dict):
                 raise HttpInferError("回傳內容錯誤。")
-            return _parse_http_response(result)
+            dets = result.get("detections", [])
+            if not isinstance(dets, list):
+                return []
+            return [d for d in dets if isinstance(d, dict)]
         except HttpInferError:
             raise
         except urllib.error.HTTPError as exc:
@@ -111,823 +98,495 @@ class YoloHttpClient:
             raise HttpInferError(f"HTTP 推論失敗: {exc}") from exc
 
 
-def _encode_image_to_base64(frame_bgr) -> str:
-    ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        raise HttpInferError("圖片編碼失敗。")
-    return base64.b64encode(buf.tobytes()).decode("ascii")
+class App(QMainWindow):
+    """YOLOv26 模型驗證器（PySide6）。"""
 
-
-def _parse_http_response(payload: Dict[str, object]) -> HttpInferResponse:
-    classify_type = str(payload.get("classifyType", "none"))
-    try:
-        percentage = float(payload.get("percentage", 0.0))
-    except Exception:
-        percentage = 0.0
-    detections: List[HttpDetection] = []
-    raw_dets = payload.get("detections", [])
-    if isinstance(raw_dets, list):
-        for item in raw_dets:
-            if not isinstance(item, dict):
-                continue
-            class_name = str(item.get("className", ""))
-            try:
-                conf = float(item.get("conf", 0.0))
-            except Exception:
-                conf = 0.0
-            xyxy_raw = item.get("xyxy", [])
-            if not isinstance(xyxy_raw, list) or len(xyxy_raw) != 4:
-                continue
-            try:
-                xyxy = tuple(int(v) for v in xyxy_raw)
-            except Exception:
-                continue
-            detections.append(HttpDetection(class_name=class_name, conf=conf, xyxy=xyxy))
-    return HttpInferResponse(classify_type=classify_type, percentage=percentage, detections=detections)
-
-class App(tk.Tk):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.title("YOLOv26 模型驗證器")
-        self.geometry("1100x720")
-        self.minsize(980, 640)
+        self.setWindowTitle("YOLOv26 模型驗證器")
+        self.resize(1100, 720)
+        self.setMinimumSize(980, 640)
 
-        self.var_model = tk.StringVar()
-        self.var_input = tk.StringVar()
-        self.var_conf = tk.DoubleVar(value=0.70)
-        self.var_iou = tk.DoubleVar(value=0.45)
-        self.var_conf_str = tk.StringVar(value="0.70")
-        self.var_iou_str = tk.StringVar(value="0.45")
-        self.var_device = tk.StringVar(value="")
-        self.var_show = tk.BooleanVar(value=True)
-        self.var_ignore_conf = tk.BooleanVar(value=False)
-        self.var_ignore_iou = tk.BooleanVar(value=False)
-        self.var_interval = tk.DoubleVar(value=1.0)
-        self.var_order = tk.StringVar(value="圖片優先")
-        self.var_use_http = tk.BooleanVar(value=False)
-        self.var_http_url = tk.StringVar(value=DEFAULT_HTTP_URL)
-        self._order_map = {
-            "圖片優先": "images_first",
-            "影片優先": "videos_first",
-        }
-        self._order_map_rev = {v: k for k, v in self._order_map.items()}
+        self._config_path = Path(__file__).resolve().parent / "yolo_validator_config.json"
+        self._stop_event = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self._ui_token = 0
+        self._events: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self._last_frame = None
+        self._frame_buf = None
+        self._loading_config = False
         self._last_model_dir: Optional[Path] = None
         self._last_input_dir: Optional[Path] = None
-
-        self._worker: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._last_image: Optional[ImageTk.PhotoImage] = None
-        self._ui_token = 0
-        self._conf_prev: Optional[float] = None
-        self._iou_prev: Optional[float] = None
-        self._loading_config = False
-        self._config_path = Path(__file__).resolve().parent / "yolo_validator_config.json"
-        self._syncing_scale = False
+        self._order_map = {"圖片優先": "images_first", "影片優先": "videos_first"}
+        self._order_map_rev = {v: k for k, v in self._order_map.items()}
 
         self._build_ui()
-
-    def _build_ui(self):
-        pad = 10
-        root = ttk.Frame(self)
-        root.pack(fill="both", expand=True, padx=pad, pady=pad)
-
-        path_box = ttk.LabelFrame(root, text="模型與檔案")
-        path_box.pack(fill="x", padx=2, pady=6)
-
-        ttk.Label(path_box, text="YOLO 模型 (.pt):").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        self.ent_model = ttk.Entry(path_box, textvariable=self.var_model)
-        self.ent_model.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
-        self.ent_model.bind("<FocusOut>", lambda _e: self._on_model_entry())
-        self.ent_model.bind("<Return>", lambda _e: self._on_model_entry())
-        ttk.Button(path_box, text="瀏覽...", command=self.browse_model).grid(row=0, column=2, padx=8, pady=6)
-
-        ttk.Label(path_box, text="圖片或影片:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
-        self.ent_input = ttk.Entry(path_box, textvariable=self.var_input)
-        self.ent_input.grid(row=1, column=1, sticky="ew", padx=8, pady=6)
-        self.ent_input.bind("<FocusOut>", lambda _e: self._on_input_entry())
-        self.ent_input.bind("<FocusOut>", lambda _e: self._on_input_entry())
-        self.ent_input.bind("<Return>", lambda _e: self._on_input_entry())
-        ttk.Button(path_box, text="瀏覽檔案...", command=self.browse_input).grid(row=1, column=2, padx=8, pady=6)
-        ttk.Button(path_box, text="瀏覽資料夾...", command=self.browse_input_dir).grid(row=1, column=3, padx=8, pady=6)
-
-        path_box.columnconfigure(1, weight=1)
-
-        opt_box = ttk.LabelFrame(root, text="推論設定")
-        opt_box.pack(fill="x", padx=2, pady=6)
-
-        ttk.Label(opt_box, text="conf:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        self.scale_conf = ttk.Scale(
-            opt_box,
-            from_=0.01,
-            to=1.0,
-            orient="horizontal",
-            command=lambda v: self._sync_from_scale("conf", v),
-        )
-        self.scale_conf.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
-        self.ent_conf = ttk.Entry(opt_box, textvariable=self.var_conf_str, width=8)
-        self.ent_conf.grid(row=0, column=2, sticky="w", padx=4, pady=6)
-        self.ent_conf.bind("<FocusOut>", lambda _e: self._validate_entry("conf"))
-        self.ent_conf.bind("<Return>", lambda _e: self._validate_entry("conf"))
-
-        ttk.Label(opt_box, text="iou:").grid(row=0, column=3, sticky="w", padx=8, pady=6)
-        self.scale_iou = ttk.Scale(
-            opt_box,
-            from_=0.0,
-            to=1.0,
-            orient="horizontal",
-            command=lambda v: self._sync_from_scale("iou", v),
-        )
-        self.scale_iou.grid(row=0, column=4, sticky="ew", padx=8, pady=6)
-        self.ent_iou = ttk.Entry(opt_box, textvariable=self.var_iou_str, width=8)
-        self.ent_iou.grid(row=0, column=5, sticky="w", padx=4, pady=6)
-        self.ent_iou.bind("<FocusOut>", lambda _e: self._validate_entry("iou"))
-        self.ent_iou.bind("<Return>", lambda _e: self._validate_entry("iou"))
-
-        ttk.Label(opt_box, text="device (空白=auto):").grid(row=1, column=0, sticky="w", padx=8, pady=6)
-        self.ent_device = ttk.Entry(opt_box, textvariable=self.var_device, width=10)
-        self.ent_device.grid(row=1, column=1, sticky="w", padx=8, pady=6)
-        self.ent_device.bind("<FocusOut>", lambda _e: self._save_config())
-        self.ent_device.bind("<Return>", lambda _e: self._save_config())
-        ttk.Checkbutton(opt_box, text="顯示 YOLO 判斷框與標籤", variable=self.var_show, command=self._on_toggle_show).grid(
-            row=1, column=2, columnspan=2, sticky="w", padx=8, pady=6
-        )
-        ttk.Checkbutton(opt_box, text="忽略 conf", variable=self.var_ignore_conf, command=self._on_ignore_conf).grid(
-            row=1, column=4, sticky="w", padx=8, pady=6
-        )
-        ttk.Checkbutton(opt_box, text="忽略 iou", variable=self.var_ignore_iou, command=self._on_ignore_iou).grid(
-            row=1, column=5, sticky="w", padx=8, pady=6
-        )
-
-        ttk.Label(opt_box, text="圖片切換/影片間隔(秒):").grid(row=2, column=0, sticky="w", padx=8, pady=6)
-        self.ent_interval = ttk.Entry(opt_box, textvariable=self.var_interval, width=8)
-        self.ent_interval.grid(row=2, column=1, sticky="w", padx=8, pady=6)
-        self.ent_interval.bind("<FocusOut>", lambda _e: self._on_interval_entry())
-        self.ent_interval.bind("<Return>", lambda _e: self._on_interval_entry())
-
-        ttk.Label(opt_box, text="播放順序:").grid(row=2, column=2, sticky="w", padx=8, pady=6)
-        self.cmb_order = ttk.Combobox(
-            opt_box,
-            textvariable=self.var_order,
-            state="readonly",
-            values=["圖片優先", "影片優先"],
-            width=14,
-        )
-        self.cmb_order.grid(row=2, column=3, sticky="w", padx=8, pady=6)
-        self.cmb_order.bind("<<ComboboxSelected>>", lambda _e: self._save_config())
-
-        ttk.Checkbutton(
-            opt_box,
-            text="使用 HTTP 推論",
-            variable=self.var_use_http,
-            command=self._on_toggle_http,
-        ).grid(row=3, column=0, sticky="w", padx=8, pady=6)
-        ttk.Label(opt_box, text="HTTP URL:").grid(row=3, column=2, sticky="w", padx=8, pady=6)
-        self.ent_http_url = ttk.Entry(opt_box, textvariable=self.var_http_url)
-        self.ent_http_url.grid(row=3, column=3, columnspan=3, sticky="ew", padx=8, pady=6)
-        self.ent_http_url.bind("<FocusOut>", lambda _e: self._on_http_url_entry())
-        self.ent_http_url.bind("<Return>", lambda _e: self._on_http_url_entry())
-
-        opt_box.columnconfigure(1, weight=1)
-        opt_box.columnconfigure(3, weight=1)
-        opt_box.columnconfigure(4, weight=1)
-
-        act = ttk.Frame(root)
-        act.pack(fill="x", padx=2, pady=6)
-        self.btn_start = ttk.Button(act, text="開始", command=self.start)
-        self.btn_start.pack(side="left", padx=6)
-        self.btn_stop = ttk.Button(act, text="停止", command=self.stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=6)
-
-        self.lbl_status = ttk.Label(act, text="就緒")
-        self.lbl_status.pack(side="left", padx=10)
-        self.lbl_device = ttk.Label(act, text="device: -")
-        self.lbl_device.pack(side="left", padx=10)
-
-        paned = tk.PanedWindow(root, orient="vertical")
-        paned.pack(fill="both", expand=True, padx=2, pady=6)
-
-        view = ttk.LabelFrame(paned, text="預覽")
-        self.canvas = tk.Canvas(view, bg="#111", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-
-        log_frame = ttk.LabelFrame(paned, text="Log")
-        self.log_box = tk.Text(log_frame, height=8, wrap="word")
-        self.log_box.pack(fill="both", expand=True)
-
-        paned.add(view)
-        paned.add(log_frame)
-        paned.paneconfigure(log_frame, minsize=90)
-
-        self._canvas_img_id = None
-        self._last_frame_bgr = None
-
-        self._paned = paned
-        self._log_frame = log_frame
-        self._log_lines = 5
-
-        self.log("就緒。請選擇模型與圖片/影片。")
         self._load_config()
-        self._sync_from_value("conf", self.var_conf.get())
-        self._sync_from_value("iou", self.var_iou.get())
-        self._apply_ignore_state()
-        self.after(0, lambda: self._set_log_height(self._paned, self._log_frame, self._log_lines))
-        self.canvas.bind("<Configure>", lambda _e: self._redraw_last_frame())
-        self._paned.bind("<Configure>", lambda _e: self._set_log_height(self._paned, self._log_frame, self._log_lines))
-        self.after(100, self._try_preview_on_start)
+        self._log("就緒。請選擇模型與圖片/影片。")
+        self._try_preview_on_start()
 
-    def log(self, msg: str):
-        ts = time.strftime("%H:%M:%S")
-        self.log_box.insert("end", f"[{ts}] {msg}\n")
-        self.log_box.see("end")
-        self.update_idletasks()
+        self._timer = QTimer(self)
+        self._timer.setInterval(40)
+        self._timer.timeout.connect(self._poll_events)
+        self._timer.start()
 
-    def browse_model(self):
-        initial = self._resolve_initial_dir(self.var_model.get(), self._last_model_dir)
-        p = filedialog.askopenfilename(
-            title="選擇 YOLO 模型",
-            initialdir=initial,
-            filetypes=[("YOLO Model", "*.pt"), ("All", "*.*")],
-        )
+    def _build_ui(self) -> None:
+        root = QWidget(self)
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+
+        path_box = QGroupBox("模型與檔案", root)
+        path_form = QFormLayout(path_box)
+
+        row_model = QWidget(path_box)
+        row_model_l = QHBoxLayout(row_model)
+        row_model_l.setContentsMargins(0, 0, 0, 0)
+        self.ent_model = QLineEdit(row_model)
+        self.ent_model.editingFinished.connect(self._save_config)
+        btn_model = QPushButton("瀏覽...", row_model)
+        btn_model.clicked.connect(self.browse_model)
+        row_model_l.addWidget(self.ent_model, 1)
+        row_model_l.addWidget(btn_model)
+        path_form.addRow("YOLO 模型 (.pt):", row_model)
+
+        row_input = QWidget(path_box)
+        row_input_l = QHBoxLayout(row_input)
+        row_input_l.setContentsMargins(0, 0, 0, 0)
+        self.ent_input = QLineEdit(row_input)
+        self.ent_input.editingFinished.connect(self._on_input_changed)
+        btn_input = QPushButton("瀏覽檔案...", row_input)
+        btn_input.clicked.connect(self.browse_input)
+        btn_input_dir = QPushButton("瀏覽資料夾...", row_input)
+        btn_input_dir.clicked.connect(self.browse_input_dir)
+        row_input_l.addWidget(self.ent_input, 1)
+        row_input_l.addWidget(btn_input)
+        row_input_l.addWidget(btn_input_dir)
+        path_form.addRow("圖片或影片:", row_input)
+        layout.addWidget(path_box)
+
+        opt_box = QGroupBox("推論設定", root)
+        opt_form = QFormLayout(opt_box)
+
+        row_conf = QWidget(opt_box)
+        row_conf_l = QHBoxLayout(row_conf)
+        row_conf_l.setContentsMargins(0, 0, 0, 0)
+        self.sld_conf = QSlider(Qt.Horizontal, row_conf)
+        self.sld_conf.setRange(1, 100)
+        self.sld_conf.setValue(70)
+        self.sld_conf.valueChanged.connect(lambda v: self.ent_conf.setText(f"{v/100:.2f}"))
+        self.ent_conf = QLineEdit("0.70", row_conf)
+        self.ent_conf.setMaximumWidth(80)
+        row_conf_l.addWidget(self.sld_conf, 1)
+        row_conf_l.addWidget(self.ent_conf)
+        opt_form.addRow("conf:", row_conf)
+
+        row_iou = QWidget(opt_box)
+        row_iou_l = QHBoxLayout(row_iou)
+        row_iou_l.setContentsMargins(0, 0, 0, 0)
+        self.sld_iou = QSlider(Qt.Horizontal, row_iou)
+        self.sld_iou.setRange(0, 100)
+        self.sld_iou.setValue(45)
+        self.sld_iou.valueChanged.connect(lambda v: self.ent_iou.setText(f"{v/100:.2f}"))
+        self.ent_iou = QLineEdit("0.45", row_iou)
+        self.ent_iou.setMaximumWidth(80)
+        row_iou_l.addWidget(self.sld_iou, 1)
+        row_iou_l.addWidget(self.ent_iou)
+        opt_form.addRow("iou:", row_iou)
+
+        row_more = QWidget(opt_box)
+        row_more_l = QHBoxLayout(row_more)
+        row_more_l.setContentsMargins(0, 0, 0, 0)
+        self.ent_device = QLineEdit("", row_more)
+        self.ent_device.setPlaceholderText("空白=auto")
+        self.chk_show = QCheckBox("顯示 YOLO 判斷框與標籤", row_more)
+        self.chk_show.setChecked(True)
+        self.chk_ignore_conf = QCheckBox("忽略 conf", row_more)
+        self.chk_ignore_iou = QCheckBox("忽略 iou", row_more)
+        self.ent_interval = QLineEdit("1.0", row_more)
+        self.ent_interval.setMaximumWidth(80)
+        self.cmb_order = QComboBox(row_more)
+        self.cmb_order.addItems(["圖片優先", "影片優先"])
+        row_more_l.addWidget(QLabel("device:", row_more))
+        row_more_l.addWidget(self.ent_device)
+        row_more_l.addWidget(self.chk_show)
+        row_more_l.addWidget(self.chk_ignore_conf)
+        row_more_l.addWidget(self.chk_ignore_iou)
+        row_more_l.addWidget(QLabel("間隔(秒):", row_more))
+        row_more_l.addWidget(self.ent_interval)
+        row_more_l.addWidget(QLabel("順序:", row_more))
+        row_more_l.addWidget(self.cmb_order)
+        row_more_l.addStretch(1)
+        opt_form.addRow(row_more)
+
+        row_http = QWidget(opt_box)
+        row_http_l = QHBoxLayout(row_http)
+        row_http_l.setContentsMargins(0, 0, 0, 0)
+        self.chk_use_http = QCheckBox("使用 HTTP 推論", row_http)
+        self.ent_http_url = QLineEdit(DEFAULT_HTTP_URL, row_http)
+        row_http_l.addWidget(self.chk_use_http)
+        row_http_l.addWidget(QLabel("HTTP URL:", row_http))
+        row_http_l.addWidget(self.ent_http_url, 1)
+        opt_form.addRow(row_http)
+        layout.addWidget(opt_box)
+
+        act = QWidget(root)
+        act_l = QHBoxLayout(act)
+        act_l.setContentsMargins(0, 0, 0, 0)
+        self.btn_start = QPushButton("開始", act)
+        self.btn_start.clicked.connect(self.start)
+        self.btn_stop = QPushButton("停止", act)
+        self.btn_stop.clicked.connect(self.stop)
+        self.btn_stop.setEnabled(False)
+        self.lbl_status = QLabel("就緒", act)
+        self.lbl_device = QLabel("device: -", act)
+        act_l.addWidget(self.btn_start)
+        act_l.addWidget(self.btn_stop)
+        act_l.addWidget(self.lbl_status, 1)
+        act_l.addWidget(self.lbl_device)
+        layout.addWidget(act)
+
+        splitter = QSplitter(Qt.Vertical, root)
+        self.lbl_preview = QLabel("", splitter)
+        self.lbl_preview.setAlignment(Qt.AlignCenter)
+        self.lbl_preview.setStyleSheet("background:#111;")
+        self.log_box = QPlainTextEdit(splitter)
+        self.log_box.setReadOnly(True)
+        splitter.addWidget(self.lbl_preview)
+        splitter.addWidget(self.log_box)
+        splitter.setSizes([560, 130])
+        layout.addWidget(splitter, 1)
+
+    def _log(self, msg: str) -> None:
+        self.log_box.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+    def _emit(self, kind: str, payload: object) -> None:
+        self._events.put((kind, payload))
+
+    def _poll_events(self) -> None:
+        while True:
+            try:
+                kind, payload = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "log":
+                self._log(str(payload))
+            elif kind == "status":
+                self.lbl_status.setText(str(payload))
+            elif kind == "device":
+                self.lbl_device.setText(f"device: {payload}")
+            elif kind == "error":
+                msg = str(payload)
+                self._log(msg)
+                QMessageBox.critical(self, "錯誤", msg)
+            elif kind == "frame":
+                frame, info = payload
+                self._last_frame = frame
+                self._render_frame(frame)
+                self.lbl_status.setText(str(info))
+            elif kind == "done":
+                stopped = bool(payload)
+                self.btn_start.setEnabled(True)
+                self.btn_stop.setEnabled(False)
+                self.lbl_status.setText("已停止" if stopped else "完成")
+
+    def _render_frame(self, frame_bgr) -> None:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg)
+        pix = pix.scaled(self.lbl_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._frame_buf = rgb
+        self.lbl_preview.setPixmap(pix)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._last_frame is not None:
+            self._render_frame(self._last_frame)
+
+    def browse_model(self) -> None:
+        initial = self._resolve_initial_dir(self.ent_model.text(), self._last_model_dir)
+        p, _ = QFileDialog.getOpenFileName(self, "選擇 YOLO 模型", initial, "YOLO Model (*.pt);;All (*.*)")
         if p:
-            self.var_model.set(p)
+            self.ent_model.setText(p)
             self._last_model_dir = Path(p).parent
             self._stop_if_running()
             self._save_config()
 
-    def browse_input(self):
-        initial = self._resolve_initial_dir(self.var_input.get(), self._last_input_dir)
-        p = filedialog.askopenfilename(
-            title="選擇圖片或影片",
-            initialdir=initial,
-            filetypes=[
-                ("Images/Video", "*.jpg;*.jpeg;*.png;*.bmp;*.webp;*.mp4;*.avi;*.mov;*.mkv;*.wmv"),
-                ("All", "*.*"),
-            ],
+    def browse_input(self) -> None:
+        initial = self._resolve_initial_dir(self.ent_input.text(), self._last_input_dir)
+        p, _ = QFileDialog.getOpenFileName(
+            self,
+            "選擇圖片或影片",
+            initial,
+            "Images/Video (*.jpg *.jpeg *.png *.bmp *.webp *.mp4 *.avi *.mov *.mkv *.wmv);;All (*.*)",
         )
         if p:
-            self.var_input.set(p)
+            self.ent_input.setText(p)
             self._last_input_dir = Path(p).parent
             self._preview_input(Path(p))
             self._stop_if_running()
             self._save_config()
 
-    def browse_input_dir(self):
-        initial = self._resolve_initial_dir(self.var_input.get(), self._last_input_dir)
-        p = filedialog.askdirectory(
-            title="選擇資料夾",
-            initialdir=initial,
-        )
+    def browse_input_dir(self) -> None:
+        initial = self._resolve_initial_dir(self.ent_input.text(), self._last_input_dir)
+        p = QFileDialog.getExistingDirectory(self, "選擇資料夾", initial)
         if p:
-            self.var_input.set(p)
+            self.ent_input.setText(p)
             self._last_input_dir = Path(p)
             self._preview_input(Path(p))
             self._stop_if_running()
             self._save_config()
 
-    def stop(self):
+    def stop(self) -> None:
         self._stop_event.set()
-        self.lbl_status.config(text="停止中...")
+        self.lbl_status.setText("停止中...")
 
-    def start(self):
-        if self._worker and self._worker.is_alive():
-            messagebox.showwarning("執行中", "目前正在執行。")
-            return
-
-        use_http = self.var_use_http.get()
-        model_path = None
-        if not use_http:
-            model_path = Path(self.var_model.get().strip())
-            if not model_path.exists():
-                messagebox.showerror("錯誤", "模型檔不存在。")
-                return
-        http_url = ""
-        if use_http:
-            http_url = self._normalize_http_url(self.var_http_url.get())
-            if not http_url:
-                messagebox.showerror("錯誤", "HTTP URL 無效。")
-                return
-            self.var_http_url.set(http_url)
-
-        input_path = Path(self.var_input.get().strip())
-        if not input_path.exists():
-            messagebox.showerror("錯誤", "輸入檔不存在。")
-            return
-        if input_path.is_dir():
-            if not self._collect_folder_items(input_path):
-                messagebox.showerror("錯誤", "資料夾內找不到可用的圖片或影片。")
-                return
-
-        self._validate_entry("conf")
-        self._validate_entry("iou")
-        self._on_interval_entry()
-
-        self._stop_event.clear()
-        self.btn_start.config(state="disabled")
-        self.btn_stop.config(state="normal")
-        self.lbl_status.config(text="執行中...")
-
-        self._ui_token += 1
-        token = self._ui_token
-        self._worker = threading.Thread(
-            target=self._run,
-            args=(model_path, input_path, self.var_device.get(), token, use_http, http_url),
-            daemon=True,
-        )
-        self._worker.start()
-
-    def _run(
-        self,
-        model_path: Optional[Path],
-        input_path: Path,
-        device: str,
-        token: int,
-        use_http: bool,
-        http_url: str,
-    ):
+    def _run(self, model_path: Optional[Path], input_path: Path, token: int, use_http: bool, http_url: str) -> None:
+        stopped = False
         try:
+            engine = None
+            http_client = None
             if use_http:
-                client = YoloHttpClient(http_url)
-                self._ui_device("http")
-                if input_path.is_dir():
-                    self._run_folder(None, client, input_path, token)
-                else:
-                    suffix = input_path.suffix.lower()
-                    if suffix in IMG_EXTS:
-                        self._run_image(None, client, input_path, token)
-                    elif suffix in VID_EXTS:
-                        self._run_video(None, client, input_path, token)
-                    else:
-                        self._ui_error("不支援的檔案格式。")
+                http_client = YoloHttpClient(http_url)
+                self._emit("device", "http")
             else:
                 if model_path is None:
-                    self._ui_error("模型路徑無效。")
+                    self._emit("error", "模型路徑無效。")
                     return
-                engine = YoloEngine(str(model_path), device=device.strip())
+                engine = YoloEngine(str(model_path), device=self.ent_device.text().strip())
                 engine.load()
-                self._ui_device(engine.device_name)
-                if engine.cuda_available and engine.device_name.startswith("cpu"):
-                    self.log("偵測到 CUDA 可用，但模型仍在 CPU。可嘗試 device=cuda:0。")
-                if input_path.is_dir():
-                    self._run_folder(engine, None, input_path, token)
-                else:
-                    suffix = input_path.suffix.lower()
-                    if suffix in IMG_EXTS:
-                        self._run_image(engine, None, input_path, token)
-                    elif suffix in VID_EXTS:
-                        self._run_video(engine, None, input_path, token)
-                    else:
-                        self._ui_error("不支援的檔案格式。")
-        except Exception as e:
-            self._ui_error(f"執行失敗: {e}")
-        finally:
-            self._ui_done()
+                self._emit("device", engine.device_name)
 
-    def _run_image(
-        self,
-        engine: Optional[YoloEngine],
-        http_client: Optional[YoloHttpClient],
-        path: Path,
-        token: int,
-    ):
-        frame = cv2.imread(str(path))
-        if frame is None:
-            self._ui_error("讀取圖片失敗。")
-            return
-
-        self._process_and_show(engine, http_client, frame, token)
-
-    def _run_video(
-        self,
-        engine: Optional[YoloEngine],
-        http_client: Optional[YoloHttpClient],
-        path: Path,
-        token: int,
-    ):
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            self._ui_error("讀取影片失敗。")
-            return
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        delay = 1.0 / fps if fps > 0 else 0.03
-
-        while not self._stop_event.is_set():
-            ok, frame = cap.read()
-            if not ok:
-                break
-            self._process_and_show(engine, http_client, frame, token)
-            time.sleep(delay)
-
-        cap.release()
-
-    def _run_folder(
-        self,
-        engine: Optional[YoloEngine],
-        http_client: Optional[YoloHttpClient],
-        folder: Path,
-        token: int,
-    ):
-        images, videos = self._collect_folder_items(folder)
-        if not images and not videos:
-            self._ui_error("資料夾內沒有可用的圖片或影片。")
-            return
-        order = self._order_map.get(self.var_order.get(), "images_first")
-        if order == "videos_first":
-            sequence = [("video", p) for p in videos] + [("image", p) for p in images]
-        else:
-            sequence = [("image", p) for p in images] + [("video", p) for p in videos]
-
-        interval = max(0.0, float(self.var_interval.get()))
-        for kind, path in sequence:
-            if self._stop_event.is_set() or token != self._ui_token:
-                return
-            if kind == "image":
-                self._run_image(engine, http_client, path, token)
-                self._sleep_interval(interval, token)
+            if input_path.is_dir():
+                items = self._collect_items(input_path)
             else:
-                self._run_video(engine, http_client, path, token)
-                self._sleep_interval(interval, token)
+                items = [input_path]
 
-    def _collect_folder_items(self, folder: Path):
-        images = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS])
-        videos = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VID_EXTS])
-        return images, videos
+            for item in items:
+                if self._stop_event.is_set() or token != self._ui_token:
+                    stopped = True
+                    break
+                suffix = item.suffix.lower()
+                if suffix in IMG_EXTS:
+                    frame = cv2.imread(str(item))
+                    if frame is None:
+                        self._emit("log", f"讀取失敗: {item.name}")
+                        continue
+                    self._infer_and_emit(engine, http_client, frame, token)
+                    self._sleep_interval(token)
+                elif suffix in VID_EXTS:
+                    cap = cv2.VideoCapture(str(item))
+                    if not cap.isOpened():
+                        self._emit("log", f"讀取失敗: {item.name}")
+                        continue
+                    while not self._stop_event.is_set() and token == self._ui_token:
+                        ok, frame = cap.read()
+                        if not ok:
+                            break
+                        self._infer_and_emit(engine, http_client, frame, token)
+                    cap.release()
+                    self._sleep_interval(token)
+        except Exception as exc:
+            self._emit("error", f"執行失敗: {exc}")
+        finally:
+            self._emit("done", stopped or self._stop_event.is_set())
 
-    def _sleep_interval(self, seconds: float, token: int):
-        if seconds <= 0:
+    def _infer_and_emit(self, engine, http_client, frame_bgr, token: int) -> None:
+        if token != self._ui_token:
             return
-        end_time = time.time() + seconds
-        while time.time() < end_time:
+        if not self.chk_show.isChecked():
+            self._emit("frame", (frame_bgr, "顯示原始影像（未顯示判斷）"))
+            return
+        if http_client is not None:
+            dets = http_client.infer(frame_bgr)
+            annotated = frame_bgr.copy()
+            for d in dets:
+                xyxy = d.get("xyxy", [])
+                if not isinstance(xyxy, list) or len(xyxy) != 4:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in xyxy]
+                name = str(d.get("className", ""))
+                conf = float(d.get("conf", 0.0))
+                label = f"{name} {conf:.2f}"
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(annotated, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            info = "未偵測到物件" if not dets else f"偵測 {len(dets)} 個"
+            self._emit("frame", (annotated, info))
+            return
+        conf = self._conf_value()
+        iou = self._iou_value()
+        if self.chk_ignore_conf.isChecked():
+            conf = 0.01
+        if self.chk_ignore_iou.isChecked():
+            iou = 1.0
+        result, dets = engine.infer(frame_bgr, conf=conf, iou=iou)
+        annotated = result.plot() if result is not None else frame_bgr
+        info = "未偵測到物件" if not dets else f"偵測 {len(dets)} 個"
+        self._emit("frame", (annotated, info))
+
+    def _sleep_interval(self, token: int) -> None:
+        try:
+            interval = max(0.0, float(self.ent_interval.text()))
+        except Exception:
+            interval = 0.0
+        end = time.time() + interval
+        while time.time() < end:
             if self._stop_event.is_set() or token != self._ui_token:
                 return
             time.sleep(0.05)
 
-    def _process_and_show(
-        self,
-        engine: Optional[YoloEngine],
-        http_client: Optional[YoloHttpClient],
-        frame_bgr,
-        token: int,
-    ):
-        if token != self._ui_token:
-            return
-        if self.var_show.get():
-            if http_client is not None:
-                try:
-                    response = http_client.infer(frame_bgr)
-                except HttpInferError as exc:
-                    self._ui_error(f"HTTP 推論失敗: {exc}")
-                    self._stop_event.set()
-                    return
-                annotated = self._draw_http_dets(frame_bgr.copy(), response.detections)
-                info = self._format_http_dets(response.detections)
-                self._ui_update(annotated, info, token)
-            else:
-                conf = float(self.var_conf.get())
-                iou = float(self.var_iou.get())
-                if self.var_ignore_conf.get():
-                    conf = 0.01
-                if self.var_ignore_iou.get():
-                    iou = 1.0
-                result, dets = engine.infer(frame_bgr, conf=conf, iou=iou)
-                if result is not None:
-                    annotated = result.plot()
-                else:
-                    annotated = frame_bgr
-                info = self._format_dets(dets)
-                self._ui_update(annotated, info, token)
-        else:
-            self._ui_update(frame_bgr, "顯示原始影像（未顯示判斷）", token)
+    def _collect_items(self, folder: Path) -> list[Path]:
+        images = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS])
+        videos = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VID_EXTS])
+        if self._order_map.get(self.cmb_order.currentText(), "images_first") == "videos_first":
+            return videos + images
+        return images + videos
 
-    def _format_dets(self, dets) -> str:
-        if not dets:
-            return "未偵測到物件"
-        top = dets[:5]
-        summary = ", ".join([f"{d.class_name} {d.conf:.2f}" for d in top])
-        return f"偵測 {len(dets)} 個: {summary}"
-
-    def _format_http_dets(self, dets: List[HttpDetection]) -> str:
-        if not dets:
-            return "未偵測到物件"
-        top = dets[:5]
-        summary = ", ".join([f"{d.class_name} {d.conf:.2f}" for d in top])
-        return f"偵測 {len(dets)} 個: {summary}"
-
-    def _draw_http_dets(self, frame_bgr, dets: List[HttpDetection]):
-        for d in dets:
-            x1, y1, x2, y2 = d.xyxy
-            label = f"{d.class_name} {d.conf:.2f}"
-            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                frame_bgr,
-                label,
-                (x1, max(0, y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                2,
-                lineType=cv2.LINE_AA,
-            )
-        return frame_bgr
-
-    def _ui_update(self, frame_bgr, info: str, token: Optional[int] = None):
-        self._last_frame_bgr = frame_bgr
-        def _update():
-            if token is not None and token != self._ui_token:
-                return
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(rgb)
-            img = self._fit_image(img, (self.canvas.winfo_width(), self.canvas.winfo_height()))
-            self._last_image = ImageTk.PhotoImage(img)
-            w = self.canvas.winfo_width()
-            h = self.canvas.winfo_height()
-            if w <= 0 or h <= 0:
-                w, h = img.width, img.height
-            if self._canvas_img_id is None:
-                self._canvas_img_id = self.canvas.create_image(w // 2, h // 2, image=self._last_image, anchor="center")
-            else:
-                self.canvas.itemconfigure(self._canvas_img_id, image=self._last_image)
-                self.canvas.coords(self._canvas_img_id, w // 2, h // 2)
-            self.lbl_status.config(text=info)
-
-        self.after(0, _update)
-
-    def _redraw_last_frame(self):
-        if self._last_frame_bgr is None:
-            return
-        rgb = cv2.cvtColor(self._last_frame_bgr, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        img = self._fit_image(img, (self.canvas.winfo_width(), self.canvas.winfo_height()))
-        self._last_image = ImageTk.PhotoImage(img)
-        w = self.canvas.winfo_width()
-        h = self.canvas.winfo_height()
-        if w <= 0 or h <= 0:
-            w, h = img.width, img.height
-        if self._canvas_img_id is None:
-            self._canvas_img_id = self.canvas.create_image(w // 2, h // 2, image=self._last_image, anchor="center")
-        else:
-            self.canvas.itemconfigure(self._canvas_img_id, image=self._last_image)
-            self.canvas.coords(self._canvas_img_id, w // 2, h // 2)
-
-    def _ui_device(self, device_name: str):
-        self.after(0, lambda: self.lbl_device.config(text=f"device: {device_name}"))
-
-    def _ui_error(self, msg: str):
-        self.after(0, lambda: messagebox.showerror("錯誤", msg))
-        self.after(0, lambda: self.log(msg))
-
-    def _ui_done(self):
-        def _done():
-            self.btn_start.config(state="normal")
-            self.btn_stop.config(state="disabled")
-            if not self._stop_event.is_set():
-                self.lbl_status.config(text="完成")
-            else:
-                self.lbl_status.config(text="已停止")
-
-        self.after(0, _done)
-
-    @staticmethod
-    def _fit_image(img: Image.Image, size: Tuple[int, int]) -> Image.Image:
-        w, h = size
-        if w <= 0 or h <= 0:
-            return img
-        img_ratio = img.width / img.height
-        box_ratio = w / h
-        if img_ratio > box_ratio:
-            new_w = w
-            new_h = int(w / img_ratio)
-        else:
-            new_h = h
-            new_w = int(h * img_ratio)
-        return img.resize((max(1, new_w), max(1, new_h)), Image.BILINEAR)
-
-    def _stop_if_running(self):
+    def start(self) -> None:
         if self._worker and self._worker.is_alive():
-            self._ui_token += 1
-            self._stop_event.set()
-            self.lbl_status.config(text="已停止（重新選擇）")
-
-    def _preview_input(self, path: Path):
-        try:
-            if path.is_dir():
-                images, videos = self._collect_folder_items(path)
-                order = self._order_map.get(self.var_order.get(), "images_first")
-                if order == "videos_first":
-                    pick = videos[0] if videos else (images[0] if images else None)
-                else:
-                    pick = images[0] if images else (videos[0] if videos else None)
-                if pick is None:
-                    return
-                self._preview_input(pick)
+            QMessageBox.warning(self, "執行中", "目前正在執行。")
+            return
+        use_http = self.chk_use_http.isChecked()
+        model_path: Optional[Path] = None
+        if not use_http:
+            model_path = Path(self.ent_model.text().strip())
+            if not model_path.exists():
+                QMessageBox.critical(self, "錯誤", "模型檔不存在。")
                 return
-            suffix = path.suffix.lower()
-            if suffix in IMG_EXTS:
-                frame = cv2.imread(str(path))
-                if frame is None:
-                    return
-                self._ui_update(frame, "預覽圖片")
-                return
-            if suffix in VID_EXTS:
-                cap = cv2.VideoCapture(str(path))
-                if not cap.isOpened():
-                    return
-                ok, frame = cap.read()
-                cap.release()
-                if ok and frame is not None:
-                    self._ui_update(frame, "預覽影片第一幀")
-        except Exception:
+        http_url = self._normalize_http_url(self.ent_http_url.text()) if use_http else ""
+        if use_http and not http_url:
+            QMessageBox.critical(self, "錯誤", "HTTP URL 無效。")
+            return
+        input_path = Path(self.ent_input.text().strip())
+        if not input_path.exists():
+            QMessageBox.critical(self, "錯誤", "輸入路徑不存在。")
+            return
+        if input_path.is_dir() and not self._collect_items(input_path):
+            QMessageBox.critical(self, "錯誤", "資料夾內找不到可用的圖片或影片。")
             return
 
-    def _on_model_entry(self):
-        raw = (self.var_model.get() or "").strip()
-        if raw:
-            p = Path(raw)
-            if p.exists():
-                self._last_model_dir = p if p.is_dir() else p.parent
-            else:
-                self.log("模型路徑不存在。")
+        self._stop_event.clear()
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.lbl_status.setText("執行中...")
+        self._ui_token += 1
+        token = self._ui_token
+        self._worker = threading.Thread(
+            target=self._run,
+            args=(model_path, input_path, token, use_http, http_url),
+            daemon=True,
+        )
+        self._worker.start()
         self._save_config()
 
-    def _on_input_entry(self):
-        raw = (self.var_input.get() or "").strip()
+    def _on_input_changed(self) -> None:
+        raw = self.ent_input.text().strip()
         if raw:
             p = Path(raw)
             if p.exists():
                 self._last_input_dir = p if p.is_dir() else p.parent
                 self._preview_input(p)
             else:
-                self.log("圖片或影片路徑不存在。")
+                self._log("圖片或影片路徑不存在。")
         self._save_config()
 
-    def _on_toggle_show(self):
-        self._save_config()
-
-    def _on_toggle_http(self):
-        self._save_config()
-
-    def _on_http_url_entry(self):
-        raw = self.var_http_url.get()
-        normalized = self._normalize_http_url(raw)
-        if normalized:
-            self.var_http_url.set(normalized)
-        self._save_config()
-
-    def _on_interval_entry(self):
+    def _preview_input(self, path: Path) -> None:
         try:
-            v = float(self.var_interval.get())
-        except Exception:
-            v = 1.0
-        if v < 0:
-            v = 0.0
-        self.var_interval.set(v)
-        self._save_config()
-
-    def _apply_ignore_state(self):
-        if self.var_ignore_conf.get():
-            if self._conf_prev is None:
-                self._conf_prev = float(self.var_conf.get())
-            self._set_conf_value(0.01)
-            self.ent_conf.configure(state="disabled")
-            self.scale_conf.configure(state="disabled")
-        else:
-            self.ent_conf.configure(state="normal")
-            self.scale_conf.configure(state="normal")
-
-        if self.var_ignore_iou.get():
-            if self._iou_prev is None:
-                self._iou_prev = float(self.var_iou.get())
-            self._set_iou_value(1.0)
-            self.ent_iou.configure(state="disabled")
-            self.scale_iou.configure(state="disabled")
-        else:
-            self.ent_iou.configure(state="normal")
-            self.scale_iou.configure(state="normal")
-
-    def _on_ignore_conf(self):
-        if self.var_ignore_conf.get():
-            self._conf_prev = float(self.var_conf.get())
-            self._set_conf_value(0.01)
-            self.ent_conf.configure(state="disabled")
-            self.scale_conf.configure(state="disabled")
-        else:
-            self.ent_conf.configure(state="normal")
-            self.scale_conf.configure(state="normal")
-            if self._conf_prev is not None:
-                self._set_conf_value(self._conf_prev)
-                self._conf_prev = None
-        self._save_config()
-
-    def _on_ignore_iou(self):
-        if self.var_ignore_iou.get():
-            self._iou_prev = float(self.var_iou.get())
-            self._set_iou_value(1.0)
-            self.ent_iou.configure(state="disabled")
-            self.scale_iou.configure(state="disabled")
-        else:
-            self.ent_iou.configure(state="normal")
-            self.scale_iou.configure(state="normal")
-            if self._iou_prev is not None:
-                self._set_iou_value(self._iou_prev)
-                self._iou_prev = None
-        self._save_config()
-
-    def _set_conf_value(self, v: float, allow_zero: bool = False):
-        min_v = 0.0 if allow_zero else 0.01
-        v = max(min_v, min(1.0, float(v)))
-        self.var_conf.set(v)
-        self.var_conf_str.set(f"{v:.2f}")
-        if not self._syncing_scale:
-            if v <= 0.0:
-                self._syncing_scale = True
-                try:
-                    self.scale_conf.set(0.01)
-                finally:
-                    self._syncing_scale = False
+            if path.is_dir():
+                items = self._collect_items(path)
+                if not items:
+                    return
+                self._preview_input(items[0])
                 return
-            self.scale_conf.set(v)
+            if path.suffix.lower() in IMG_EXTS:
+                frame = cv2.imread(str(path))
+                if frame is None:
+                    return
+                self._last_frame = frame
+                self._render_frame(frame)
+                self.lbl_status.setText("預覽圖片")
+                return
+            if path.suffix.lower() in VID_EXTS:
+                cap = cv2.VideoCapture(str(path))
+                if not cap.isOpened():
+                    return
+                ok, frame = cap.read()
+                cap.release()
+                if ok:
+                    self._last_frame = frame
+                    self._render_frame(frame)
+                    self.lbl_status.setText("預覽影片第一幀")
+        except Exception:
+            return
 
-    def _set_iou_value(self, v: float):
-        v = max(0.0, min(1.0, float(v)))
-        self.var_iou.set(v)
-        self.var_iou_str.set(f"{v:.2f}")
-        if not self._syncing_scale:
-            self.scale_iou.set(v)
+    def _stop_if_running(self) -> None:
+        if self._worker and self._worker.is_alive():
+            self._ui_token += 1
+            self._stop_event.set()
+            self.lbl_status.setText("已停止（重新選擇）")
 
-    def _load_config(self):
+    def _save_config(self) -> None:
+        if self._loading_config:
+            return
+        try:
+            data = {
+                "model_path": self.ent_model.text(),
+                "input_path": self.ent_input.text(),
+                "conf": self._conf_value(),
+                "iou": self._iou_value(),
+                "device": self.ent_device.text(),
+                "show": self.chk_show.isChecked(),
+                "ignore_conf": self.chk_ignore_conf.isChecked(),
+                "ignore_iou": self.chk_ignore_iou.isChecked(),
+                "interval_sec": self.ent_interval.text(),
+                "order": self._order_map.get(self.cmb_order.currentText(), "images_first"),
+                "use_http": self.chk_use_http.isChecked(),
+                "http_url": self.ent_http_url.text(),
+            }
+            self._config_path.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception:
+            return
+
+    def _load_config(self) -> None:
         if not self._config_path.exists():
             return
         try:
             self._loading_config = True
             data = json.loads(self._config_path.read_text(encoding="utf-8"))
-            self.var_model.set(data.get("model_path", self.var_model.get()))
-            self.var_input.set(data.get("input_path", self.var_input.get()))
-            conf = float(data.get("conf", self.var_conf.get()))
-            iou = float(data.get("iou", self.var_iou.get()))
-            conf = max(0.0, min(1.0, conf))
-            iou = max(0.0, min(1.0, iou))
-            self.var_conf.set(conf)
-            self.var_iou.set(iou)
-            self.var_conf_str.set(f"{conf:.2f}")
-            self.var_iou_str.set(f"{iou:.2f}")
-            self.var_device.set(data.get("device", self.var_device.get()))
-            self.var_show.set(bool(data.get("show", True)))
-            self.var_ignore_conf.set(bool(data.get("ignore_conf", False)))
-            self.var_ignore_iou.set(bool(data.get("ignore_iou", False)))
-            interval = float(data.get("interval_sec", self.var_interval.get()))
-            if interval < 0:
-                interval = 0.0
-            self.var_interval.set(interval)
-            order_raw = data.get("order", self._order_map.get(self.var_order.get(), "images_first"))
-            self.var_order.set(self._order_map_rev.get(order_raw, "圖片優先"))
-            self.var_use_http.set(bool(data.get("use_http", self.var_use_http.get())))
-            self.var_http_url.set(data.get("http_url", self.var_http_url.get()))
-
-            if self.var_ignore_conf.get():
-                self._conf_prev = conf
-            if self.var_ignore_iou.get():
-                self._iou_prev = iou
-
-            if self.var_model.get().strip():
-                p = Path(self.var_model.get().strip())
-                if p.exists():
-                    self._last_model_dir = p if p.is_dir() else p.parent
-            if self.var_input.get().strip():
-                p = Path(self.var_input.get().strip())
-                if p.exists():
-                    self._last_input_dir = p if p.is_dir() else p.parent
+            self.ent_model.setText(data.get("model_path", ""))
+            self.ent_input.setText(data.get("input_path", ""))
+            conf = max(0.01, min(1.0, float(data.get("conf", 0.70))))
+            iou = max(0.0, min(1.0, float(data.get("iou", 0.45))))
+            self.ent_conf.setText(f"{conf:.2f}")
+            self.ent_iou.setText(f"{iou:.2f}")
+            self.sld_conf.setValue(int(round(conf * 100)))
+            self.sld_iou.setValue(int(round(iou * 100)))
+            self.ent_device.setText(data.get("device", ""))
+            self.chk_show.setChecked(bool(data.get("show", True)))
+            self.chk_ignore_conf.setChecked(bool(data.get("ignore_conf", False)))
+            self.chk_ignore_iou.setChecked(bool(data.get("ignore_iou", False)))
+            self.ent_interval.setText(str(data.get("interval_sec", "1.0")))
+            self.cmb_order.setCurrentText(self._order_map_rev.get(data.get("order", "images_first"), "圖片優先"))
+            self.chk_use_http.setChecked(bool(data.get("use_http", False)))
+            self.ent_http_url.setText(data.get("http_url", DEFAULT_HTTP_URL))
         except Exception:
             return
         finally:
             self._loading_config = False
 
-    def _save_config(self):
-        if self._loading_config:
-            return
+    def _conf_value(self) -> float:
         try:
-            conf_val = float(self.var_conf.get())
-            iou_val = float(self.var_iou.get())
-            if self.var_ignore_conf.get() and self._conf_prev is not None:
-                conf_val = float(self._conf_prev)
-            if self.var_ignore_iou.get() and self._iou_prev is not None:
-                iou_val = float(self._iou_prev)
-            data = {
-                "model_path": self.var_model.get(),
-                "input_path": self.var_input.get(),
-                "conf": conf_val,
-                "iou": iou_val,
-                "device": self.var_device.get(),
-                "show": bool(self.var_show.get()),
-                "ignore_conf": bool(self.var_ignore_conf.get()),
-                "ignore_iou": bool(self.var_ignore_iou.get()),
-                "interval_sec": float(self.var_interval.get()),
-                "order": self._order_map.get(self.var_order.get(), "images_first"),
-                "use_http": bool(self.var_use_http.get()),
-                "http_url": self.var_http_url.get(),
-            }
-            self._config_path.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
+            v = float(self.ent_conf.text())
         except Exception:
-            return
+            v = 0.70
+        return max(0.01, min(1.0, v))
+
+    def _iou_value(self) -> float:
+        try:
+            v = float(self.ent_iou.text())
+        except Exception:
+            v = 0.45
+        return max(0.0, min(1.0, v))
 
     @staticmethod
     def _resolve_initial_dir(path_value: str, last_dir: Optional[Path]) -> str:
@@ -955,103 +614,21 @@ class App(tk.Tk):
             text = f"{text}/detect"
         return text
 
-    def _set_log_height(self, paned: tk.PanedWindow, log_frame: ttk.LabelFrame, lines: int):
-        try:
-            self.update_idletasks()
-            line_px = int(self.log_box["font"].split()[-1]) + 6
-        except Exception:
-            line_px = 18
-        log_h = max(90, lines * line_px + 18)
-        total = paned.winfo_height()
-        if total <= 0:
-            return
-        sash = max(50, total - log_h)
-        try:
-            paned.sash_place(0, 0, sash)
-        except Exception:
-            pass
-
-    def _sync_from_scale(self, which: str, value: str):
-        if which == "conf" and self.var_ignore_conf.get():
-            return
-        if which == "iou" and self.var_ignore_iou.get():
-            return
-        if self._syncing_scale:
-            return
-        try:
-            v = float(value)
-        except Exception:
-            return
-        if which == "conf":
-            v = max(0.01, min(1.0, v))
-        else:
-            v = max(0.0, min(1.0, v))
-        self._syncing_scale = True
-        try:
-            if which == "conf":
-                self.var_conf.set(v)
-                self.var_conf_str.set(f"{v:.2f}")
-            else:
-                self.var_iou.set(v)
-                self.var_iou_str.set(f"{v:.2f}")
-        finally:
-            self._syncing_scale = False
-        self._save_config()
-
-    def _sync_from_value(self, which: str, value: float):
-        if which == "conf":
-            raw = float(value)
-            if raw <= 0.0:
-                self.var_conf_str.set("0.00")
-                self._syncing_scale = True
-                try:
-                    self.scale_conf.set(0.01)
-                finally:
-                    self._syncing_scale = False
-                return
-            v = max(0.01, min(1.0, raw))
-            self.var_conf_str.set(f"{v:.2f}")
-            self.scale_conf.set(v)
-        else:
-            v = max(0.0, min(1.0, float(value)))
-            self.var_iou_str.set(f"{v:.2f}")
-            self.scale_iou.set(v)
-
-    def _validate_entry(self, which: str):
-        if which == "conf" and self.var_ignore_conf.get():
-            return
-        if which == "iou" and self.var_ignore_iou.get():
-            return
-        raw = self.var_conf_str.get() if which == "conf" else self.var_iou_str.get()
-        try:
-            v = float(raw)
-        except Exception:
-            v = 0.70 if which == "conf" else 0.45
-        if v > 1:
-            try:
-                digits = len(str(int(v)))
-                v = v / (10 ** digits)
-            except Exception:
-                v = 1.0
-        v = max(0.0, min(1.0, v))
-        if which == "conf":
-            if v == 0.0:
-                self._set_conf_value(0.0, allow_zero=True)
-            else:
-                self._set_conf_value(v)
-        else:
-            self._set_iou_value(v)
-        self._save_config()
-
-    def _try_preview_on_start(self):
-        raw = (self.var_input.get() or "").strip()
+    def _try_preview_on_start(self) -> None:
+        raw = self.ent_input.text().strip()
         if not raw:
             return
         p = Path(raw)
-        if p.exists() and p.is_file():
+        if p.exists():
             self._preview_input(p)
 
 
+def main() -> None:
+    app = QApplication([])
+    win = App()
+    win.show()
+    app.exec()
+
+
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    main()

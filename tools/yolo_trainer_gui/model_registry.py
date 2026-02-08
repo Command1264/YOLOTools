@@ -1,11 +1,11 @@
 # model_registry.py
 from __future__ import annotations
 import re
-import json
 from pathlib import Path
 from typing import List, Dict, Optional
 
 import requests
+from json_models import WeightsCacheModel
 
 DEFAULT_FALLBACK = [
     # Legacy
@@ -78,15 +78,15 @@ def fetch_ultralytics_weights_online(timeout_sec: int = 6) -> List[str]:
 def load_weights(cache_path: Path) -> List[str]:
     if cache_path.exists():
         try:
-            data = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(data, list) and data:
-                return _merge_weights(data, DEFAULT_FALLBACK)
+            data = WeightsCacheModel.from_file(cache_path)
+            if data.weights:
+                return _merge_weights(data.weights, DEFAULT_FALLBACK)
         except Exception:
             pass
     return DEFAULT_FALLBACK[:]
 
 def save_weights(cache_path: Path, weights: List[str]) -> None:
-    cache_path.write_text(json.dumps(weights, ensure_ascii=False, indent=2), encoding="utf-8")
+    WeightsCacheModel(weights=list(weights)).save(cache_path)
 
 def get_weights(cache_path: Path, try_online: bool = True) -> Dict[str, List[str]]:
     """

@@ -1,32 +1,49 @@
+from __future__ import annotations
+
 import os
 import threading
 import time
-import platform
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, colorchooser
+from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QColorDialog,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QComboBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 
-# =========================
-# 取得程式所在資料夾（沒 __file__ 時退回 cwd）
-# =========================
+ANCHORS = ["左上", "上中", "右上", "左中", "置中", "右中", "左下", "下中", "右下"]
+
+
 def get_app_dir() -> str:
+    """Resolve application directory safely."""
     try:
         return os.path.dirname(os.path.abspath(__file__))
     except Exception:
         return os.getcwd()
 
 
-# =========================
-# 對話框 initialdir 規則：
-# - 如果目前路徑為空：用程式所在資料夾
-# - 如果有路徑：優先開啟該路徑（檔案則開其所在資料夾）
-# - 路徑無效：回到程式所在資料夾
-# =========================
 def initial_dir_from(path_str: str) -> str:
+    """Resolve best initial directory for file dialogs."""
     app_dir = get_app_dir()
     p = (path_str or "").strip()
     if not p:
@@ -38,156 +55,17 @@ def initial_dir_from(path_str: str) -> str:
     return app_dir
 
 
-# =========================
-# Windows：強制把「原生對話框」搬到主視窗中心（best-effort）
-# =========================
-def _win_center_dialog_over_root_async(root: tk.Tk, timeout_sec: float = 2.0):
-    if platform.system().lower() != "windows":
-        return
-
-    try:
-        import ctypes
-        from ctypes import wintypes
-    except Exception:
-        return
-
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    # typedef BOOL (CALLBACK* WNDENUMPROC)(HWND, LPARAM);
-    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    EnumWindows = user32.EnumWindows
-    EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
-    EnumWindows.restype = wintypes.BOOL
-
-    GetClassNameW = user32.GetClassNameW
-    GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    GetClassNameW.restype = ctypes.c_int
-
-    GetWindowTextW = user32.GetWindowTextW
-    GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    GetWindowTextW.restype = ctypes.c_int
-
-    IsWindowVisible = user32.IsWindowVisible
-    IsWindowVisible.argtypes = [wintypes.HWND]
-    IsWindowVisible.restype = wintypes.BOOL
-
-    GetWindowThreadProcessId = user32.GetWindowThreadProcessId
-    GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    GetWindowThreadProcessId.restype = wintypes.DWORD
-
-    GetWindowRect = user32.GetWindowRect
-    GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-    GetWindowRect.restype = wintypes.BOOL
-
-    MoveWindow = user32.MoveWindow
-    MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
-    MoveWindow.restype = wintypes.BOOL
-
-    GetCurrentProcessId = kernel32.GetCurrentProcessId
-    GetCurrentProcessId.argtypes = []
-    GetCurrentProcessId.restype = wintypes.DWORD
-
-    pid = GetCurrentProcessId()
-
-    # 常見標題（不同語系/版本會不一樣）
-    possible_titles = {
-        "Color", "Choose Color", "Select Color",
-        "色彩", "選擇色彩", "選擇顏色", "選色", "顏色"
-    }
-
-    def worker():
-        end = time.time() + timeout_sec
-
-        try:
-            root.update_idletasks()
-            rx = root.winfo_rootx()
-            ry = root.winfo_rooty()
-            rw = root.winfo_width()
-            rh = root.winfo_height()
-            rcx = rx + rw // 2
-            rcy = ry + rh // 2
-        except Exception:
-            rcx, rcy = 600, 400
-
-        found_hwnd = None
-
-        @WNDENUMPROC
-        def enum_proc(hwnd, lparam):
-            nonlocal found_hwnd
-            if found_hwnd:
-                return False
-
-            if not IsWindowVisible(hwnd):
-                return True
-
-            wpid = wintypes.DWORD()
-            GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
-            if wpid.value != pid:
-                return True
-
-            cls = ctypes.create_unicode_buffer(256)
-            GetClassNameW(hwnd, cls, 256)
-            if cls.value != "#32770":  # 系統對話框 class
-                return True
-
-            title = ctypes.create_unicode_buffer(512)
-            GetWindowTextW(hwnd, title, 512)
-            t = (title.value or "").strip()
-
-            # 有些版本標題可能空的；空標題也放行
-            if t and (t not in possible_titles):
-                return True
-
-            found_hwnd = hwnd
-            return False
-
-        while time.time() < end and not found_hwnd:
-            try:
-                EnumWindows(enum_proc, 0)
-            except Exception:
-                return
-            if not found_hwnd:
-                time.sleep(0.02)
-
-        if not found_hwnd:
-            return
-
-        rect = wintypes.RECT()
-        if not GetWindowRect(found_hwnd, ctypes.byref(rect)):
-            return
-        w = rect.right - rect.left
-        h = rect.bottom - rect.top
-        if w <= 0 or h <= 0:
-            return
-
-        x = int(rcx - w / 2)
-        y = int(rcy - h / 2)
-        x = max(0, x)
-        y = max(0, y)
-
-        try:
-            MoveWindow(found_hwnd, x, y, w, h, True)
-        except Exception:
-            return
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-# =========================
-# OpenCV 讀寫（支援中文路徑）
-# =========================
 def cv_imread_unicode(path: str):
+    """Read image from unicode path with OpenCV."""
     try:
         data = np.fromfile(path, dtype=np.uint8)
-        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        return img
+        return cv2.imdecode(data, cv2.IMREAD_COLOR)
     except Exception:
         return None
 
 
-def cv_imwrite_unicode(path: str, img_bgr, *, ext: str, params=None):
+def cv_imwrite_unicode(path: str, img_bgr, ext: str, params=None) -> bool:
+    """Write image to unicode path with OpenCV."""
     if not ext.startswith("."):
         ext = "." + ext
     ok, buf = cv2.imencode(ext, img_bgr, params if params else [])
@@ -200,8 +78,8 @@ def cv_imwrite_unicode(path: str, img_bgr, *, ext: str, params=None):
         return False
 
 
-def is_image_file(fn: str):
-    ext = os.path.splitext(fn)[1].lower()
+def is_image_file(filename: str) -> bool:
+    ext = os.path.splitext(filename)[1].lower()
     return ext in [".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"]
 
 
@@ -214,15 +92,15 @@ def hex_to_bgr(hex_str: str):
     r = int(s[0:2], 16)
     g = int(s[2:4], 16)
     b = int(s[4:6], 16)
-    return (b, g, r)
+    return b, g, r
 
 
-def bgr_to_hex(bgr):
+def bgr_to_hex(bgr) -> str:
     b, g, r = bgr
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
-def ensure_unique_path(path: str):
+def ensure_unique_path(path: str) -> str:
     if not os.path.exists(path):
         return path
     base, ext = os.path.splitext(path)
@@ -234,14 +112,7 @@ def ensure_unique_path(path: str):
         i += 1
 
 
-ANCHORS = [
-    "左上", "上中", "右上",
-    "左中", "置中", "右中",
-    "左下", "下中", "右下",
-]
-
-
-def compute_offset(canvas_w, canvas_h, img_w, img_h, anchor: str):
+def compute_offset(canvas_w: int, canvas_h: int, img_w: int, img_h: int, anchor: str):
     if anchor in ("左上", "左中", "左下"):
         x = 0
     elif anchor in ("上中", "置中", "下中"):
@@ -255,14 +126,12 @@ def compute_offset(canvas_w, canvas_h, img_w, img_h, anchor: str):
         y = (canvas_h - img_h) // 2
     else:
         y = canvas_h - img_h
-
     return max(0, x), max(0, y)
 
 
 def resize_letterbox(img_bgr, target_w: int, target_h: int, fill_bgr=(0, 0, 0), anchor="置中"):
     if img_bgr is None:
         return None
-
     h, w = img_bgr.shape[:2]
     if w <= 0 or h <= 0 or target_w <= 0 or target_h <= 0:
         return None
@@ -270,273 +139,252 @@ def resize_letterbox(img_bgr, target_w: int, target_h: int, fill_bgr=(0, 0, 0), 
     scale = min(target_w / w, target_h / h)
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
-
     resized = cv2.resize(
-        img_bgr, (new_w, new_h),
-        interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+        img_bgr,
+        (new_w, new_h),
+        interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
     )
-
     canvas = np.full((target_h, target_w, 3), fill_bgr, dtype=np.uint8)
     x, y = compute_offset(target_w, target_h, new_w, new_h, anchor)
     canvas[y:y + new_h, x:x + new_w] = resized
     return canvas
 
 
-class ImageResizerGUI:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Image Resizer (OpenCV) - 等比例縮放 + 補色 + 批次")
-        self.root.geometry("1300x800")
-        self.root.minsize(1200, 800)
-        root.state('zoomed')   # Windows only
+class ImageResizerWindow(QMainWindow):
+    """Image resizer GUI using PySide6."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Image Resizer (OpenCV) - 等比例縮放 + 補色 + 批次")
+        self.resize(1300, 800)
+        self.setMinimumSize(1120, 700)
 
         self.fill_bgr = (0, 0, 0)
-        self.worker_thread = None
+        self.worker_thread: Optional[threading.Thread] = None
         self.stop_flag = False
 
-        self.var_input = tk.StringVar()
-        self.var_output = tk.StringVar()
-        self.var_w = tk.StringVar(value="640")
-        self.var_h = tk.StringVar(value="640")
-        self.var_suffix = tk.StringVar(value="")
-
-        self.var_count = tk.StringVar(value="0 / 0")
-        self.var_current = tk.StringVar(value="（尚未開始）")
-
-        self.var_anchor = tk.StringVar(value="置中")
-        self.var_outfmt = tk.StringVar(value="保持原格式")
-        self.var_overwrite = tk.BooleanVar(value=False)
-
-        self.var_jpg_quality = tk.IntVar(value=95)
-        self.var_webp_quality = tk.IntVar(value=90)
-        self.var_png_compress = tk.IntVar(value=3)
-
-        self.var_color_hex = tk.StringVar(value=bgr_to_hex(self.fill_bgr))
-
-        self._preview_job = None
-        self._photo_in = None
-        self._photo_out = None
+        self._state_lock = threading.Lock()
+        self._progress_done = 0
+        self._progress_total = 0
+        self._current_name = "（尚未開始）"
+        self._finish_dialog: Optional[tuple[str, str, str]] = None
+        self._preview_source = None
 
         self._build_ui()
         self._bind_events()
 
-        self.root.after(100, self.update_preview)
+        self._ui_timer = QTimer(self)
+        self._ui_timer.setInterval(80)
+        self._ui_timer.timeout.connect(self._flush_worker_updates)
+        self._ui_timer.start()
 
-    def _build_ui(self):
-        outer = ttk.Frame(self.root, padding=10)
-        outer.pack(fill="both", expand=True)
+        QTimer.singleShot(120, self.update_preview)
 
-        left = ttk.Frame(outer)
-        left.pack(side="left", fill="y", padx=(0, 12))
+    def _build_ui(self) -> None:
+        root = QWidget(self)
+        self.setCentralWidget(root)
+        outer = QHBoxLayout(root)
 
-        lf_in = ttk.LabelFrame(left, text="輸入（圖片或資料夾）", padding=10)
-        lf_in.pack(fill="x", pady=(0, 10))
-        row = ttk.Frame(lf_in)
-        row.pack(fill="x")
-        ttk.Entry(row, textvariable=self.var_input).pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="選圖片", command=self.pick_input_file).pack(side="left", padx=5)
-        ttk.Button(row, text="選資料夾", command=self.pick_input_dir).pack(side="left")
+        left_wrap = QWidget(root)
+        left = QVBoxLayout(left_wrap)
+        outer.addWidget(left_wrap, 0)
 
-        lf_out = ttk.LabelFrame(left, text="輸出資料夾", padding=10)
-        lf_out.pack(fill="x", pady=(0, 10))
-        row = ttk.Frame(lf_out)
-        row.pack(fill="x")
-        ttk.Entry(row, textvariable=self.var_output).pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="瀏覽", command=self.pick_output_dir).pack(side="left", padx=5)
+        in_box = QGroupBox("輸入（圖片或資料夾）", left_wrap)
+        in_form = QFormLayout(in_box)
+        row_in = QWidget(in_box)
+        row_in_l = QHBoxLayout(row_in)
+        row_in_l.setContentsMargins(0, 0, 0, 0)
+        self.ent_input = QLineEdit(row_in)
+        btn_pick_file = QPushButton("選圖片", row_in)
+        btn_pick_dir = QPushButton("選資料夾", row_in)
+        btn_pick_file.clicked.connect(self.pick_input_file)
+        btn_pick_dir.clicked.connect(self.pick_input_dir)
+        row_in_l.addWidget(self.ent_input, 1)
+        row_in_l.addWidget(btn_pick_file)
+        row_in_l.addWidget(btn_pick_dir)
+        in_form.addRow(row_in)
+        left.addWidget(in_box)
 
-        lf_res = ttk.LabelFrame(left, text="目標解析度（寬 x 高）", padding=10)
-        lf_res.pack(fill="x", pady=(0, 10))
-        row = ttk.Frame(lf_res)
-        row.pack(fill="x")
-        ttk.Label(row, text="寬").pack(side="left")
-        ttk.Entry(row, textvariable=self.var_w, width=8).pack(side="left", padx=(5, 12))
-        ttk.Label(row, text="高").pack(side="left")
-        ttk.Entry(row, textvariable=self.var_h, width=8).pack(side="left")
+        out_box = QGroupBox("輸出資料夾", left_wrap)
+        out_form = QFormLayout(out_box)
+        row_out = QWidget(out_box)
+        row_out_l = QHBoxLayout(row_out)
+        row_out_l.setContentsMargins(0, 0, 0, 0)
+        self.ent_output = QLineEdit(row_out)
+        btn_pick_out = QPushButton("瀏覽", row_out)
+        btn_pick_out.clicked.connect(self.pick_output_dir)
+        row_out_l.addWidget(self.ent_output, 1)
+        row_out_l.addWidget(btn_pick_out)
+        out_form.addRow(row_out)
+        left.addWidget(out_box)
 
-        lf_anchor = ttk.LabelFrame(left, text="定位（貼齊方式）", padding=10)
-        lf_anchor.pack(fill="x", pady=(0, 10))
-        ttk.Label(lf_anchor, text="縮放後圖片貼到畫布的：").pack(anchor="w")
-        ttk.Combobox(lf_anchor, textvariable=self.var_anchor, values=ANCHORS, state="readonly") \
-            .pack(fill="x", pady=(6, 0))
+        res_box = QGroupBox("目標解析度（寬 x 高）", left_wrap)
+        res_form = QFormLayout(res_box)
+        row_res = QWidget(res_box)
+        row_res_l = QHBoxLayout(row_res)
+        row_res_l.setContentsMargins(0, 0, 0, 0)
+        self.ent_w = QLineEdit("640", row_res)
+        self.ent_h = QLineEdit("640", row_res)
+        self.ent_w.setMaximumWidth(100)
+        self.ent_h.setMaximumWidth(100)
+        row_res_l.addWidget(QLabel("寬", row_res))
+        row_res_l.addWidget(self.ent_w)
+        row_res_l.addWidget(QLabel("高", row_res))
+        row_res_l.addWidget(self.ent_h)
+        row_res_l.addStretch(1)
+        res_form.addRow(row_res)
+        left.addWidget(res_box)
 
-        lf_color = ttk.LabelFrame(left, text="填滿顏色（剩餘空白）", padding=10)
-        lf_color.pack(fill="x", pady=(0, 10))
-        row = ttk.Frame(lf_color)
-        row.pack(fill="x")
-        self.color_swatch = tk.Canvas(row, width=34, height=18, bd=1, relief="solid")
-        self.color_swatch.pack(side="left")
-        ttk.Entry(row, textvariable=self.var_color_hex, width=10).pack(side="left", padx=8)
-        ttk.Button(row, text="調色盤…", command=self.choose_color_builtin).pack(side="left")
-        ttk.Label(lf_color, text="色碼格式：#RRGGBB").pack(anchor="w", pady=(6, 0))
+        anchor_box = QGroupBox("定位（貼齊方式）", left_wrap)
+        anchor_form = QFormLayout(anchor_box)
+        self.cmb_anchor = QComboBox(anchor_box)
+        self.cmb_anchor.addItems(ANCHORS)
+        self.cmb_anchor.setCurrentText("置中")
+        anchor_form.addRow("縮放後圖片貼到畫布的：", self.cmb_anchor)
+        left.addWidget(anchor_box)
+
+        color_box = QGroupBox("填滿顏色（剩餘空白）", left_wrap)
+        color_form = QFormLayout(color_box)
+        row_color = QWidget(color_box)
+        row_color_l = QHBoxLayout(row_color)
+        row_color_l.setContentsMargins(0, 0, 0, 0)
+        self.lbl_color = QLabel(row_color)
+        self.lbl_color.setFixedSize(34, 18)
+        self.lbl_color.setFrameShape(QLabel.Box)
+        self.ent_color_hex = QLineEdit(bgr_to_hex(self.fill_bgr), row_color)
+        self.ent_color_hex.setMaximumWidth(100)
+        btn_color = QPushButton("調色盤...", row_color)
+        btn_color.clicked.connect(self.choose_color_builtin)
+        row_color_l.addWidget(self.lbl_color)
+        row_color_l.addWidget(self.ent_color_hex)
+        row_color_l.addWidget(btn_color)
+        row_color_l.addStretch(1)
+        color_form.addRow(row_color)
+        color_form.addRow(QLabel("色碼格式：#RRGGBB", color_box))
+        left.addWidget(color_box)
         self._update_color_swatch_from_hex()
 
-        lf_suffix = ttk.LabelFrame(left, text="檔名後綴（空=不加）", padding=10)
-        lf_suffix.pack(fill="x", pady=(0, 10))
-        ttk.Entry(lf_suffix, textvariable=self.var_suffix).pack(fill="x")
+        suffix_box = QGroupBox("檔名後綴（空=不加）", left_wrap)
+        suffix_form = QFormLayout(suffix_box)
+        self.ent_suffix = QLineEdit("", suffix_box)
+        suffix_form.addRow(self.ent_suffix)
+        left.addWidget(suffix_box)
 
-        lf_fmt = ttk.LabelFrame(left, text="輸出格式與品質", padding=10)
-        lf_fmt.pack(fill="x", pady=(0, 10))
-        row = ttk.Frame(lf_fmt)
-        row.pack(fill="x")
-        ttk.Label(row, text="輸出格式：").pack(side="left")
-        ttk.Combobox(
-            row, textvariable=self.var_outfmt,
-            values=["保持原格式", "PNG", "JPG", "WEBP"],
-            state="readonly", width=10
-        ).pack(side="left", padx=6)
+        fmt_box = QGroupBox("輸出格式與品質", left_wrap)
+        fmt_form = QFormLayout(fmt_box)
+        self.cmb_outfmt = QComboBox(fmt_box)
+        self.cmb_outfmt.addItems(["保持原格式", "PNG", "JPG", "WEBP"])
+        fmt_form.addRow("輸出格式：", self.cmb_outfmt)
 
-        self.frm_q = ttk.Frame(lf_fmt)
-        self.frm_q.pack(fill="x", pady=(10, 0))
+        self.ent_jpg_quality = QLineEdit("95", fmt_box)
+        self.ent_webp_quality = QLineEdit("90", fmt_box)
+        self.ent_png_compress = QLineEdit("3", fmt_box)
+        fmt_form.addRow("JPG 品質（0-100）：", self.ent_jpg_quality)
+        fmt_form.addRow("WEBP 品質（0-100）：", self.ent_webp_quality)
+        fmt_form.addRow("PNG 壓縮（0-9）：", self.ent_png_compress)
+        self.chk_overwrite = QCheckBox("同名檔案直接覆蓋", fmt_box)
+        fmt_form.addRow(self.chk_overwrite)
+        left.addWidget(fmt_box)
 
-        self.row_jpg = ttk.Frame(self.frm_q)
-        ttk.Label(self.row_jpg, text="JPG 品質：").pack(side="left")
-        ttk.Scale(self.row_jpg, from_=0, to=100, variable=self.var_jpg_quality, orient="horizontal") \
-            .pack(side="left", fill="x", expand=True, padx=6)
-        self.lbl_jpg = ttk.Label(self.row_jpg, text=str(self.var_jpg_quality.get()))
-        self.lbl_jpg.pack(side="left")
+        prog_box = QGroupBox("進度", left_wrap)
+        prog_form = QFormLayout(prog_box)
+        self.lbl_count = QLabel("0 / 0", prog_box)
+        self.lbl_current = QLabel("（尚未開始）", prog_box)
+        self.progress = QProgressBar(prog_box)
+        self.progress.setRange(0, 1)
+        prog_form.addRow("已處理/總件數：", self.lbl_count)
+        prog_form.addRow("目前檔案：", self.lbl_current)
+        prog_form.addRow(self.progress)
+        left.addWidget(prog_box)
 
-        self.row_webp = ttk.Frame(self.frm_q)
-        ttk.Label(self.row_webp, text="WEBP 品質：").pack(side="left")
-        ttk.Scale(self.row_webp, from_=0, to=100, variable=self.var_webp_quality, orient="horizontal") \
-            .pack(side="left", fill="x", expand=True, padx=6)
-        self.lbl_webp = ttk.Label(self.row_webp, text=str(self.var_webp_quality.get()))
-        self.lbl_webp.pack(side="left")
+        row_btn = QWidget(left_wrap)
+        row_btn_l = QHBoxLayout(row_btn)
+        row_btn_l.setContentsMargins(0, 0, 0, 0)
+        self.btn_start = QPushButton("開始處理", row_btn)
+        self.btn_start.clicked.connect(self.start)
+        self.btn_stop = QPushButton("停止", row_btn)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop)
+        row_btn_l.addWidget(self.btn_start, 1)
+        row_btn_l.addWidget(self.btn_stop, 1)
+        left.addWidget(row_btn)
+        left.addStretch(1)
 
-        self.row_png = ttk.Frame(self.frm_q)
-        ttk.Label(self.row_png, text="PNG 壓縮：").pack(side="left")
-        ttk.Scale(self.row_png, from_=0, to=9, variable=self.var_png_compress, orient="horizontal") \
-            .pack(side="left", fill="x", expand=True, padx=6)
-        self.lbl_png = ttk.Label(self.row_png, text=str(self.var_png_compress.get()))
-        self.lbl_png.pack(side="left")
+        right_wrap = QWidget(root)
+        right = QVBoxLayout(right_wrap)
+        outer.addWidget(right_wrap, 1)
 
-        ttk.Checkbutton(
-            lf_fmt,
-            text="同名檔案直接覆蓋（不勾選則自動改名 (1)(2)…）",
-            variable=self.var_overwrite
-        ).pack(anchor="w", pady=(10, 0))
+        prev_box = QGroupBox("預覽（左：原圖 / 右：處理後）", right_wrap)
+        prev_l = QHBoxLayout(prev_box)
+        self.lbl_prev_in = QLabel("（尚未選擇有效的圖片或資料夾）", prev_box)
+        self.lbl_prev_in.setAlignment(Qt.AlignCenter)
+        self.lbl_prev_in.setStyleSheet("background:#222;color:#ddd;")
+        self.lbl_prev_out = QLabel("", prev_box)
+        self.lbl_prev_out.setAlignment(Qt.AlignCenter)
+        self.lbl_prev_out.setStyleSheet("background:#222;color:#ddd;")
+        prev_l.addWidget(self.lbl_prev_in, 1)
+        prev_l.addWidget(self.lbl_prev_out, 1)
+        right.addWidget(prev_box, 1)
 
-        lf_prog = ttk.LabelFrame(left, text="進度", padding=10)
-        lf_prog.pack(fill="x", pady=(0, 10))
-        row = ttk.Frame(lf_prog)
-        row.pack(fill="x")
-        ttk.Label(row, text="已處理/總件數：").pack(side="left")
-        ttk.Label(row, textvariable=self.var_count).pack(side="left")
-        ttk.Label(lf_prog, text="目前檔案：").pack(anchor="w", pady=(8, 0))
-        ttk.Label(lf_prog, textvariable=self.var_current).pack(fill="x", pady=(2, 0))
-        self.pbar = ttk.Progressbar(lf_prog, mode="determinate")
-        self.pbar.pack(fill="x", pady=(10, 0))
+        self.lbl_preview_info = QLabel("提示：改參數會更新預覽（取第一張圖）。", right_wrap)
+        right.addWidget(self.lbl_preview_info)
 
-        btn_row = ttk.Frame(left)
-        btn_row.pack(fill="x", pady=(6, 0))
-        self.btn_start = ttk.Button(btn_row, text="開始處理", command=self.start)
-        self.btn_start.pack(side="left", fill="x", expand=True)
-        self.btn_stop = ttk.Button(btn_row, text="停止", command=self.stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=(8, 0))
+    def _bind_events(self) -> None:
+        for w in [self.ent_input, self.ent_output, self.ent_w, self.ent_h, self.ent_suffix]:
+            w.textChanged.connect(self.schedule_preview_update)
+        self.ent_color_hex.textChanged.connect(self.on_color_hex_change)
+        self.cmb_anchor.currentTextChanged.connect(self.schedule_preview_update)
+        self.cmb_outfmt.currentTextChanged.connect(self.schedule_preview_update)
+        self.ent_jpg_quality.textChanged.connect(self.schedule_preview_update)
+        self.ent_webp_quality.textChanged.connect(self.schedule_preview_update)
+        self.ent_png_compress.textChanged.connect(self.schedule_preview_update)
 
-        right = ttk.Frame(outer)
-        right.pack(side="left", fill="both", expand=True)
+    def schedule_preview_update(self) -> None:
+        QTimer.singleShot(120, self.update_preview)
 
-        lf_prev = ttk.LabelFrame(right, text="8) 預覽（左：原圖 / 右：處理後）", padding=10)
-        lf_prev.pack(fill="both", expand=True)
-
-        top = ttk.Frame(lf_prev)
-        top.pack(fill="both", expand=True)
-
-        self.prev_in_frame = ttk.LabelFrame(top, text="原圖", padding=8)
-        self.prev_in_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        self.lbl_prev_in = ttk.Label(self.prev_in_frame, anchor="center")
-        self.lbl_prev_in.pack(fill="both", expand=True)
-
-        self.prev_out_frame = ttk.LabelFrame(top, text="處理後", padding=8)
-        self.prev_out_frame.pack(side="left", fill="both", expand=True)
-        self.lbl_prev_out = ttk.Label(self.prev_out_frame, anchor="center")
-        self.lbl_prev_out.pack(fill="both", expand=True)
-
-        self.preview_info = ttk.Label(lf_prev, text="提示：改解析度/補色/貼齊/輸出格式會更新預覽（取第一張圖）。")
-        self.preview_info.pack(fill="x", pady=(10, 0))
-
-        def upd_labels(*_):
-            self.lbl_jpg.config(text=str(int(self.var_jpg_quality.get())))
-            self.lbl_webp.config(text=str(int(self.var_webp_quality.get())))
-            self.lbl_png.config(text=str(int(self.var_png_compress.get())))
-        self.var_jpg_quality.trace_add("write", upd_labels)
-        self.var_webp_quality.trace_add("write", upd_labels)
-        self.var_png_compress.trace_add("write", upd_labels)
-
-        self._refresh_quality_visibility()
-
-    def _bind_events(self):
-        for var in (self.var_input, self.var_output, self.var_w, self.var_h,
-                    self.var_suffix, self.var_anchor, self.var_outfmt):
-            var.trace_add("write", lambda *_: self.schedule_preview_update())
-
-        self.var_jpg_quality.trace_add("write", lambda *_: self.schedule_preview_update())
-        self.var_webp_quality.trace_add("write", lambda *_: self.schedule_preview_update())
-        self.var_png_compress.trace_add("write", lambda *_: self.schedule_preview_update())
-
-        self.var_color_hex.trace_add("write", lambda *_: self.on_color_hex_change())
-
-    def schedule_preview_update(self):
-        self._refresh_quality_visibility()
-        if self._preview_job is not None:
-            self.root.after_cancel(self._preview_job)
-        self._preview_job = self.root.after(250, self.update_preview)
-
-    def _refresh_quality_visibility(self):
-        fmt = self.var_outfmt.get()
-        for row in (self.row_jpg, self.row_webp, self.row_png):
-            row.pack_forget()
-        if fmt == "JPG":
-            self.row_jpg.pack(fill="x", pady=(0, 6))
-        elif fmt == "WEBP":
-            self.row_webp.pack(fill="x", pady=(0, 6))
-        elif fmt == "PNG":
-            self.row_png.pack(fill="x", pady=(0, 6))
-
-    def pick_input_file(self):
-        initdir = initial_dir_from(self.var_input.get())
-        path = filedialog.askopenfilename(
-            parent=self.root,
-            initialdir=initdir,
-            title="選擇圖片",
-            filetypes=[("Image", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"), ("All", "*.*")],
+    def pick_input_file(self) -> None:
+        initdir = initial_dir_from(self.ent_input.text())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "選擇圖片",
+            initdir,
+            "Image (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp);;All (*)",
         )
         if path:
-            self.var_input.set(path)
+            self.ent_input.setText(path)
 
-    def pick_input_dir(self):
-        initdir = initial_dir_from(self.var_input.get())
-        path = filedialog.askdirectory(parent=self.root, initialdir=initdir, title="選擇圖片資料夾")
+    def pick_input_dir(self) -> None:
+        initdir = initial_dir_from(self.ent_input.text())
+        path = QFileDialog.getExistingDirectory(self, "選擇圖片資料夾", initdir)
         if path:
-            self.var_input.set(path)
+            self.ent_input.setText(path)
 
-    def pick_output_dir(self):
-        initdir = initial_dir_from(self.var_output.get())
-        path = filedialog.askdirectory(parent=self.root, initialdir=initdir, title="選擇輸出資料夾")
+    def pick_output_dir(self) -> None:
+        initdir = initial_dir_from(self.ent_output.text())
+        path = QFileDialog.getExistingDirectory(self, "選擇輸出資料夾", initdir)
         if path:
-            self.var_output.set(path)
+            self.ent_output.setText(path)
 
-    def choose_color_builtin(self):
-        _win_center_dialog_over_root_async(self.root, timeout_sec=2.0)
-        rgb, hx = colorchooser.askcolor(parent=self.root, title="選擇填滿顏色", color=self.var_color_hex.get())
-        if hx:
-            self.var_color_hex.set(hx.upper())
+    def choose_color_builtin(self) -> None:
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.ent_color_hex.setText(color.name().upper())
 
-    def _update_color_swatch_from_hex(self):
-        hx = self.var_color_hex.get().strip().upper()
+    def _update_color_swatch_from_hex(self) -> None:
+        hx = self.ent_color_hex.text().strip().upper()
         try:
             bgr = hex_to_bgr(hx)
         except Exception:
-            self.color_swatch.configure(bg="#FFFFFF")
+            self.lbl_color.setStyleSheet("background:#FFFFFF;")
             return
         self.fill_bgr = bgr
-        self.color_swatch.configure(bg=bgr_to_hex(bgr))
+        self.lbl_color.setStyleSheet(f"background:{bgr_to_hex(bgr)};")
 
-    def on_color_hex_change(self):
+    def on_color_hex_change(self) -> None:
         self._update_color_swatch_from_hex()
         self.schedule_preview_update()
 
-    def _get_first_image_path(self, input_path: str):
+    def _get_first_image_path(self, input_path: str) -> Optional[str]:
         if not input_path:
             return None
         if os.path.isfile(input_path) and is_image_file(input_path):
@@ -547,26 +395,29 @@ class ImageResizerGUI:
             return files[0] if files else None
         return None
 
-    def _fit_to_label(self, pil_img: Image.Image, label: ttk.Label):
-        max_w = max(260, label.winfo_width() - 10)
-        max_h = max(260, label.winfo_height() - 10)
+    def _set_label_pixmap(self, label: QLabel, pil_img: Image.Image) -> None:
+        max_w = max(260, label.width() - 10)
+        max_h = max(260, label.height() - 10)
         out = pil_img.copy()
         out.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
-        return out
+        arr = np.array(out.convert("RGB"), copy=False)
+        h, w = arr.shape[:2]
+        qimg = QImage(arr.data, w, h, w * 3, QImage.Format_RGB888)
+        label.setPixmap(QPixmap.fromImage(qimg))
+        self._preview_source = arr  # keep buffer referenced
 
-    def update_preview(self):
-        self._preview_job = None
-        first = self._get_first_image_path(self.var_input.get().strip())
+    def update_preview(self) -> None:
+        first = self._get_first_image_path(self.ent_input.text().strip())
         if not first:
-            self.lbl_prev_in.configure(image="", text="（尚未選擇有效的圖片或資料夾）")
-            self.lbl_prev_out.configure(image="", text="")
-            self._photo_in = None
-            self._photo_out = None
+            self.lbl_prev_in.setText("（尚未選擇有效的圖片或資料夾）")
+            self.lbl_prev_in.setPixmap(QPixmap())
+            self.lbl_prev_out.setText("")
+            self.lbl_prev_out.setPixmap(QPixmap())
             return
 
         try:
-            tw = int(self.var_w.get())
-            th = int(self.var_h.get())
+            tw = int(self.ent_w.text())
+            th = int(self.ent_h.text())
             if tw <= 0 or th <= 0:
                 return
         except Exception:
@@ -574,28 +425,23 @@ class ImageResizerGUI:
 
         img = cv_imread_unicode(first)
         if img is None:
-            self.lbl_prev_in.configure(image="", text="（無法讀取圖片）")
-            self.lbl_prev_out.configure(image="", text="")
-            self._photo_in = None
-            self._photo_out = None
+            self.lbl_prev_in.setText("（無法讀取圖片）")
+            self.lbl_prev_out.setPixmap(QPixmap())
             return
 
         rgb_in = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        pil_in = Image.fromarray(rgb_in)
-        self._photo_in = ImageTk.PhotoImage(self._fit_to_label(pil_in, self.lbl_prev_in))
-        self.lbl_prev_in.configure(image=self._photo_in, text="")
+        self._set_label_pixmap(self.lbl_prev_in, Image.fromarray(rgb_in))
+        self.lbl_prev_in.setText("")
 
-        out = resize_letterbox(img, tw, th, fill_bgr=self.fill_bgr, anchor=self.var_anchor.get())
+        out = resize_letterbox(img, tw, th, fill_bgr=self.fill_bgr, anchor=self.cmb_anchor.currentText())
         rgb_out = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-        pil_out = Image.fromarray(rgb_out)
-        self._photo_out = ImageTk.PhotoImage(self._fit_to_label(pil_out, self.lbl_prev_out))
-        self.lbl_prev_out.configure(image=self._photo_out, text="")
-
-        self.preview_info.configure(
-            text=f"預覽：{os.path.basename(first)} | 目標 {tw}x{th} | 貼齊 {self.var_anchor.get()} | 補色 {bgr_to_hex(self.fill_bgr)}"
+        self._set_label_pixmap(self.lbl_prev_out, Image.fromarray(rgb_out))
+        self.lbl_prev_out.setText("")
+        self.lbl_preview_info.setText(
+            f"預覽：{os.path.basename(first)} | 目標 {tw}x{th} | 貼齊 {self.cmb_anchor.currentText()} | 補色 {bgr_to_hex(self.fill_bgr)}"
         )
 
-    def collect_input_paths(self, input_path: str):
+    def collect_input_paths(self, input_path: str) -> list[str]:
         if os.path.isfile(input_path):
             return [input_path] if is_image_file(input_path) else []
         if os.path.isdir(input_path):
@@ -605,82 +451,104 @@ class ImageResizerGUI:
         return []
 
     def get_output_ext_and_params(self, src_path: str):
-        fmt = self.var_outfmt.get()
-
+        fmt = self.cmb_outfmt.currentText()
         if fmt == "保持原格式":
             ext = os.path.splitext(src_path)[1].lower()
             if ext == ".jpeg":
                 ext = ".jpg"
             if ext not in [".jpg", ".png", ".webp", ".bmp", ".tif", ".tiff"]:
                 ext = ".png"
-            params = []
             if ext == ".jpg":
-                params = [int(cv2.IMWRITE_JPEG_QUALITY), int(self.var_jpg_quality.get())]
-            elif ext == ".webp":
-                params = [int(cv2.IMWRITE_WEBP_QUALITY), int(self.var_webp_quality.get())]
-            elif ext == ".png":
-                params = [int(cv2.IMWRITE_PNG_COMPRESSION), int(self.var_png_compress.get())]
-            return ext, params
-
+                return ext, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.ent_jpg_quality.text() or "95")]
+            if ext == ".webp":
+                return ext, [int(cv2.IMWRITE_WEBP_QUALITY), int(self.ent_webp_quality.text() or "90")]
+            if ext == ".png":
+                return ext, [int(cv2.IMWRITE_PNG_COMPRESSION), int(self.ent_png_compress.text() or "3")]
+            return ext, []
         if fmt == "PNG":
-            return ".png", [int(cv2.IMWRITE_PNG_COMPRESSION), int(self.var_png_compress.get())]
+            return ".png", [int(cv2.IMWRITE_PNG_COMPRESSION), int(self.ent_png_compress.text() or "3")]
         if fmt == "JPG":
-            return ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), int(self.var_jpg_quality.get())]
-        return ".webp", [int(cv2.IMWRITE_WEBP_QUALITY), int(self.var_webp_quality.get())]
+            return ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), int(self.ent_jpg_quality.text() or "95")]
+        return ".webp", [int(cv2.IMWRITE_WEBP_QUALITY), int(self.ent_webp_quality.text() or "90")]
 
-    def start(self):
+    def _set_worker_progress(self, done: int, total: int, current_name: str) -> None:
+        with self._state_lock:
+            self._progress_done = done
+            self._progress_total = total
+            self._current_name = current_name
+
+    def _flush_worker_updates(self) -> None:
+        with self._state_lock:
+            done = self._progress_done
+            total = self._progress_total
+            current = self._current_name
+            finish_dialog = self._finish_dialog
+            if finish_dialog is not None:
+                self._finish_dialog = None
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(done)
+        self.lbl_count.setText(f"{done} / {total}")
+        self.lbl_current.setText(current)
+
+        if finish_dialog is not None:
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            level, title, msg = finish_dialog
+            if level == "error":
+                QMessageBox.critical(self, title, msg)
+            elif level == "warn":
+                QMessageBox.warning(self, title, msg)
+            else:
+                QMessageBox.information(self, title, msg)
+
+    def start(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
-            messagebox.showinfo("進行中", "目前正在處理中。", parent=self.root)
+            QMessageBox.information(self, "進行中", "目前正在處理中。")
             return
 
-        input_path = self.var_input.get().strip()
-        output_dir = self.var_output.get().strip()
-
+        input_path = self.ent_input.text().strip()
+        output_dir = self.ent_output.text().strip()
         if not input_path:
-            messagebox.showwarning("缺少輸入", "請選擇輸入圖片或資料夾。", parent=self.root)
+            QMessageBox.warning(self, "缺少輸入", "請選擇輸入圖片或資料夾。")
             return
         if not output_dir:
-            messagebox.showwarning("缺少輸出", "請選擇輸出資料夾。", parent=self.root)
+            QMessageBox.warning(self, "缺少輸出", "請選擇輸出資料夾。")
+            return
+        try:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "建立輸出資料夾失敗", str(exc))
             return
 
-        if not os.path.exists(output_dir):
-            try:
-                os.makedirs(output_dir, exist_ok=True)
-            except Exception as e:
-                messagebox.showerror("建立輸出資料夾失敗", str(e), parent=self.root)
-                return
-
         try:
-            tw = int(self.var_w.get())
-            th = int(self.var_h.get())
+            tw = int(self.ent_w.text())
+            th = int(self.ent_h.text())
             if tw <= 0 or th <= 0:
                 raise ValueError
         except Exception:
-            messagebox.showwarning("解析度錯誤", "請輸入正整數的寬與高。", parent=self.root)
+            QMessageBox.warning(self, "解析度錯誤", "請輸入正整數的寬與高。")
             return
 
         try:
-            _ = hex_to_bgr(self.var_color_hex.get().strip())
+            _ = hex_to_bgr(self.ent_color_hex.text().strip())
         except Exception:
-            messagebox.showwarning("顏色錯誤", "填滿顏色請輸入正確的 #RRGGBB。", parent=self.root)
+            QMessageBox.warning(self, "顏色錯誤", "填滿顏色請輸入正確的 #RRGGBB。")
             return
 
         paths = self.collect_input_paths(input_path)
         if not paths:
-            messagebox.showwarning("沒有圖片", "找不到支援的圖片檔。", parent=self.root)
+            QMessageBox.warning(self, "沒有圖片", "找不到支援的圖片檔。")
             return
 
-        suffix = self.var_suffix.get()
-        anchor = self.var_anchor.get()
-        overwrite = bool(self.var_overwrite.get())
+        suffix = self.ent_suffix.text()
+        anchor = self.cmb_anchor.currentText()
+        overwrite = self.chk_overwrite.isChecked()
         fill_bgr = self.fill_bgr
 
         self.stop_flag = False
-        self.btn_start.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.pbar.configure(value=0, maximum=len(paths))
-        self.var_count.set(f"0 / {len(paths)}")
-        self.var_current.set("（準備開始…）")
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self._set_worker_progress(0, len(paths), "（準備開始...）")
 
         self.worker_thread = threading.Thread(
             target=self._worker,
@@ -689,42 +557,45 @@ class ImageResizerGUI:
         )
         self.worker_thread.start()
 
-    def stop(self):
+    def stop(self) -> None:
         self.stop_flag = True
 
-    def _safe_set_progress(self, done, total, current_name=None):
-        self.pbar.configure(value=done, maximum=total)
-        self.var_count.set(f"{done} / {total}")
-        if current_name is not None:
-            self.var_current.set(current_name)
-
-    def _worker(self, paths, output_dir, tw, th, suffix, fill_bgr, anchor, overwrite):
+    def _worker(
+        self,
+        paths: list[str],
+        output_dir: str,
+        tw: int,
+        th: int,
+        suffix: str,
+        fill_bgr,
+        anchor: str,
+        overwrite: bool,
+    ) -> None:
         total = len(paths)
         done = 0
         failed = 0
-
-        for pth in paths:
+        for src_path in paths:
             if self.stop_flag:
                 break
 
-            base = os.path.basename(pth)
-            self.root.after(0, self._safe_set_progress, done, total, base)
+            base = os.path.basename(src_path)
+            self._set_worker_progress(done, total, base)
 
-            img = cv_imread_unicode(pth)
+            img = cv_imread_unicode(src_path)
             if img is None:
                 failed += 1
                 done += 1
-                self.root.after(0, self._safe_set_progress, done, total, f"{base}（讀取失敗）")
+                self._set_worker_progress(done, total, f"{base}（讀取失敗）")
                 continue
 
             out = resize_letterbox(img, tw, th, fill_bgr=fill_bgr, anchor=anchor)
             if out is None:
                 failed += 1
                 done += 1
-                self.root.after(0, self._safe_set_progress, done, total, f"{base}（處理失敗）")
+                self._set_worker_progress(done, total, f"{base}（處理失敗）")
                 continue
 
-            ext, params = self.get_output_ext_and_params(pth)
+            ext, params = self.get_output_ext_and_params(src_path)
             name_no_ext = os.path.splitext(base)[0]
             new_name = f"{name_no_ext}{suffix}{ext}" if suffix else f"{name_no_ext}{ext}"
             save_path = os.path.join(output_dir, new_name)
@@ -736,33 +607,26 @@ class ImageResizerGUI:
                 failed += 1
 
             done += 1
-            self.root.after(0, self._safe_set_progress, done, total, base)
+            self._set_worker_progress(done, total, base)
 
-        def finish():
-            self.btn_start.configure(state="normal")
-            self.btn_stop.configure(state="disabled")
-            if self.stop_flag:
-                messagebox.showinfo("已停止", f"已停止處理：{done}/{total}，失敗 {failed}。", parent=self.root)
-                self.var_current.set("（已停止）")
-            else:
-                messagebox.showinfo("完成", f"處理完成：{done}/{total}，失敗 {failed}。\n輸出：{output_dir}", parent=self.root)
-                self.var_current.set("（完成）")
+        if self.stop_flag:
+            msg = f"已停止處理：{done}/{total}，失敗 {failed}。"
+            self._set_worker_progress(done, total, "（已停止）")
+            with self._state_lock:
+                self._finish_dialog = ("info", "已停止", msg)
+            return
 
-        self.root.after(0, finish)
+        msg = f"處理完成：{done}/{total}，失敗 {failed}。\n輸出：{output_dir}"
+        self._set_worker_progress(done, total, "（完成）")
+        with self._state_lock:
+            self._finish_dialog = ("info", "完成", msg)
 
 
-def main():
-    root = tk.Tk()
-
-    # Windows DPI（可有可無）
-    try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-
-    ImageResizerGUI(root)
-    root.mainloop()
+def main() -> None:
+    app = QApplication([])
+    win = ImageResizerWindow()
+    win.show()
+    app.exec()
 
 
 if __name__ == "__main__":

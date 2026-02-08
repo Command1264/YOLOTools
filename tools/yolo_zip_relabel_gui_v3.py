@@ -1,79 +1,80 @@
-import os
+from __future__ import annotations
+
 import re
 import shutil
-import zipfile
 import tempfile
 import threading
+import zipfile
 from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from typing import Optional
 
-# ---- Optional dependency: PyYAML ----
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
 try:
-    import yaml  # pip install pyyaml
+    import yaml
 except Exception:
     yaml = None
 
 
-# =========================
-# YAML parsing helpers
-# =========================
 def _parse_yaml_fallback(text: str) -> dict:
-    """
-    Minimal YAML parser fallback.
-    Supports:
-      - key: value
-      - names: ['a','b']  or names: [a, b]
-      - names:
-          0: a
-          1: b
-    """
-    data = {}
-    lines = text.splitlines()
-    cleaned = []
-    for ln in lines:
+    data: dict = {}
+    lines = []
+    for ln in text.splitlines():
         ln = ln.split("#", 1)[0].rstrip("\n")
         if ln.strip():
-            cleaned.append(ln)
+            lines.append(ln)
 
     i = 0
-    while i < len(cleaned):
-        ln = cleaned[i]
+    while i < len(lines):
+        ln = lines[i]
         if ":" not in ln:
             i += 1
             continue
         key, rest = ln.split(":", 1)
         key = key.strip()
         rest = rest.strip()
-
         if key == "names" and rest == "":
             names_map = {}
             i += 1
-            while i < len(cleaned):
-                sub = cleaned[i]
+            while i < len(lines):
+                sub = lines[i]
                 if re.match(r"^\s+\d+\s*:\s*", sub):
                     m = re.match(r"^\s+(\d+)\s*:\s*(.+)$", sub)
                     if m:
-                        idx = int(m.group(1))
-                        val = m.group(2).strip().strip("'\"")
-                        names_map[idx] = val
+                        names_map[int(m.group(1))] = m.group(2).strip().strip("'\"")
                     i += 1
                 else:
                     break
             if names_map:
                 data["names"] = [names_map[k] for k in sorted(names_map.keys())]
             continue
-
         if key == "names" and rest.startswith("["):
-            inside = rest.strip()[1:-1]
+            inside = rest[1:-1]
             parts = [p.strip().strip("'\"") for p in inside.split(",") if p.strip()]
             data["names"] = parts
             i += 1
             continue
-
         data[key] = rest.strip().strip("'\"")
         i += 1
-
     return data
 
 
@@ -95,26 +96,23 @@ def _dump_yaml_simple(obj: dict) -> str:
     lines = []
     for k, v in obj.items():
         if k == "names" and isinstance(v, list):
-            quoted = ", ".join([f"'{x}'" for x in v])
-            lines.append(f"names: [{quoted}]")
+            lines.append(f"names: [{', '.join([repr(x) for x in v])}]")
         else:
             lines.append(f"{k}: {v}")
     return "\n".join(lines) + "\n"
 
 
-# =========================
-# ZIP helpers
-# =========================
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
-def norm_zip_path(p: str) -> str:
-    return p.replace("\\", "/").lstrip("./")
+
+def norm_zip_path(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
 
 
 def join_zip(base: str, rel: str) -> str:
     base = norm_zip_path(base)
     rel = norm_zip_path(rel)
-    if base == "" or base == ".":
+    if not base:
         return rel
     return f"{base.rstrip('/')}/{rel}"
 
@@ -139,338 +137,318 @@ def zip_read_text(zf: zipfile.ZipFile, member: str) -> str:
 
 
 def infer_labels_dir(images_dir: str) -> str:
-    """
-    Common convention:
-      .../images/... -> .../labels/...
-    """
-    p = norm_zip_path(images_dir)
-    if "/images/" in p:
-        return p.replace("/images/", "/labels/")
-    if p.endswith("/images"):
-        return p[:-len("/images")] + "/labels"
-    if p.startswith("images/"):
-        return p.replace("images/", "labels/", 1)
-    return p.replace("images", "labels")
+    path = norm_zip_path(images_dir)
+    if "/images/" in path:
+        return path.replace("/images/", "/labels/")
+    if path.endswith("/images"):
+        return path[:-len("/images")] + "/labels"
+    if path.startswith("images/"):
+        return path.replace("images/", "labels/", 1)
+    return path.replace("images", "labels")
 
 
-def ensure_parent_dir(fp: Path):
-    fp.parent.mkdir(parents=True, exist_ok=True)
+def ensure_parent_dir(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def list_images_in_zip(all_names: set[str], images_dir: str) -> list[str]:
-    """
-    Return file members under images_dir (recursive) with image extensions.
-    """
     prefix = norm_zip_path(images_dir).rstrip("/") + "/"
     imgs = []
-    for n in all_names:
-        nn = norm_zip_path(n)
+    for name in all_names:
+        nn = norm_zip_path(name)
         if nn.startswith(prefix) and nn.lower().endswith(IMG_EXTS):
             imgs.append(nn)
     imgs.sort()
     return imgs
 
 
-def find_label_for_image(all_names: set[str], labels_dir: str, image_member: str) -> str | None:
-    """
-    For image: <labels_dir>/<stem>.txt (same filename stem)
-    """
+def find_label_for_image(all_names: set[str], labels_dir: str, image_member: str) -> Optional[str]:
     stem = Path(image_member).stem
     cand = norm_zip_path(labels_dir).rstrip("/") + "/" + stem + ".txt"
     return cand if cand in all_names else None
 
 
-# =========================
-# Drag & drop listbox
-# =========================
-class DragListbox(tk.Listbox):
-    def __init__(self, master, **kw):
-        super().__init__(master, kw)
-        self.curIndex = None
-        self.bind("<Button-1>", self.set_current)
-        self.bind("<B1-Motion>", self.shift_selection)
+class ReorderListWidget(QListWidget):
+    order_changed = Signal()
 
-    def set_current(self, event):
-        self.curIndex = self.nearest(event.y)
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QListWidget.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
 
-    def shift_selection(self, event):
-        i = self.nearest(event.y)
-        if i < 0 or self.curIndex is None:
-            return
-        if i != self.curIndex:
-            x = self.get(self.curIndex)
-            self.delete(self.curIndex)
-            self.insert(i, x)
-            self.curIndex = i
+    def dropEvent(self, event) -> None:
+        super().dropEvent(event)
+        self.order_changed.emit()
 
 
-# =========================
-# Main GUI App
-# =========================
-class App:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("YOLO Zip Label Remapper (通用) v3")
-        self.root.geometry("980x760")
+class MainWindow(QMainWindow):
+    """YOLO zip label remapper GUI."""
 
-        self.zip_path = tk.StringVar(value="")
-        self.out_dir = tk.StringVar(value="")  # empty => script dir
-        self.out_name = tk.StringVar(value="converted_dataset.zip")
-        self.keep_unlabeled = tk.BooleanVar(value=True)  # <-- new option
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("YOLO Zip Label Remapper v3")
+        self.resize(1020, 760)
+        self.setMinimumSize(900, 640)
 
-        self.status = tk.StringVar(value="尚未載入 dataset")
-        self.progress_text = tk.StringVar(value="0/0")
+        self.data_yaml_member: Optional[str] = None
+        self.data_yaml_base = ""
+        self.orig_yaml: dict = {}
+        self.orig_names: list[str] = []
+        self.items: list[dict] = []
 
-        self.data_yaml_member = None
-        self.data_yaml_base = ""     # folder containing data.yaml inside zip
-        self.orig_yaml = {}          # parsed yaml dict
-        self.orig_names = []         # list[str]
-        self.items = []              # list[dict]: {"old_id": int, "name": str}
+        self._worker: Optional[threading.Thread] = None
+        self._running = False
+        self._status_buffer: list[str] = []
+        self._progress_cur = 0
+        self._progress_total = 1
+        self._lock = threading.Lock()
+        self._finish_dialog: Optional[tuple[str, str, str]] = None
 
         self._build_ui()
 
-    # -----------------
-    # Path rules
-    # -----------------
-    def _script_dir(self) -> Path:
-        return Path(os.getcwd())
+        self._timer = QTimer(self)
+        self._timer.setInterval(120)
+        self._timer.timeout.connect(self._flush_ui)
+        self._timer.start()
 
-    def _initial_dir(self, chosen_path: str) -> str:
-        if chosen_path and Path(chosen_path).exists():
-            return str(Path(chosen_path))
-        return str(self._script_dir())
+    def _build_ui(self) -> None:
+        root = QWidget(self)
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
 
-    # -----------------
-    # UI
-    # -----------------
-    def _build_ui(self):
-        pad = 10
-        frm = tk.Frame(self.root)
-        frm.pack(fill="both", expand=True, padx=pad, pady=pad)
+        path_box = QGroupBox("輸入與輸出", root)
+        path_layout = QFormLayout(path_box)
 
-        # Zip selection
-        zip_row = tk.Frame(frm)
-        zip_row.pack(fill="x")
-        tk.Label(zip_row, text="輸入 Zip（載入時只讀 data.yaml；不整包解壓）").pack(anchor="w")
-        tk.Entry(zip_row, textvariable=self.zip_path).pack(side="left", fill="x", expand=True)
-        tk.Button(zip_row, text="選擇 Zip", command=self.pick_zip).pack(side="left", padx=6)
+        row_zip = QWidget(path_box)
+        row_zip_l = QHBoxLayout(row_zip)
+        row_zip_l.setContentsMargins(0, 0, 0, 0)
+        self.ent_zip = QLineEdit(row_zip)
+        btn_zip = QPushButton("選擇 Zip", row_zip)
+        btn_zip.clicked.connect(self.pick_zip)
+        row_zip_l.addWidget(self.ent_zip, 1)
+        row_zip_l.addWidget(btn_zip)
+        path_layout.addRow("輸入 Zip:", row_zip)
 
-        # Output
-        out_box = tk.LabelFrame(frm, text="輸出設定（沒填路徑=程式執行位置；輸出為 zip）")
-        out_box.pack(fill="x", pady=(12, 0))
+        row_out_dir = QWidget(path_box)
+        row_out_dir_l = QHBoxLayout(row_out_dir)
+        row_out_dir_l.setContentsMargins(0, 0, 0, 0)
+        self.ent_out_dir = QLineEdit(row_out_dir)
+        btn_out = QPushButton("選擇資料夾", row_out_dir)
+        btn_out.clicked.connect(self.pick_out_dir)
+        row_out_dir_l.addWidget(self.ent_out_dir, 1)
+        row_out_dir_l.addWidget(btn_out)
+        path_layout.addRow("輸出資料夾（空白=目前目錄）:", row_out_dir)
 
-        out_row1 = tk.Frame(out_box)
-        out_row1.pack(fill="x", padx=8, pady=6)
-        tk.Label(out_row1, text="輸出資料夾：").pack(side="left")
-        tk.Entry(out_row1, textvariable=self.out_dir).pack(side="left", fill="x", expand=True)
-        tk.Button(out_row1, text="選擇資料夾", command=self.pick_out_dir).pack(side="left", padx=6)
+        self.ent_out_name = QLineEdit("converted_dataset.zip", path_box)
+        path_layout.addRow("輸出 zip 檔名:", self.ent_out_name)
+        layout.addWidget(path_box)
 
-        out_row2 = tk.Frame(out_box)
-        out_row2.pack(fill="x", padx=8, pady=(0, 8))
-        tk.Label(out_row2, text="輸出 zip 檔名：").pack(side="left")
-        tk.Entry(out_row2, textvariable=self.out_name, width=52).pack(side="left")
-
-        # Options
-        opt_box = tk.LabelFrame(frm, text="處理選項")
-        opt_box.pack(fill="x", pady=(12, 0))
-        tk.Checkbutton(
-            opt_box,
-            text="保留沒有標註/過濾後為空的圖片（會產生空的 .txt label，最相容）",
-            variable=self.keep_unlabeled
-        ).pack(anchor="w", padx=8, pady=6)
-
-        # Middle
-        mid = tk.Frame(frm)
-        mid.pack(fill="both", expand=True, pady=(12, 0))
-
-        left = tk.LabelFrame(mid, text="Labels（拖曳改順序；顯示：原 id → 新 id；可刪除；可改名）")
-        left.pack(side="left", fill="both", expand=True)
-
-        self.listbox = DragListbox(left, selectmode=tk.SINGLE, height=18)
-        self.listbox.pack(fill="both", expand=True, padx=8, pady=8)
-        self.listbox.bind("<<ListboxSelect>>", self.on_select)
-
-        btn_row = tk.Frame(left)
-        btn_row.pack(fill="x", padx=8, pady=(0, 8))
-        tk.Button(btn_row, text="刪除選取 label", command=self.delete_selected).pack(side="left")
-        tk.Button(btn_row, text="清空列表", command=self.clear_all).pack(side="left", padx=6)
-        tk.Button(btn_row, text="重新計算 → 顯示新 id", command=self.refresh_display).pack(side="left", padx=6)
-
-        right = tk.LabelFrame(mid, text="編輯 label 名稱")
-        right.pack(side="left", fill="y", padx=(12, 0))
-
-        tk.Label(right, text="目前選取：").pack(anchor="w", padx=8, pady=(8, 0))
-        self.sel_info = tk.StringVar(value="(無)")
-        tk.Label(right, textvariable=self.sel_info, wraplength=280, justify="left").pack(anchor="w", padx=8)
-
-        tk.Label(right, text="新名稱：").pack(anchor="w", padx=8, pady=(12, 0))
-        self.rename_var = tk.StringVar(value="")
-        tk.Entry(right, textvariable=self.rename_var, width=34).pack(anchor="w", padx=8)
-        tk.Button(right, text="套用改名", command=self.apply_rename).pack(anchor="w", padx=8, pady=8)
-
-        tk.Label(
-            right,
-            text="顯示格式：\n  old_id label  →  new_id\n\n說明：\n- old_id 只用來對照原始資料\n- new_id 由目前順序決定\n- 刪除=不輸出該 class",
-            justify="left"
-        ).pack(anchor="w", padx=8, pady=(12, 8))
-
-        # Progress
-        bottom = tk.Frame(frm)
-        bottom.pack(fill="x", pady=(10, 0))
-
-        self.pbar = ttk.Progressbar(bottom, orient="horizontal", mode="determinate")
-        self.pbar.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        tk.Label(bottom, textvariable=self.progress_text, width=14).pack(side="left")
-        tk.Button(bottom, text="🚀 一鍵處理並輸出 Zip", command=self.run).pack(side="left", padx=8)
-
-        tk.Label(frm, textvariable=self.status, fg="#333").pack(anchor="w", pady=(10, 0))
-
-        # Sync drag to data
-        self._wire_drag_sync()
-
-    # -----------------
-    # Drag sync
-    # -----------------
-    def _wire_drag_sync(self):
-        lb = self.listbox
-
-        def shift_selection(event):
-            i = lb.nearest(event.y)
-            if i < 0 or lb.curIndex is None:
-                return
-            if i != lb.curIndex:
-                # move in data
-                item = self.items.pop(lb.curIndex)
-                self.items.insert(i, item)
-                lb.curIndex = i
-                self.refresh_display()
-                lb.selection_clear(0, tk.END)
-                lb.selection_set(i)
-
-        lb.shift_selection = shift_selection
-        lb.bind("<B1-Motion>", lb.shift_selection)
-
-    # -----------------
-    # Load zip / yaml (no full extract)
-    # -----------------
-    def pick_zip(self):
-        initdir = self._initial_dir(self.zip_path.get())
-        path = filedialog.askopenfilename(
-            initialdir=initdir,
-            filetypes=[("Zip files", "*.zip"), ("All files", "*.*")]
+        self.chk_keep_unlabeled = QCheckBox(
+            "保留沒有標註/過濾後為空的圖片（會產生空的 .txt label）",
+            root,
         )
+        self.chk_keep_unlabeled.setChecked(True)
+        layout.addWidget(self.chk_keep_unlabeled)
+
+        mid = QWidget(root)
+        mid_l = QHBoxLayout(mid)
+        mid_l.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(mid, 1)
+
+        left = QGroupBox("Labels（拖曳改順序；可刪除；可改名）", mid)
+        left_l = QVBoxLayout(left)
+        self.listbox = ReorderListWidget(left)
+        self.listbox.currentRowChanged.connect(self.on_select)
+        self.listbox.order_changed.connect(self._sync_items_from_view)
+        left_l.addWidget(self.listbox, 1)
+
+        row_left_btn = QWidget(left)
+        row_left_btn_l = QHBoxLayout(row_left_btn)
+        row_left_btn_l.setContentsMargins(0, 0, 0, 0)
+        btn_del = QPushButton("刪除選取 label", row_left_btn)
+        btn_del.clicked.connect(self.delete_selected)
+        btn_clear = QPushButton("清空列表", row_left_btn)
+        btn_clear.clicked.connect(self.clear_all)
+        btn_refresh = QPushButton("重新整理顯示", row_left_btn)
+        btn_refresh.clicked.connect(self.refresh_display)
+        row_left_btn_l.addWidget(btn_del)
+        row_left_btn_l.addWidget(btn_clear)
+        row_left_btn_l.addWidget(btn_refresh)
+        left_l.addWidget(row_left_btn)
+        mid_l.addWidget(left, 2)
+
+        right = QGroupBox("編輯 label 名稱", mid)
+        right_l = QVBoxLayout(right)
+        self.lbl_sel = QLabel("(無)", right)
+        right_l.addWidget(self.lbl_sel)
+        self.ent_rename = QLineEdit(right)
+        right_l.addWidget(self.ent_rename)
+        btn_apply = QPushButton("套用改名", right)
+        btn_apply.clicked.connect(self.apply_rename)
+        right_l.addWidget(btn_apply)
+        right_l.addStretch(1)
+        mid_l.addWidget(right, 1)
+
+        row_bottom = QWidget(root)
+        row_bottom_l = QHBoxLayout(row_bottom)
+        row_bottom_l.setContentsMargins(0, 0, 0, 0)
+        self.progress = QProgressBar(row_bottom)
+        self.progress_text = QLabel("0/0", row_bottom)
+        self.btn_run = QPushButton("一鍵處理並輸出 Zip", row_bottom)
+        self.btn_run.clicked.connect(self.run)
+        row_bottom_l.addWidget(self.progress, 1)
+        row_bottom_l.addWidget(self.progress_text)
+        row_bottom_l.addWidget(self.btn_run)
+        layout.addWidget(row_bottom)
+
+        self.lbl_status = QLabel("尚未載入 dataset", root)
+        layout.addWidget(self.lbl_status)
+
+    def _post_status(self, text: str) -> None:
+        with self._lock:
+            self._status_buffer.append(text)
+
+    def _set_progress(self, cur: int, total: int) -> None:
+        with self._lock:
+            self._progress_cur = cur
+            self._progress_total = max(1, total)
+
+    def _flush_ui(self) -> None:
+        with self._lock:
+            msgs = self._status_buffer[:]
+            self._status_buffer.clear()
+            cur = self._progress_cur
+            total = self._progress_total
+        if msgs:
+            self.lbl_status.setText(msgs[-1])
+        self.progress.setRange(0, total)
+        self.progress.setValue(min(cur, total))
+        self.progress_text.setText(f"{cur}/{total}")
+        if self._worker and (not self._worker.is_alive()):
+            if self._running or self._finish_dialog is not None:
+                self._running = False
+                self.btn_run.setEnabled(True)
+                if self._finish_dialog is not None:
+                    level, title, message = self._finish_dialog
+                    self._finish_dialog = None
+                    if level == "error":
+                        QMessageBox.critical(self, title, message)
+                    elif level == "warn":
+                        QMessageBox.warning(self, title, message)
+                    else:
+                        QMessageBox.information(self, title, message)
+
+    def pick_zip(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "選擇 Zip", str(Path.cwd()), "Zip files (*.zip)")
         if not path:
             return
-        self.zip_path.set(path)
+        self.ent_zip.setText(path)
         self.load_yaml_from_zip(Path(path))
 
-    def pick_out_dir(self):
-        initdir = self._initial_dir(self.out_dir.get())
-        path = filedialog.askdirectory(initialdir=initdir)
-        if not path:
-            return
-        self.out_dir.set(path)
+    def pick_out_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "選擇輸出資料夾", str(Path.cwd()))
+        if path:
+            self.ent_out_dir.setText(path)
 
-    def load_yaml_from_zip(self, zpath: Path):
+    def load_yaml_from_zip(self, zpath: Path) -> None:
         try:
             with zipfile.ZipFile(zpath, "r") as zf:
                 member = find_data_yaml_in_zip(zf)
                 text = zip_read_text(zf, member)
-                data = parse_data_yaml(text)
-
+            data = parse_data_yaml(text)
             names = data.get("names")
             if not isinstance(names, list) or not names:
-                raise ValueError("data.yaml 解析不到 names（需為 list 或 mapping）")
+                raise ValueError("data.yaml 解析不到 names")
 
             self.data_yaml_member = member
             base = norm_zip_path(str(Path(member).parent))
             self.data_yaml_base = "" if base in ("", ".", "./") else base
-
             self.orig_yaml = data
             self.orig_names = names[:]
             self.items = [{"old_id": i, "name": n} for i, n in enumerate(names)]
             self.refresh_display()
+            self._post_status(f"已載入：{zpath.name} | data.yaml: {member} | classes: {len(names)}")
+        except Exception as exc:
+            QMessageBox.critical(self, "錯誤", str(exc))
 
-            self.status.set(f"已載入：{zpath.name} | data.yaml: {member} | classes: {len(names)}")
-        except Exception as e:
-            messagebox.showerror("錯誤", str(e))
-            self.status.set("載入失敗")
-
-    # -----------------
-    # List display (old -> new arrow)
-    # -----------------
-    def refresh_display(self):
-        sel = self._selected_index()
-        self.listbox.delete(0, tk.END)
+    def refresh_display(self) -> None:
+        self.listbox.clear()
         for new_id, item in enumerate(self.items):
             old_id = item["old_id"]
             name = item["name"]
-            self.listbox.insert(tk.END, f"{old_id:>3}  {name}   →   {new_id}")
-        if sel is not None and sel < self.listbox.size():
-            self.listbox.selection_set(sel)
-        self.on_select()
+            text = f"{old_id:>3}  {name}   ->   {new_id}"
+            list_item = QListWidgetItem(text)
+            list_item.setData(Qt.UserRole, {"old_id": old_id, "name": name})
+            self.listbox.addItem(list_item)
+        if self.listbox.count() > 0:
+            self.listbox.setCurrentRow(0)
+        self._set_progress(0, 1)
 
-        self.progress_text.set("0/0")
-        self.pbar["value"] = 0
-        self.pbar["maximum"] = 1
-
-    def _selected_index(self):
-        sel = self.listbox.curselection()
-        if not sel:
-            return None
-        return int(sel[0])
-
-    def on_select(self, _evt=None):
-        idx = self._selected_index()
-        if idx is None:
-            self.sel_info.set("(無)")
-            self.rename_var.set("")
-            return
-        item = self.items[idx]
-        self.sel_info.set(f"old {item['old_id']}  name '{item['name']}'  (目前 new id = {idx})")
-        self.rename_var.set(item["name"])
-
-    def delete_selected(self):
-        idx = self._selected_index()
-        if idx is None:
-            return
-        del self.items[idx]
+    def _sync_items_from_view(self) -> None:
+        new_items = []
+        for i in range(self.listbox.count()):
+            item = self.listbox.item(i)
+            data = item.data(Qt.UserRole) or {}
+            old_id = int(data.get("old_id"))
+            name = str(data.get("name"))
+            new_items.append({"old_id": old_id, "name": name})
+        self.items = new_items
         self.refresh_display()
 
-    def clear_all(self):
-        if messagebox.askyesno("確認", "確定要清空列表嗎？（你可以再載入 zip 重新來）"):
-            self.items = []
-            self.refresh_display()
-
-    def apply_rename(self):
-        idx = self._selected_index()
-        if idx is None:
+    def on_select(self, row: int) -> None:
+        if row < 0 or row >= len(self.items):
+            self.lbl_sel.setText("(無)")
+            self.ent_rename.clear()
             return
-        new_name = self.rename_var.get().strip()
+        item = self.items[row]
+        self.lbl_sel.setText(f"old {item['old_id']} | name '{item['name']}' | new id {row}")
+        self.ent_rename.setText(item["name"])
+
+    def delete_selected(self) -> None:
+        row = self.listbox.currentRow()
+        if row < 0:
+            return
+        del self.items[row]
+        self.refresh_display()
+
+    def clear_all(self) -> None:
+        if QMessageBox.question(self, "確認", "確定要清空列表嗎？") != QMessageBox.Yes:
+            return
+        self.items = []
+        self.refresh_display()
+
+    def apply_rename(self) -> None:
+        row = self.listbox.currentRow()
+        if row < 0:
+            return
+        new_name = self.ent_rename.text().strip()
         if not new_name:
-            messagebox.showwarning("提示", "新名稱不能是空白")
+            QMessageBox.warning(self, "提示", "新名稱不能是空白")
             return
-        self.items[idx]["name"] = new_name
+        self.items[row]["name"] = new_name
         self.refresh_display()
+        self.listbox.setCurrentRow(row)
 
-    # -----------------
-    # Run processing
-    # -----------------
-    def run(self):
-        if not self.zip_path.get():
-            messagebox.showerror("錯誤", "請先選擇輸入 zip")
+    def run(self) -> None:
+        if self._worker and self._worker.is_alive():
+            QMessageBox.warning(self, "執行中", "目前正在處理中。")
+            return
+        if not self.ent_zip.text().strip():
+            QMessageBox.critical(self, "錯誤", "請先選擇輸入 zip")
             return
         if not self.data_yaml_member or not self.orig_names:
-            messagebox.showerror("錯誤", "尚未成功載入 data.yaml")
+            QMessageBox.critical(self, "錯誤", "尚未成功載入 data.yaml")
             return
         if len(self.items) == 0:
-            messagebox.showerror("錯誤", "labels 列表是空的（你可能刪光了）")
+            QMessageBox.critical(self, "錯誤", "labels 列表是空的")
             return
 
-        out_dir = Path(self.out_dir.get().strip()) if self.out_dir.get().strip() else self._script_dir()
+        out_dir = Path(self.ent_out_dir.text().strip()) if self.ent_out_dir.text().strip() else Path.cwd()
         out_dir.mkdir(parents=True, exist_ok=True)
-
-        out_name = self.out_name.get().strip() or "converted_dataset.zip"
+        out_name = self.ent_out_name.text().strip() or "converted_dataset.zip"
         if not out_name.lower().endswith(".zip"):
             out_name += ".zip"
         out_zip_path = out_dir / out_name
@@ -480,75 +458,69 @@ class App:
         removed = set(range(len(self.orig_names))) - set(kept_old_ids)
         id_map = {old_id: new_id for new_id, old_id in enumerate(kept_old_ids)}
 
-        keep_unlabeled = bool(self.keep_unlabeled.get())
-
-        threading.Thread(
+        self.btn_run.setEnabled(False)
+        self._running = True
+        self._worker = threading.Thread(
             target=self._process_zip_worker,
-            args=(Path(self.zip_path.get()), out_zip_path, id_map, removed, new_names, keep_unlabeled),
-            daemon=True
-        ).start()
+            args=(
+                Path(self.ent_zip.text().strip()),
+                out_zip_path,
+                id_map,
+                removed,
+                new_names,
+                self.chk_keep_unlabeled.isChecked(),
+            ),
+            daemon=True,
+        )
+        self._worker.start()
 
-    def _process_zip_worker(self, zip_path: Path, out_zip_path: Path,
-                            id_map: dict, removed: set, new_names: list, keep_unlabeled: bool):
+    def _process_zip_worker(
+        self,
+        zip_path: Path,
+        out_zip_path: Path,
+        id_map: dict,
+        removed: set,
+        new_names: list,
+        keep_unlabeled: bool,
+    ) -> None:
         try:
-            self._set_progress(0, 1, "準備中...")
-
+            self._set_progress(0, 1)
+            self._post_status("準備中...")
             with zipfile.ZipFile(zip_path, "r") as zf:
-                yaml_text = zip_read_text(zf, self.data_yaml_member)
-                data = parse_data_yaml(yaml_text)
-
+                data = parse_data_yaml(zip_read_text(zf, self.data_yaml_member))
                 base = self.data_yaml_base
 
-                # IMPORTANT:
-                # Output folder structure should follow these relative paths.
-                # We'll use exactly the same train/val/test strings in output yaml.
                 train_rel = str(data.get("train", "images/train"))
                 val_rel = str(data.get("val", "images/val"))
                 test_rel = str(data.get("test", "images/test"))
-
-                train_images = norm_zip_path(join_zip(base, train_rel))
-                val_images = norm_zip_path(join_zip(base, val_rel))
-                test_images = norm_zip_path(join_zip(base, test_rel))
-
-                split_images = {"train": train_images, "val": val_images, "test": test_images}
+                split_images = {
+                    "train": norm_zip_path(join_zip(base, train_rel)),
+                    "val": norm_zip_path(join_zip(base, val_rel)),
+                    "test": norm_zip_path(join_zip(base, test_rel)),
+                }
                 split_labels = {k: infer_labels_dir(v) for k, v in split_images.items()}
 
                 all_names = set(map(norm_zip_path, zf.namelist()))
-
-                # Collect images for progress (scan images dirs)
-                split_image_members = {}
+                split_image_members: dict[str, list[str]] = {}
                 total_images = 0
                 for split, img_dir in split_images.items():
                     imgs = list_images_in_zip(all_names, img_dir)
                     split_image_members[split] = imgs
                     total_images += len(imgs)
-
                 if total_images == 0:
-                    raise RuntimeError("在 zip 裡找不到任何圖片（請確認 data.yaml 的 train/val/test 指向正確資料夾）")
+                    raise RuntimeError("找不到任何圖片，請確認 data.yaml 的路徑設定。")
 
-                # Temp workspace auto cleaned
                 with tempfile.TemporaryDirectory() as td:
-                    td = Path(td)
-                    out_root = td / "dataset"
-
-                    # Phase 1: iterate images (so we can keep/skip unlabeled)
+                    out_root = Path(td) / "dataset"
                     kept = 0
                     processed = 0
-                    self._set_progress(0, total_images, f"處理 images/labels... (0/{total_images})")
+                    self._set_progress(0, total_images)
 
                     for split, imgs in split_image_members.items():
-                        img_out_dir = out_root / split_images[split]  # keep same structure as input
-                        lbl_out_dir = out_root / split_labels[split]
-                        img_out_dir.mkdir(parents=True, exist_ok=True)
-                        lbl_out_dir.mkdir(parents=True, exist_ok=True)
-
                         for img_member in imgs:
                             processed += 1
-
-                            # Find label member (may not exist)
                             lbl_member = find_label_for_image(all_names, split_labels[split], img_member)
                             new_lines = []
-
                             if lbl_member is not None:
                                 text = zip_read_text(zf, lbl_member)
                                 for line in text.splitlines():
@@ -559,42 +531,35 @@ class App:
                                         old_id = int(parts[0])
                                     except Exception:
                                         continue
-                                    if old_id in removed:
-                                        continue
-                                    if old_id not in id_map:
+                                    if old_id in removed or old_id not in id_map:
                                         continue
                                     new_id = id_map[old_id]
                                     new_lines.append(str(new_id) + " " + " ".join(parts[1:]))
 
-                            # Decide keep or skip
-                            if (lbl_member is None and not keep_unlabeled) or (lbl_member is not None and not new_lines and not keep_unlabeled):
-                                # skip unlabeled or emptied
+                            should_skip = (
+                                (lbl_member is None and not keep_unlabeled)
+                                or (lbl_member is not None and not new_lines and not keep_unlabeled)
+                            )
+                            if should_skip:
                                 if processed % 10 == 0 or processed == total_images:
-                                    self._set_progress(processed, total_images,
-                                                       f"處理 images/labels... ({processed}/{total_images}) | 已保留 {kept}")
+                                    self._post_status(f"處理中... ({processed}/{total_images}) | 已保留 {kept}")
+                                    self._set_progress(processed, total_images)
                                 continue
 
-                            # Copy image
                             out_img_path = out_root / img_member
                             ensure_parent_dir(out_img_path)
                             with zf.open(img_member, "r") as src, open(out_img_path, "wb") as dst:
                                 shutil.copyfileobj(src, dst)
 
-                            # Write label:
-                            # - If no label exists or becomes empty:
-                            #   - keep_unlabeled True => write empty .txt (most compatible)
-                            #   - else already skipped
                             out_lbl_path = out_root / split_labels[split] / (Path(img_member).stem + ".txt")
                             ensure_parent_dir(out_lbl_path)
                             out_lbl_path.write_text("\n".join(new_lines), encoding="utf-8")
 
                             kept += 1
-
                             if processed % 10 == 0 or processed == total_images:
-                                self._set_progress(processed, total_images,
-                                                   f"處理 images/labels... ({processed}/{total_images}) | 已保留 {kept}")
+                                self._post_status(f"處理中... ({processed}/{total_images}) | 已保留 {kept}")
+                                self._set_progress(processed, total_images)
 
-                    # Write new data.yaml (keep original train/val/test strings!)
                     new_yaml = dict(data) if isinstance(data, dict) else {}
                     new_yaml["path"] = "."
                     new_yaml["names"] = new_names
@@ -603,44 +568,47 @@ class App:
                     new_yaml["val"] = val_rel
                     new_yaml["test"] = test_rel
 
-                    yaml_str = yaml.safe_dump(new_yaml, allow_unicode=True, sort_keys=False) if yaml else _dump_yaml_simple(new_yaml)
-                    (out_root / join_zip(base, "data.yaml")).parent.mkdir(parents=True, exist_ok=True)
-                    (out_root / join_zip(base, "data.yaml")).write_text(yaml_str, encoding="utf-8")
+                    if yaml is not None:
+                        yaml_str = yaml.safe_dump(new_yaml, allow_unicode=True, sort_keys=False)
+                    else:
+                        yaml_str = _dump_yaml_simple(new_yaml)
+                    yaml_path = out_root / join_zip(base, "data.yaml")
+                    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+                    yaml_path.write_text(yaml_str, encoding="utf-8")
 
-                    # Phase 2: zip packaging with progress
                     files = [fp for fp in out_root.rglob("*") if fp.is_file()]
                     total_files = len(files)
                     if total_files == 0:
-                        raise RuntimeError("輸出資料夾沒有任何檔案可打包（可能全部被略過）")
-
+                        raise RuntimeError("輸出資料夾沒有任何檔案可打包。")
                     if out_zip_path.exists():
                         out_zip_path.unlink()
 
-                    self._set_progress(0, total_files, f"📦 打包 zip... (0/{total_files})")
-                    with zipfile.ZipFile(out_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as outzf:
-                        for j, fp in enumerate(files, start=1):
-                            rel = fp.relative_to(out_root).as_posix()
-                            outzf.write(fp, arcname=rel)
-                            if j % 20 == 0 or j == total_files:
-                                self._set_progress(j, total_files, f"📦 打包 zip... ({j}/{total_files})")
+                    self._set_progress(0, total_files)
+                    self._post_status("打包 zip 中...")
+                    with zipfile.ZipFile(out_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as out_zf:
+                        for i, fp in enumerate(files, start=1):
+                            out_zf.write(fp, arcname=fp.relative_to(out_root).as_posix())
+                            if i % 20 == 0 or i == total_files:
+                                self._set_progress(i, total_files)
+                                self._post_status(f"打包中... ({i}/{total_files})")
 
-            self._set_progress(1, 1, f"完成：輸出 {out_zip_path}")
-            messagebox.showinfo("完成", f"已輸出：\n{out_zip_path}")
+            self._set_progress(1, 1)
+            self._post_status(f"完成：{out_zip_path}")
+            self._finish_dialog = ("info", "完成", f"已輸出：\n{out_zip_path}")
+        except Exception as exc:
+            self._set_progress(0, 1)
+            self._post_status("失敗")
+            self._finish_dialog = ("error", "錯誤", str(exc))
+        finally:
+            self._running = False
 
-        except Exception as e:
-            self._set_progress(0, 1, "失敗")
-            messagebox.showerror("錯誤", str(e))
 
-    def _set_progress(self, cur: int, total: int, msg: str):
-        def _ui():
-            self.pbar["maximum"] = max(total, 1)
-            self.pbar["value"] = min(cur, total)
-            self.progress_text.set(f"{cur}/{total}")
-            self.status.set(msg)
-        self.root.after(0, _ui)
+def main() -> None:
+    app = QApplication([])
+    win = MainWindow()
+    win.show()
+    app.exec()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = App(root)
-    root.mainloop()
+    main()
