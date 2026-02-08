@@ -8,7 +8,7 @@ from logging import Logger
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QPushButton,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -39,8 +40,6 @@ from server_controller import ServerController
 from server import YoloServer
 from single_instance import SingleInstanceLock
 from tray_controller import TrayController
-from tray import create_tray_icon
-from tray_base import TrayBase
 
 
 def _resolve_exec_dir() -> Path:
@@ -110,18 +109,11 @@ class App(QMainWindow):
         self._deps_token: int = 0
         self._dep_result_queue: queue.Queue[tuple[int, Optional[str]]] = queue.Queue()
         self._device_queue: queue.Queue[str] = queue.Queue()
-        self._tray_queue: queue.Queue[str] = queue.Queue()
         self._log_viewer: Optional[LogViewer] = None
         self._instance_lock: Optional[SingleInstanceLock] = instance_lock
         self._quitting: bool = False
+        self.tray_icon: Optional[QSystemTrayIcon] = None
 
-        tray_icon_path = _select_icon_path()
-        self.tray: TrayBase = create_tray_icon(
-            tooltip="YOLO Server",
-            on_exit=self._enqueue_tray_exit,
-            on_show=self._enqueue_tray_show,
-            icon_path=str(tray_icon_path) if tray_icon_path else None,
-        )
         self.server_controller: ServerController = ServerController(
             app=self,
             config_path=CONFIG_PATH,
@@ -131,10 +123,10 @@ class App(QMainWindow):
         self.tray_controller: TrayController = TrayController(self)
 
         self._build_ui()
+        self.tray_controller.setup_tray(_select_icon_path)
         self._apply_config_to_ui()
         self._init_dep_status()
         self._apply_startup_setting()
-        self.tray.start()
 
         self._poll_timer: QTimer = QTimer(self)
         self._poll_timer.setInterval(200)
@@ -299,7 +291,7 @@ class App(QMainWindow):
             self.cfg.close_behavior = label_to_key.get(cmb_close.currentText(), "ask")
             self.cfg.save(CONFIG_PATH)
             self._apply_startup_setting()
-            self.tray.start()
+            self.tray_controller.ensure_tray_visible()
             dialog.accept()
 
         btn_save.clicked.connect(_save_and_close)
@@ -314,19 +306,9 @@ class App(QMainWindow):
         dialog_geo.moveCenter(parent_geo.center())
         dialog.move(dialog_geo.topLeft())
 
-    def _enqueue_tray_show(self) -> None:
-        self.tray_controller.enqueue_tray_show()
-
-    def _enqueue_tray_exit(self) -> None:
-        self.tray_controller.enqueue_tray_exit()
-
     def _poll_background_queues(self) -> None:
-        self._poll_tray_queue()
         self._poll_dep_queue()
         self._poll_device_queue()
-
-    def _poll_tray_queue(self) -> None:
-        self.tray_controller.poll_tray_queue()
 
     def _poll_dep_queue(self) -> None:
         self.server_controller.poll_dep_queue()
@@ -354,15 +336,6 @@ class App(QMainWindow):
 
     def _on_dep_preload_done(self, token: int, error_msg: Optional[str]) -> None:
         self.server_controller.on_dep_preload_done(token, error_msg)
-
-    def _minimize_to_tray(self) -> None:
-        self.tray_controller.minimize_to_tray()
-
-    def _restore_window(self) -> None:
-        self.tray_controller.restore_window()
-
-    def _exit_app(self) -> None:
-        self.tray_controller.exit_app()
 
     def _load_device_async(self) -> None:
         self.server_controller.load_device_async()

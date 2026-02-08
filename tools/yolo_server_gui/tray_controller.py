@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import os
-import queue
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtGui import QAction, QCloseEvent, QIcon
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
-from config_model import CLOSE_LABELS
 from config_service import build_startup_command, startup_cmd_path
 
 
@@ -18,31 +16,28 @@ class TrayController:
     def __init__(self, app: Any) -> None:
         self.app = app
 
-    def enqueue_tray_show(self) -> None:
-        """Queue tray show action."""
-        try:
-            self.app._tray_queue.put_nowait("show")
-        except Exception:
-            self.app.log_ctrl.exception("加入顯示事件到 tray 佇列失敗。")
+    def setup_tray(self, select_icon_path: Callable[[], Optional[Path]]) -> None:
+        """Initialize Qt native tray icon and context menu."""
+        self.app.tray_icon = QSystemTrayIcon(self.app)
+        icon_path = select_icon_path()
+        if icon_path is not None:
+            self.app.tray_icon.setIcon(QIcon(str(icon_path)))
+        self.app.tray_icon.setToolTip("YOLO Server")
+        menu = QMenu(self.app)
+        action_show = QAction("顯示", self.app)
+        action_exit = QAction("關閉", self.app)
+        action_show.triggered.connect(self.restore_window)
+        action_exit.triggered.connect(self.exit_app)
+        menu.addAction(action_show)
+        menu.addAction(action_exit)
+        self.app.tray_icon.setContextMenu(menu)
+        self.app.tray_icon.activated.connect(self.on_tray_activated)
+        self.app.tray_icon.show()
 
-    def enqueue_tray_exit(self) -> None:
-        """Queue tray exit action."""
-        try:
-            self.app._tray_queue.put_nowait("exit")
-        except Exception:
-            self.app.log_ctrl.exception("加入退出事件到 tray 佇列失敗。")
-
-    def poll_tray_queue(self) -> None:
-        """Drain tray queue and execute actions."""
-        try:
-            while True:
-                action: str = self.app._tray_queue.get_nowait()
-                if action == "show":
-                    self.restore_window()
-                elif action == "exit":
-                    self.exit_app()
-        except queue.Empty:
-            return
+    def ensure_tray_visible(self) -> None:
+        """Ensure tray icon is visible."""
+        if self.app.tray_icon is not None:
+            self.app.tray_icon.show()
 
     def apply_startup_setting(self) -> None:
         """Apply launch-on-startup setting on Windows."""
@@ -67,7 +62,8 @@ class TrayController:
             self.exit_app()
             return
         self.app.hide()
-        self.app.tray.start()
+        if self.app.tray_icon is not None:
+            self.app.tray_icon.show()
 
     def restore_window(self) -> None:
         """Restore app window from tray."""
@@ -85,7 +81,8 @@ class TrayController:
         except Exception:
             self.app.log_ctrl.exception("停止伺服器時發生錯誤。")
         try:
-            self.app.tray.stop()
+            if self.app.tray_icon is not None:
+                self.app.tray_icon.hide()
         except Exception:
             self.app.log_ctrl.exception("停止 tray 時發生錯誤。")
         try:
@@ -99,6 +96,11 @@ class TrayController:
             qt_app.quit()
             return
         self.app.close()
+
+    def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        """Handle tray activation events."""
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.restore_window()
 
     def handle_close_event(self, event: QCloseEvent) -> bool:
         """Handle close event based on configured behavior.
