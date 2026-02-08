@@ -74,10 +74,10 @@ class App(QMainWindow):
         self.history_controller = HistoryController(self)
 
         self._bind_config_traces()
+        self._load_weights(try_online=True)
         self._load_config()
         self._sync_last_paths()
         self._sync_model_mode()
-        self._load_weights(try_online=True)
         self._load_history()
 
         self._queue_timer = QTimer(self)
@@ -461,12 +461,13 @@ class App(QMainWindow):
             self._loading_config = True
             cfg = TrainerGuiConfig.from_file(CONFIG_PATH)
             self.cmb_task.setCurrentText(cfg.task or self.cmb_task.currentText())
+            self.cmb_model_family.setCurrentText(ALL_OPTION if str(cfg.model_family).lower() == "all" else str(cfg.model_family))
+            self.cmb_model_size.setCurrentText(ALL_OPTION if str(cfg.model_size).lower() == "all" else str(cfg.model_size))
+            self._apply_model_filters()
+            self.cmb_model.setCurrentText(cfg.model_pick or self.cmb_model.currentText())
             self.edt_dataset_zip.setText(normalize_path(cfg.dataset_zip or self.edt_dataset_zip.text()))
             self.edt_work_dir.setText(normalize_path(cfg.work_dir or self.edt_work_dir.text()))
             self.edt_out_zip_dir.setText(normalize_path(cfg.out_zip_dir or self.edt_out_zip_dir.text()))
-            self.cmb_model.setCurrentText(cfg.model_pick or self.cmb_model.currentText())
-            self.cmb_model_family.setCurrentText(ALL_OPTION if str(cfg.model_family).lower() == "all" else str(cfg.model_family))
-            self.cmb_model_size.setCurrentText(ALL_OPTION if str(cfg.model_size).lower() == "all" else str(cfg.model_size))
             self.edt_model_dir.setText(normalize_path(cfg.model_dir or self.edt_model_dir.text()))
             self.chk_use_custom_model.setChecked(bool(cfg.use_custom_model))
             self.edt_custom_model.setText(normalize_path(cfg.custom_model or self.edt_custom_model.text()))
