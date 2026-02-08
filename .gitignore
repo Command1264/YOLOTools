@@ -38,3 +38,6 @@ dist
 # 日誌
 log
 *.log
+
+# 測試使用
+test*
