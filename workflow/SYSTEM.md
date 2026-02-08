@@ -106,6 +106,8 @@ Guess the user's intent and thinking as much as possible, and propose actions yo
 - 避免範圍性/籠統命名（例如 Com/Common/Utils）；改用一看就懂用途的名稱。
 - Organize folders by role (examples): DllHost / TextService / Setup / Conversion / Scripts / Docs.
 - 資料夾按角色分層（例）：DllHost / TextService / Setup / Conversion / Scripts / Docs。
+- When reading external YAML or JSON files, unless explicitly stated otherwise, use serialization/deserialization and class-based models.
+- 當讀取外部 YAML 或 JSON 檔案，除非有特別說明，否則都使用序列化/反序列化，並且要使用 class 的方式。
 
 ### GUI Development Guidelines
 ### GUI 開發規範
