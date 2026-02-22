@@ -6,13 +6,15 @@ import os
 import threading
 from http import HTTPStatus
 from logging import Logger
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import cv2
 import numpy as np
 from flask import Flask, Response, request
 from werkzeug.serving import make_server
 
+from http_codec import RequestPayloadError, encode_detect_response, encode_error, parse_detect_request
+from http_schema import DetectResponse, DetectResult, DetectionItem
 from log_manager import LogController, get_logger
 from yolo_engine import Detection, YoloEngine
 
@@ -43,16 +45,16 @@ def _pick_top1(dets: list[Detection]) -> Tuple[str, float]:
     best: Detection = max(dets, key=lambda d: d.conf)
     return best.class_name, float(best.conf)
 
-def _dets_to_payload(dets: list[Detection]) -> list[Dict[str, Any]]:
-    payload: list[Dict[str, Any]] = []
+def _dets_to_payload(dets: list[Detection]) -> list[DetectionItem]:
+    payload: list[DetectionItem] = []
     for d in dets or []:
         payload.append(
-            {
-                "classId": int(d.class_id),
-                "className": d.class_name,
-                "conf": float(d.conf),
-                "xyxy": [int(v) for v in d.xyxy],
-            }
+            DetectionItem(
+                class_id=int(d.class_id),
+                class_name=d.class_name,
+                conf=float(d.conf),
+                xyxy=[int(v) for v in d.xyxy],
+            )
         )
     return payload
 
@@ -144,7 +146,7 @@ class YoloServer:
     def _text_response(self, status: HTTPStatus, text: str) -> Response:
         return Response(text.encode("utf-8"), status=status.value, content_type="text/plain; charset=utf-8")
 
-    def _json_response(self, status: HTTPStatus, payload: Dict[str, Any]) -> Response:
+    def _json_response(self, status: HTTPStatus, payload: dict[str, object]) -> Response:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         return Response(data, status=status.value, content_type="application/json; charset=utf-8")
 
@@ -167,37 +169,34 @@ class YoloServer:
 
     def _handle_detect(self) -> Response:
         payload: Any = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            self._log_ctrl.warning("Detect request with invalid JSON.")
-            return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
+        try:
+            parsed_request = parse_detect_request(payload)
+        except RequestPayloadError as exc:
+            self._log_ctrl.warning("Detect request invalid: %s", exc)
+            return self._json_response(HTTPStatus.BAD_REQUEST, encode_error(str(exc)))
 
-        thread_name: str = payload.get("threadName", "")
-        if "image" in payload:
-            result: Dict[str, Any] = self._infer_single(payload.get("image", ""), self.conf)
-            return self._json_response(HTTPStatus.OK, {"threadName": thread_name, "result": result})
+        conf = self.conf if parsed_request.conf is None else parsed_request.conf
+        iou = parsed_request.iou
+        results = [self._infer_single(image_b64=img, conf=conf, iou=iou) for img in parsed_request.images]
+        result_payload: DetectResult | list[DetectResult]
+        if parsed_request.is_batch:
+            result_payload = results
+        else:
+            result_payload = results[0]
+        response_payload = DetectResponse(
+            thread_name=parsed_request.thread_name,
+            result=result_payload,
+        )
+        return self._json_response(HTTPStatus.OK, encode_detect_response(response_payload))
 
-        if "images" in payload:
-            images: Any = payload.get("images", [])
-            if not isinstance(images, list):
-                self._log_ctrl.warning("Detect request with invalid images list.")
-                return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "images must be list"})
-            results: list[Dict[str, Any]] = [self._infer_single(img, self.conf) for img in images]
-            return self._json_response(HTTPStatus.OK, {"threadName": thread_name, "result": results})
-
-        return self._json_response(HTTPStatus.BAD_REQUEST, {"error": "missing image or images"})
-
-    def _infer_single(self, image_b64: str, conf: float) -> Dict[str, Any]:
+    def _infer_single(self, image_b64: str, conf: float, iou: float | None) -> DetectResult:
         img: Optional[np.ndarray] = _decode_base64_image(image_b64)
         if img is None:
-            return {"classifyType": "none", "percentage": 0.0, "detections": []}
+            return DetectResult(classify_type="none", percentage=0.0, detections=[])
         try:
-            _, dets = self._engine.infer(img, conf=conf)
+            _, dets = self._engine.infer(img, conf=conf, iou=iou)
         except Exception:
             self._log_ctrl.exception("Inference failed.")
-            return {"classifyType": "none", "percentage": 0.0, "detections": []}
+            return DetectResult(classify_type="none", percentage=0.0, detections=[])
         cls_name, score = _pick_top1(dets)
-        return {
-            "classifyType": cls_name,
-            "percentage": score,
-            "detections": _dets_to_payload(dets),
-        }
+        return DetectResult(classify_type=cls_name, percentage=score, detections=_dets_to_payload(dets))
