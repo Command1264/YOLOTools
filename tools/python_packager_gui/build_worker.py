@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import locale
 import shlex
 import subprocess
 import sys
@@ -59,6 +60,7 @@ class BuildWorker(QtCore.QThread):
             return
         self.output_line.emit(subprocess.list2cmdline(cmd))
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        stream_encoding = locale.getpreferredencoding(False) or "utf-8"
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -66,7 +68,8 @@ class BuildWorker(QtCore.QThread):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                encoding="utf-8",
+                encoding=stream_encoding,
+                errors="replace",
                 creationflags=creationflags,
             )
         except Exception as exc:
