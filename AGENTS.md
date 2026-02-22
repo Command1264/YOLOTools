@@ -7,8 +7,8 @@ This project trains and validates YOLO models to detect fire and smoke.
 ## Tech Stack
 - Python 3.12.10
 - Python environment path: `./YOLOToolsEnv/Scripts/python`
-- ultralytics 8.4.7
-- torch 2.9.1+cu126
+- ultralytics 8.4.14
+- torch 2.10.0+cu126
 - See `requirements.txt` for the rest
 
 ## Disallowed Packages
@@ -107,8 +107,8 @@ async def get_user_profile(user_id: int) -> User:
 ## 技術棧
 - Python 3.12.10
 - Python 環境路徑：`./YOLOToolsEnv/Scripts/python`
-- ultralytics 8.4.7
-- torch 2.9.1+cu126
+- ultralytics 8.4.14
+- torch 2.10.0+cu126
 - 其餘請見 `requirements.txt`
 
 ## 禁止使用的套件
