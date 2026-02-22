@@ -115,6 +115,7 @@ class App(QMainWindow):
         self._last_frame = None
         self._frame_buf = None
         self._loading_config = False
+        self._suspend_save = True
         self._last_model_dir: Optional[Path] = None
         self._last_input_dir: Optional[Path] = None
         self._saved_conf_before_ignore: Optional[float] = None
@@ -125,6 +126,7 @@ class App(QMainWindow):
 
         self._build_ui()
         self._load_config()
+        self._suspend_save = False
         self._log("就緒。請選擇模型與圖片/影片。")
         self._try_preview_on_start()
 
@@ -557,7 +559,7 @@ class App(QMainWindow):
             self.lbl_status.setText("已停止（重新選擇）")
 
     def _save_config(self) -> None:
-        if self._loading_config:
+        if self._loading_config or self._suspend_save:
             return
         try:
             data = {
@@ -607,6 +609,7 @@ class App(QMainWindow):
             return
         finally:
             self._loading_config = False
+            self._suspend_save = False
 
     def _conf_value(self) -> float:
         try:
