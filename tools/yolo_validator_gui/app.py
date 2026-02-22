@@ -176,6 +176,7 @@ class App(QMainWindow):
         self.sld_conf.valueChanged.connect(lambda v: self.ent_conf.setText(f"{v/100:.2f}"))
         self.ent_conf = QLineEdit("0.70", row_conf)
         self.ent_conf.setMaximumWidth(80)
+        self.ent_conf.editingFinished.connect(self._sync_conf_from_text)
         row_conf_l.addWidget(self.sld_conf, 1)
         row_conf_l.addWidget(self.ent_conf)
         opt_form.addRow("conf:", row_conf)
@@ -189,6 +190,7 @@ class App(QMainWindow):
         self.sld_iou.valueChanged.connect(lambda v: self.ent_iou.setText(f"{v/100:.2f}"))
         self.ent_iou = QLineEdit("0.45", row_iou)
         self.ent_iou.setMaximumWidth(80)
+        self.ent_iou.editingFinished.connect(self._sync_iou_from_text)
         row_iou_l.addWidget(self.sld_iou, 1)
         row_iou_l.addWidget(self.ent_iou)
         opt_form.addRow("iou:", row_iou)
@@ -587,6 +589,22 @@ class App(QMainWindow):
         except Exception:
             v = 0.45
         return max(0.0, min(1.0, v))
+
+    def _sync_conf_from_text(self) -> None:
+        conf = self._conf_value()
+        slider_value = int(round(conf * 100))
+        if self.sld_conf.value() != slider_value:
+            self.sld_conf.setValue(slider_value)
+        self.ent_conf.setText(f"{conf:.2f}")
+        self._save_config()
+
+    def _sync_iou_from_text(self) -> None:
+        iou = self._iou_value()
+        slider_value = int(round(iou * 100))
+        if self.sld_iou.value() != slider_value:
+            self.sld_iou.setValue(slider_value)
+        self.ent_iou.setText(f"{iou:.2f}")
+        self._save_config()
 
     @staticmethod
     def _resolve_initial_dir(path_value: str, last_dir: Optional[Path]) -> str:
