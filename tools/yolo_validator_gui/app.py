@@ -435,8 +435,15 @@ class App(QMainWindow):
         if not self.chk_show.isChecked():
             self._emit("frame", (frame_bgr, "顯示原始影像（未顯示判斷）"))
             return
+        conf = self._conf_value()
+        iou = self._iou_value()
+        if self.chk_ignore_conf.isChecked():
+            conf = 0.01
+        if self.chk_ignore_iou.isChecked():
+            iou = 1.0
         if http_client is not None:
             dets = http_client.infer(frame_bgr)
+            dets = self._filter_http_detections(dets, conf=conf, iou=iou)
             annotated = frame_bgr.copy()
             for d in dets:
                 xyxy = d.get("xyxy", [])
@@ -451,12 +458,6 @@ class App(QMainWindow):
             info = "未偵測到物件" if not dets else f"偵測 {len(dets)} 個"
             self._emit("frame", (annotated, info))
             return
-        conf = self._conf_value()
-        iou = self._iou_value()
-        if self.chk_ignore_conf.isChecked():
-            conf = 0.01
-        if self.chk_ignore_iou.isChecked():
-            iou = 1.0
         result, dets = engine.infer(frame_bgr, conf=conf, iou=iou)
         annotated = result.plot() if result is not None else frame_bgr
         info = "未偵測到物件" if not dets else f"偵測 {len(dets)} 個"
@@ -713,16 +714,77 @@ class App(QMainWindow):
         self.ent_model.setEnabled(not use_http)
         self.btn_model.setEnabled(not use_http)
         self.ent_device.setEnabled(not use_http)
-        self.chk_ignore_conf.setEnabled(not use_http)
-        self.chk_ignore_iou.setEnabled(not use_http)
-        if use_http:
-            self.sld_conf.setEnabled(False)
-            self.ent_conf.setEnabled(False)
-            self.sld_iou.setEnabled(False)
-            self.ent_iou.setEnabled(False)
-            return
+        self.chk_ignore_conf.setEnabled(True)
+        self.chk_ignore_iou.setEnabled(True)
         self._apply_conf_ignore_state(self.chk_ignore_conf.isChecked())
         self._apply_iou_ignore_state(self.chk_ignore_iou.isChecked())
+
+    def _filter_http_detections(self, detections: list[dict], conf: float, iou: float) -> list[dict]:
+        filtered: list[dict] = []
+        for det in detections:
+            xyxy = det.get("xyxy", [])
+            if not isinstance(xyxy, list) or len(xyxy) != 4:
+                continue
+            try:
+                score = float(det.get("conf", 0.0))
+            except Exception:
+                score = 0.0
+            if score < conf:
+                continue
+            filtered.append(det)
+        if not filtered:
+            return []
+        if iou >= 1.0:
+            return filtered
+        return self._nms_detections(filtered, iou)
+
+    def _nms_detections(self, detections: list[dict], iou_threshold: float) -> list[dict]:
+        by_class: dict[str, list[dict]] = {}
+        for det in detections:
+            key = str(det.get("classId", det.get("className", "")))
+            by_class.setdefault(key, []).append(det)
+
+        kept: list[dict] = []
+        for group in by_class.values():
+            ordered = sorted(group, key=lambda d: float(d.get("conf", 0.0)), reverse=True)
+            while ordered:
+                current = ordered.pop(0)
+                kept.append(current)
+                current_box = current.get("xyxy", [])
+                remaining: list[dict] = []
+                for candidate in ordered:
+                    candidate_box = candidate.get("xyxy", [])
+                    if self._bbox_iou(current_box, candidate_box) <= iou_threshold:
+                        remaining.append(candidate)
+                ordered = remaining
+        return kept
+
+    @staticmethod
+    def _bbox_iou(box_a, box_b) -> float:
+        if not (isinstance(box_a, list) and isinstance(box_b, list) and len(box_a) == 4 and len(box_b) == 4):
+            return 0.0
+        try:
+            ax1, ay1, ax2, ay2 = [float(v) for v in box_a]
+            bx1, by1, bx2, by2 = [float(v) for v in box_b]
+        except Exception:
+            return 0.0
+
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+        if inter_area <= 0.0:
+            return 0.0
+
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter_area
+        if union <= 0.0:
+            return 0.0
+        return inter_area / union
 
     def _config_conf_value(self) -> float:
         if self.chk_ignore_conf.isChecked() and self._saved_conf_before_ignore is not None:
