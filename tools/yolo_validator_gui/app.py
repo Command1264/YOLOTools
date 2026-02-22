@@ -176,8 +176,10 @@ class App(QMainWindow):
         row_play_l.setContentsMargins(0, 0, 0, 0)
         self.ent_interval = QLineEdit("1.0", row_play)
         self.ent_interval.setMaximumWidth(80)
+        self.ent_interval.textChanged.connect(self._save_config)
         self.cmb_order = QComboBox(row_play)
         self.cmb_order.addItems(["圖片優先", "影片優先"])
+        self.cmb_order.currentIndexChanged.connect(self._save_config)
         row_play_l.addWidget(QLabel("間隔(秒):", row_play))
         row_play_l.addWidget(self.ent_interval)
         row_play_l.addSpacing(16)
@@ -196,7 +198,7 @@ class App(QMainWindow):
         self.sld_conf = QSlider(Qt.Horizontal, row_conf)
         self.sld_conf.setRange(1, 100)
         self.sld_conf.setValue(70)
-        self.sld_conf.valueChanged.connect(lambda v: self.ent_conf.setText(f"{v/100:.2f}"))
+        self.sld_conf.valueChanged.connect(self._on_conf_slider_changed)
         self.ent_conf = QLineEdit("0.70", row_conf)
         self.ent_conf.setMaximumWidth(80)
         self.chk_ignore_conf = QCheckBox("忽略 conf", row_conf)
@@ -213,7 +215,7 @@ class App(QMainWindow):
         self.sld_iou = QSlider(Qt.Horizontal, row_iou)
         self.sld_iou.setRange(0, 100)
         self.sld_iou.setValue(45)
-        self.sld_iou.valueChanged.connect(lambda v: self.ent_iou.setText(f"{v/100:.2f}"))
+        self.sld_iou.valueChanged.connect(self._on_iou_slider_changed)
         self.ent_iou = QLineEdit("0.45", row_iou)
         self.ent_iou.setMaximumWidth(80)
         self.chk_ignore_iou = QCheckBox("忽略 iou", row_iou)
@@ -233,8 +235,10 @@ class App(QMainWindow):
         row_more_l.setContentsMargins(0, 0, 0, 0)
         self.ent_device = QLineEdit("", row_more)
         self.ent_device.setPlaceholderText("空白=auto")
+        self.ent_device.textChanged.connect(self._save_config)
         self.chk_show = QCheckBox("顯示 YOLO 判斷框與標籤", opt_box)
         self.chk_show.setChecked(True)
+        self.chk_show.toggled.connect(self._save_config)
         row_more_l.addWidget(QLabel("device:", row_more))
         row_more_l.addWidget(self.ent_device)
         row_more_l.addStretch(1)
@@ -247,6 +251,7 @@ class App(QMainWindow):
         self.chk_use_http = QCheckBox("使用 HTTP 推論", row_http)
         self.chk_use_http.toggled.connect(self._on_use_http_toggled)
         self.ent_http_url = QLineEdit(DEFAULT_HTTP_URL, row_http)
+        self.ent_http_url.textChanged.connect(self._save_config)
         row_http_l.addWidget(self.chk_use_http)
         row_http_l.addWidget(QLabel("HTTP URL:", row_http))
         row_http_l.addWidget(self.ent_http_url, 1)
@@ -458,10 +463,7 @@ class App(QMainWindow):
         self._emit("frame", (annotated, info))
 
     def _sleep_interval(self, token: int) -> None:
-        try:
-            interval = max(0.0, float(self.ent_interval.text()))
-        except Exception:
-            interval = 0.0
+        interval = self._interval_value()
         end = time.time() + interval
         while time.time() < end:
             if self._stop_event.is_set() or token != self._ui_token:
@@ -565,13 +567,13 @@ class App(QMainWindow):
             data = {
                 "model_path": self.ent_model.text(),
                 "input_path": self.ent_input.text(),
-                "conf": self._conf_value(),
-                "iou": self._iou_value(),
+                "conf": self._config_conf_value(),
+                "iou": self._config_iou_value(),
                 "device": self.ent_device.text(),
                 "show": self.chk_show.isChecked(),
                 "ignore_conf": self.chk_ignore_conf.isChecked(),
                 "ignore_iou": self.chk_ignore_iou.isChecked(),
-                "interval_sec": self.ent_interval.text(),
+                "interval_sec": self._interval_value(),
                 "order": self._order_map.get(self.cmb_order.currentText(), "images_first"),
                 "use_http": self.chk_use_http.isChecked(),
                 "http_url": self.ent_http_url.text(),
@@ -625,6 +627,13 @@ class App(QMainWindow):
             v = 0.45
         return max(0.0, min(1.0, v))
 
+    def _interval_value(self) -> float:
+        try:
+            v = float(self.ent_interval.text())
+        except Exception:
+            v = 1.0
+        return max(0.0, v)
+
     def _sync_conf_from_text(self) -> None:
         conf = self._conf_value()
         slider_value = int(round(conf * 100))
@@ -639,6 +648,14 @@ class App(QMainWindow):
         if self.sld_iou.value() != slider_value:
             self.sld_iou.setValue(slider_value)
         self.ent_iou.setText(f"{iou:.2f}")
+        self._save_config()
+
+    def _on_conf_slider_changed(self, value: int) -> None:
+        self.ent_conf.setText(f"{value/100:.2f}")
+        self._save_config()
+
+    def _on_iou_slider_changed(self, value: int) -> None:
+        self.ent_iou.setText(f"{value/100:.2f}")
         self._save_config()
 
     def _on_ignore_conf_toggled(self, checked: bool) -> None:
@@ -706,6 +723,16 @@ class App(QMainWindow):
             return
         self._apply_conf_ignore_state(self.chk_ignore_conf.isChecked())
         self._apply_iou_ignore_state(self.chk_ignore_iou.isChecked())
+
+    def _config_conf_value(self) -> float:
+        if self.chk_ignore_conf.isChecked() and self._saved_conf_before_ignore is not None:
+            return max(0.01, min(1.0, float(self._saved_conf_before_ignore)))
+        return self._conf_value()
+
+    def _config_iou_value(self) -> float:
+        if self.chk_ignore_iou.isChecked() and self._saved_iou_before_ignore is not None:
+            return max(0.0, min(1.0, float(self._saved_iou_before_ignore)))
+        return self._iou_value()
 
     @staticmethod
     def _resolve_initial_dir(path_value: str, last_dir: Optional[Path]) -> str:
