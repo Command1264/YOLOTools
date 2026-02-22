@@ -146,10 +146,10 @@ class App(QMainWindow):
         row_model_l.setContentsMargins(0, 0, 0, 0)
         self.ent_model = QLineEdit(row_model)
         self.ent_model.editingFinished.connect(self._save_config)
-        btn_model = QPushButton("瀏覽...", row_model)
-        btn_model.clicked.connect(self.browse_model)
+        self.btn_model = QPushButton("瀏覽...", row_model)
+        self.btn_model.clicked.connect(self.browse_model)
         row_model_l.addWidget(self.ent_model, 1)
-        row_model_l.addWidget(btn_model)
+        row_model_l.addWidget(self.btn_model)
         path_form.addRow("YOLO 模型 (.pt):", row_model)
 
         row_input = QWidget(path_box)
@@ -167,6 +167,24 @@ class App(QMainWindow):
         path_form.addRow("圖片或影片:", row_input)
         layout.addWidget(path_box)
 
+        play_box = QGroupBox("圖片/影片連續播放設定", root)
+        play_form = QFormLayout(play_box)
+        row_play = QWidget(play_box)
+        row_play_l = QHBoxLayout(row_play)
+        row_play_l.setContentsMargins(0, 0, 0, 0)
+        self.ent_interval = QLineEdit("1.0", row_play)
+        self.ent_interval.setMaximumWidth(80)
+        self.cmb_order = QComboBox(row_play)
+        self.cmb_order.addItems(["圖片優先", "影片優先"])
+        row_play_l.addWidget(QLabel("間隔(秒):", row_play))
+        row_play_l.addWidget(self.ent_interval)
+        row_play_l.addSpacing(16)
+        row_play_l.addWidget(QLabel("順序:", row_play))
+        row_play_l.addWidget(self.cmb_order)
+        row_play_l.addStretch(1)
+        play_form.addRow(row_play)
+        layout.addWidget(play_box)
+
         opt_box = QGroupBox("推論設定", root)
         opt_form = QFormLayout(opt_box)
 
@@ -179,9 +197,12 @@ class App(QMainWindow):
         self.sld_conf.valueChanged.connect(lambda v: self.ent_conf.setText(f"{v/100:.2f}"))
         self.ent_conf = QLineEdit("0.70", row_conf)
         self.ent_conf.setMaximumWidth(80)
+        self.chk_ignore_conf = QCheckBox("忽略 conf", row_conf)
+        self.chk_ignore_conf.toggled.connect(self._on_ignore_conf_toggled)
         self.ent_conf.editingFinished.connect(self._sync_conf_from_text)
         row_conf_l.addWidget(self.sld_conf, 1)
         row_conf_l.addWidget(self.ent_conf)
+        row_conf_l.addWidget(self.chk_ignore_conf)
         opt_form.addRow("conf:", row_conf)
 
         row_iou = QWidget(opt_box)
@@ -193,48 +214,43 @@ class App(QMainWindow):
         self.sld_iou.valueChanged.connect(lambda v: self.ent_iou.setText(f"{v/100:.2f}"))
         self.ent_iou = QLineEdit("0.45", row_iou)
         self.ent_iou.setMaximumWidth(80)
+        self.chk_ignore_iou = QCheckBox("忽略 iou", row_iou)
+        self.chk_ignore_iou.toggled.connect(self._on_ignore_iou_toggled)
         self.ent_iou.editingFinished.connect(self._sync_iou_from_text)
         row_iou_l.addWidget(self.sld_iou, 1)
         row_iou_l.addWidget(self.ent_iou)
+        row_iou_l.addWidget(self.chk_ignore_iou)
         opt_form.addRow("iou:", row_iou)
+
+        ignore_width = max(self.chk_ignore_conf.sizeHint().width(), self.chk_ignore_iou.sizeHint().width())
+        self.chk_ignore_conf.setFixedWidth(ignore_width)
+        self.chk_ignore_iou.setFixedWidth(ignore_width)
 
         row_more = QWidget(opt_box)
         row_more_l = QHBoxLayout(row_more)
         row_more_l.setContentsMargins(0, 0, 0, 0)
         self.ent_device = QLineEdit("", row_more)
         self.ent_device.setPlaceholderText("空白=auto")
-        self.chk_show = QCheckBox("顯示 YOLO 判斷框與標籤", row_more)
+        self.chk_show = QCheckBox("顯示 YOLO 判斷框與標籤", opt_box)
         self.chk_show.setChecked(True)
-        self.chk_ignore_conf = QCheckBox("忽略 conf", row_more)
-        self.chk_ignore_iou = QCheckBox("忽略 iou", row_more)
-        self.chk_ignore_conf.toggled.connect(self._on_ignore_conf_toggled)
-        self.chk_ignore_iou.toggled.connect(self._on_ignore_iou_toggled)
-        self.ent_interval = QLineEdit("1.0", row_more)
-        self.ent_interval.setMaximumWidth(80)
-        self.cmb_order = QComboBox(row_more)
-        self.cmb_order.addItems(["圖片優先", "影片優先"])
         row_more_l.addWidget(QLabel("device:", row_more))
         row_more_l.addWidget(self.ent_device)
-        row_more_l.addWidget(self.chk_show)
-        row_more_l.addWidget(self.chk_ignore_conf)
-        row_more_l.addWidget(self.chk_ignore_iou)
-        row_more_l.addWidget(QLabel("間隔(秒):", row_more))
-        row_more_l.addWidget(self.ent_interval)
-        row_more_l.addWidget(QLabel("順序:", row_more))
-        row_more_l.addWidget(self.cmb_order)
         row_more_l.addStretch(1)
         opt_form.addRow(row_more)
+        opt_form.addRow("顯示:", self.chk_show)
 
         row_http = QWidget(opt_box)
         row_http_l = QHBoxLayout(row_http)
         row_http_l.setContentsMargins(0, 0, 0, 0)
         self.chk_use_http = QCheckBox("使用 HTTP 推論", row_http)
+        self.chk_use_http.toggled.connect(self._on_use_http_toggled)
         self.ent_http_url = QLineEdit(DEFAULT_HTTP_URL, row_http)
         row_http_l.addWidget(self.chk_use_http)
         row_http_l.addWidget(QLabel("HTTP URL:", row_http))
         row_http_l.addWidget(self.ent_http_url, 1)
         opt_form.addRow(row_http)
         layout.addWidget(opt_box)
+        self._apply_http_mode_state(self.chk_use_http.isChecked())
 
         act = QWidget(root)
         act_l = QHBoxLayout(act)
@@ -586,6 +602,7 @@ class App(QMainWindow):
             self.cmb_order.setCurrentText(self._order_map_rev.get(data.get("order", "images_first"), "圖片優先"))
             self.chk_use_http.setChecked(bool(data.get("use_http", False)))
             self.ent_http_url.setText(data.get("http_url", DEFAULT_HTTP_URL))
+            self._apply_http_mode_state(self.chk_use_http.isChecked())
         except Exception:
             return
         finally:
@@ -629,6 +646,10 @@ class App(QMainWindow):
         self._apply_iou_ignore_state(checked)
         self._save_config()
 
+    def _on_use_http_toggled(self, checked: bool) -> None:
+        self._apply_http_mode_state(checked)
+        self._save_config()
+
     def _apply_conf_ignore_state(self, checked: bool) -> None:
         if checked:
             if self._saved_conf_before_ignore is None:
@@ -666,6 +687,22 @@ class App(QMainWindow):
             self.ent_iou.setText(f"{restored:.2f}")
         else:
             self._sync_iou_from_text()
+
+    def _apply_http_mode_state(self, use_http: bool) -> None:
+        self.ent_http_url.setEnabled(use_http)
+        self.ent_model.setEnabled(not use_http)
+        self.btn_model.setEnabled(not use_http)
+        self.ent_device.setEnabled(not use_http)
+        self.chk_ignore_conf.setEnabled(not use_http)
+        self.chk_ignore_iou.setEnabled(not use_http)
+        if use_http:
+            self.sld_conf.setEnabled(False)
+            self.ent_conf.setEnabled(False)
+            self.sld_iou.setEnabled(False)
+            self.ent_iou.setEnabled(False)
+            return
+        self._apply_conf_ignore_state(self.chk_ignore_conf.isChecked())
+        self._apply_iou_ignore_state(self.chk_ignore_iou.isChecked())
 
     @staticmethod
     def _resolve_initial_dir(path_value: str, last_dir: Optional[Path]) -> str:
