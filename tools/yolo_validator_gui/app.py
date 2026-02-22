@@ -119,6 +119,7 @@ class App(QMainWindow):
         self._last_input_dir: Optional[Path] = None
         self._saved_conf_before_ignore: Optional[float] = None
         self._saved_iou_before_ignore: Optional[float] = None
+        self._did_initial_render_after_show = False
         self._order_map = {"圖片優先": "images_first", "影片優先": "videos_first"}
         self._order_map_rev = {v: k for k, v in self._order_map.items()}
 
@@ -306,6 +307,14 @@ class App(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if self._last_frame is not None:
+            self._render_frame(self._last_frame)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._did_initial_render_after_show:
+            return
+        self._did_initial_render_after_show = True
         if self._last_frame is not None:
             self._render_frame(self._last_frame)
 
