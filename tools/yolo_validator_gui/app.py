@@ -117,6 +117,8 @@ class App(QMainWindow):
         self._loading_config = False
         self._last_model_dir: Optional[Path] = None
         self._last_input_dir: Optional[Path] = None
+        self._saved_conf_before_ignore: Optional[float] = None
+        self._saved_iou_before_ignore: Optional[float] = None
         self._order_map = {"圖片優先": "images_first", "影片優先": "videos_first"}
         self._order_map_rev = {v: k for k, v in self._order_map.items()}
 
@@ -204,6 +206,8 @@ class App(QMainWindow):
         self.chk_show.setChecked(True)
         self.chk_ignore_conf = QCheckBox("忽略 conf", row_more)
         self.chk_ignore_iou = QCheckBox("忽略 iou", row_more)
+        self.chk_ignore_conf.toggled.connect(self._on_ignore_conf_toggled)
+        self.chk_ignore_iou.toggled.connect(self._on_ignore_iou_toggled)
         self.ent_interval = QLineEdit("1.0", row_more)
         self.ent_interval.setMaximumWidth(80)
         self.cmb_order = QComboBox(row_more)
@@ -567,6 +571,8 @@ class App(QMainWindow):
             self.chk_show.setChecked(bool(data.get("show", True)))
             self.chk_ignore_conf.setChecked(bool(data.get("ignore_conf", False)))
             self.chk_ignore_iou.setChecked(bool(data.get("ignore_iou", False)))
+            self._apply_conf_ignore_state(self.chk_ignore_conf.isChecked())
+            self._apply_iou_ignore_state(self.chk_ignore_iou.isChecked())
             self.ent_interval.setText(str(data.get("interval_sec", "1.0")))
             self.cmb_order.setCurrentText(self._order_map_rev.get(data.get("order", "images_first"), "圖片優先"))
             self.chk_use_http.setChecked(bool(data.get("use_http", False)))
@@ -605,6 +611,52 @@ class App(QMainWindow):
             self.sld_iou.setValue(slider_value)
         self.ent_iou.setText(f"{iou:.2f}")
         self._save_config()
+
+    def _on_ignore_conf_toggled(self, checked: bool) -> None:
+        self._apply_conf_ignore_state(checked)
+        self._save_config()
+
+    def _on_ignore_iou_toggled(self, checked: bool) -> None:
+        self._apply_iou_ignore_state(checked)
+        self._save_config()
+
+    def _apply_conf_ignore_state(self, checked: bool) -> None:
+        if checked:
+            if self._saved_conf_before_ignore is None:
+                self._saved_conf_before_ignore = self._conf_value()
+            self.sld_conf.setValue(1)
+            self.ent_conf.setText("0.01")
+            self.sld_conf.setEnabled(False)
+            self.ent_conf.setEnabled(False)
+            return
+        self.sld_conf.setEnabled(True)
+        self.ent_conf.setEnabled(True)
+        if self._saved_conf_before_ignore is not None:
+            restored = max(0.01, min(1.0, self._saved_conf_before_ignore))
+            self._saved_conf_before_ignore = None
+            self.sld_conf.setValue(int(round(restored * 100)))
+            self.ent_conf.setText(f"{restored:.2f}")
+        else:
+            self._sync_conf_from_text()
+
+    def _apply_iou_ignore_state(self, checked: bool) -> None:
+        if checked:
+            if self._saved_iou_before_ignore is None:
+                self._saved_iou_before_ignore = self._iou_value()
+            self.sld_iou.setValue(100)
+            self.ent_iou.setText("1.00")
+            self.sld_iou.setEnabled(False)
+            self.ent_iou.setEnabled(False)
+            return
+        self.sld_iou.setEnabled(True)
+        self.ent_iou.setEnabled(True)
+        if self._saved_iou_before_ignore is not None:
+            restored = max(0.0, min(1.0, self._saved_iou_before_ignore))
+            self._saved_iou_before_ignore = None
+            self.sld_iou.setValue(int(round(restored * 100)))
+            self.ent_iou.setText(f"{restored:.2f}")
+        else:
+            self._sync_iou_from_text()
 
     @staticmethod
     def _resolve_initial_dir(path_value: str, last_dir: Optional[Path]) -> str:
