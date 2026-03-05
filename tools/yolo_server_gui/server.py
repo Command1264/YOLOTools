@@ -4,19 +4,27 @@ import base64
 import json
 import os
 import threading
+import time
 from http import HTTPStatus
 from logging import Logger
 from typing import Any, Optional, Tuple
 
 import cv2
 import numpy as np
-from flask import Flask, Response, request
-from werkzeug.serving import make_server
+from flask import Flask, Response, g, request
+from werkzeug.serving import WSGIRequestHandler, make_server
 
 from http_codec import RequestPayloadError, encode_detect_response, encode_error, parse_detect_request
 from http_schema import DetectResponse, DetectResult, DetectionItem
 from log_manager import LogController, get_logger
 from yolo_engine import Detection, YoloEngine
+
+
+class _SilentRequestHandler(WSGIRequestHandler):
+    """Disable default werkzeug request log lines."""
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        return
 
 
 def _strip_data_url(data: str) -> str:
@@ -83,6 +91,8 @@ class YoloServer:
         self._app.add_url_rule("/", "index", self._handle_index, methods=["GET"])
         self._app.add_url_rule("/favicon.ico", "favicon", self._handle_favicon, methods=["GET"])
         self._app.add_url_rule("/detect", "detect", self._handle_detect, methods=["POST"])
+        self._app.before_request(self._before_request)
+        self._app.after_request(self._after_request)
         self._server: Optional[object] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -139,9 +149,43 @@ class YoloServer:
 
     def _create_server(self):
         try:
-            return make_server(self.host, self.port, self._app, threaded=True)
+            return make_server(
+                self.host,
+                self.port,
+                self._app,
+                threaded=True,
+                request_handler=_SilentRequestHandler,
+            )
         except TypeError:
-            return make_server(self.host, self.port, self._app)
+            return make_server(
+                self.host,
+                self.port,
+                self._app,
+                request_handler=_SilentRequestHandler,
+            )
+
+    def _before_request(self) -> None:
+        g._request_start_time = time.perf_counter()
+
+    def _after_request(self, response: Response) -> Response:
+        try:
+            start = getattr(g, "_request_start_time", None)
+            elapsed_sec = 0.0 if start is None else max(0.0, time.perf_counter() - float(start))
+            protocol = str(request.environ.get("SERVER_PROTOCOL", "HTTP/1.1"))
+            path = request.full_path[:-1] if request.full_path.endswith("?") else request.full_path
+            remote_addr = request.remote_addr or "-"
+            self._log_ctrl.info(
+                '%s - - "%s %s %s" %s %.3fs',
+                remote_addr,
+                request.method,
+                path,
+                protocol,
+                response.status_code,
+                elapsed_sec,
+            )
+        except Exception:
+            self._log_ctrl.exception("HTTP request logging failed.")
+        return response
 
     def _text_response(self, status: HTTPStatus, text: str) -> Response:
         return Response(text.encode("utf-8"), status=status.value, content_type="text/plain; charset=utf-8")

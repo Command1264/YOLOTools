@@ -6,9 +6,8 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, TextIO
 
 LOGGER_NAME: str = "yolo_server_gui"
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -23,10 +22,101 @@ class LogContext:
     """Hold log configuration and runtime state."""
 
     start_time: datetime
-    log_dir: Path
-    log_file: Path
+    log_root: Path
     log_queue: queue.Queue[str]
     logger: logging.Logger
+    file_handler: "SessionRollingFileHandler"
+
+
+class SessionRollingFileHandler(logging.Handler):
+    """Rotate log files by size and date boundary."""
+
+    def __init__(self, log_root: Path, session_start: datetime, max_bytes: int, encoding: str = "utf-8") -> None:
+        super().__init__()
+        self._log_root: Path = log_root
+        self._session_start: datetime = session_start
+        self._max_bytes: int = max_bytes
+        self._encoding: str = encoding
+        self._stream: Optional[TextIO] = None
+        self._current_file: Optional[Path] = None
+        self._current_day: str = ""
+        self._open_new_file(datetime.now())
+
+    @property
+    def current_file(self) -> Optional[Path]:
+        """Get current active log file path."""
+        return self._current_file
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            self._write(message)
+        except Exception:
+            self.handleError(record)
+
+    def close(self) -> None:
+        try:
+            if self._stream is not None:
+                self._stream.flush()
+                self._stream.close()
+        finally:
+            self._stream = None
+            self._current_file = None
+            super().close()
+
+    def _write(self, message: str) -> None:
+        if self._stream is None:
+            self._open_new_file(datetime.now())
+        encoded = f"{message}\n".encode(self._encoding, errors="replace")
+        now = datetime.now()
+        if self._should_rollover(now, len(encoded)):
+            self._open_new_file(now)
+        if self._stream is None:
+            return
+        self._stream.write(message)
+        self._stream.write("\n")
+        self._stream.flush()
+
+    def _should_rollover(self, now: datetime, incoming_size: int) -> bool:
+        if self._current_file is None:
+            return True
+        day_key = now.strftime("%Y-%m-%d")
+        if day_key != self._current_day:
+            return True
+        try:
+            current_size = self._current_file.stat().st_size
+        except Exception:
+            current_size = 0
+        return current_size + incoming_size > self._max_bytes
+
+    def _open_new_file(self, now: datetime) -> None:
+        if self._stream is not None:
+            self._stream.flush()
+            self._stream.close()
+            self._stream = None
+        self._current_day = now.strftime("%Y-%m-%d")
+        day_dir = self._log_root / self._current_day
+        day_dir.mkdir(parents=True, exist_ok=True)
+        file_path = self._build_log_file_path(day_dir, now)
+        self._stream = file_path.open("a", encoding=self._encoding)
+        self._current_file = file_path
+        if file_path.stat().st_size == 0:
+            session_text = self._session_start.strftime("%Y-%m-%d %H:%M:%S")
+            self._stream.write(f"session_start={session_text}\n")
+            self._stream.flush()
+
+    @staticmethod
+    def _build_log_file_path(day_dir: Path, now: datetime) -> Path:
+        base = f"yolo_server_log_{now.strftime('%Y%m%d_%H%M%S')}"
+        candidate = day_dir / f"{base}.log"
+        if not candidate.exists():
+            return candidate
+        index = 1
+        while True:
+            numbered = day_dir / f"{base}_{index:02d}.log"
+            if not numbered.exists():
+                return numbered
+            index += 1
 
 
 class GuiLogHandler(logging.Handler):
@@ -92,10 +182,8 @@ def setup_logging(app_dir: Path) -> LogContext:
         return _LOG_CONTEXT
 
     start_time: datetime = datetime.now()
-    date_dir: str = start_time.strftime("%Y-%m-%d")
-    log_dir: Path = app_dir / "log" / date_dir
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file: Path = log_dir / f"yolo_server_log_{start_time.strftime('%Y%m%d_%H%M%S')}.log"
+    log_root: Path = app_dir / "log"
+    log_root.mkdir(parents=True, exist_ok=True)
 
     log_queue: queue.Queue[str] = queue.Queue(maxsize=5000)
 
@@ -105,10 +193,10 @@ def setup_logging(app_dir: Path) -> LogContext:
 
     formatter: MillisecondFormatter = MillisecondFormatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
-    file_handler: RotatingFileHandler = RotatingFileHandler(
-        log_file,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=10,
+    file_handler: SessionRollingFileHandler = SessionRollingFileHandler(
+        log_root=log_root,
+        session_start=start_time,
+        max_bytes=5 * 1024 * 1024,
         encoding="utf-8",
     )
     file_handler.setLevel(logging.INFO)
@@ -139,10 +227,10 @@ def setup_logging(app_dir: Path) -> LogContext:
 
     _LOG_CONTEXT = LogContext(
         start_time=start_time,
-        log_dir=log_dir,
-        log_file=log_file,
+        log_root=log_root,
         log_queue=log_queue,
         logger=logger,
+        file_handler=file_handler,
     )
     return _LOG_CONTEXT
 
@@ -256,20 +344,35 @@ def get_active_log_file() -> Optional[Path]:
     """
     if _LOG_CONTEXT is None:
         return None
-    return _LOG_CONTEXT.log_file
+    return _LOG_CONTEXT.file_handler.current_file
 
 
 def list_log_files() -> List[Path]:
     """
-    List log files for the current log session date.
+    List log files for the current app session.
 
     Returns:
         List[Path]: Sorted log file paths.
     """
     if _LOG_CONTEXT is None:
         return []
-    log_dir = _LOG_CONTEXT.log_dir
-    if not log_dir.exists():
+    log_root = _LOG_CONTEXT.log_root
+    if not log_root.exists():
         return []
-    files = [p for p in log_dir.iterdir() if p.is_file()]
+    session_marker = f"session_start={_LOG_CONTEXT.start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    files = [
+        p
+        for p in log_root.rglob("*.log")
+        if p.is_file() and _has_session_marker(p, session_marker)
+    ]
     return sorted(files, key=lambda p: p.stat().st_mtime)
+
+
+def _has_session_marker(path: Path, marker: str) -> bool:
+    """Check whether the first line matches the target session marker."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            first_line = f.readline().strip()
+        return first_line == marker
+    except Exception:
+        return False
