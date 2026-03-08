@@ -1,9 +1,11 @@
 import importlib
+import threading
 from dataclasses import dataclass
 from types import ModuleType
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import cv2
+import numpy as np
 
 from log_manager import LogController, get_logger
 
@@ -39,12 +41,21 @@ class YoloEngine:
         self._colors: Optional["Colors"] = None
         self._torch_mod: Optional[ModuleType] = None
         self._log_ctrl: LogController = LogController(get_logger())
+        self._load_lock = threading.RLock()
+        self._predict_lock = threading.RLock()
+        self._is_warmed_up: bool = False
+        self._is_warming_up: bool = False
+        self._warmup_error: Optional[str] = None
 
     def update_model_path(self, model_path: str) -> None:
-        self.model_path = model_path
-        self._model = None
-        self._names = None
-        self._device_name = "unknown"
+        with self._load_lock:
+            self.model_path = model_path
+            self._model = None
+            self._names = None
+            self._device_name = "unknown"
+            self._is_warmed_up = False
+            self._is_warming_up = False
+            self._warmup_error = None
         self._log_ctrl.info("模型路徑已更新。model_path=%s", model_path)
 
     def _ensure_torch(self) -> ModuleType:
@@ -59,21 +70,22 @@ class YoloEngine:
         return self._colors
 
     def load(self) -> None:
-        torch_mod = self._ensure_torch()
-        self._cuda_available = torch_mod.cuda.is_available()
-        if not self.device:
-            self.device = "cuda:0" if self._cuda_available else "cpu"
-        if self._model is None:
-            yolo_mod = importlib.import_module("ultralytics")
-            self._model = yolo_mod.YOLO(self.model_path)
-            self._names = self._model.model.names
-            if self.device:
-                try:
-                    self._model.to(self.device)
-                except Exception:
-                    self._log_ctrl.exception("模型載入後切換裝置失敗。device=%s", self.device)
-        # Resolve actual device after model is loaded.
-        self._device_name = self._resolve_device_name()
+        with self._load_lock:
+            torch_mod = self._ensure_torch()
+            self._cuda_available = torch_mod.cuda.is_available()
+            if not self.device:
+                self.device = "cuda:0" if self._cuda_available else "cpu"
+            if self._model is None:
+                yolo_mod = importlib.import_module("ultralytics")
+                self._model = yolo_mod.YOLO(self.model_path)
+                self._names = self._model.model.names
+                if self.device:
+                    try:
+                        self._model.to(self.device)
+                    except Exception:
+                        self._log_ctrl.exception("模型載入後切換裝置失敗。device=%s", self.device)
+            # Resolve actual device after model is loaded.
+            self._device_name = self._resolve_device_name()
 
     @property
     def names(self) -> dict[int, str]:
@@ -87,20 +99,33 @@ class YoloEngine:
     def cuda_available(self) -> bool:
         return self._cuda_available
 
+    @property
+    def is_ready(self) -> bool:
+        return self._is_warmed_up
+
+    @property
+    def is_warming_up(self) -> bool:
+        return self._is_warming_up
+
+    @property
+    def warmup_error(self) -> Optional[str]:
+        return self._warmup_error
+
     def infer(
         self, frame_bgr: object, conf: Optional[float] = None, iou: Optional[float] = None
     ) -> Tuple[Optional[object], List[Detection]]:
         self.load()
         conf = self.conf if conf is None else conf
         iou = self.iou if iou is None else iou
-        results = self._model.predict(
-            source=frame_bgr,
-            conf=conf,
-            iou=iou,
-            device=self.device,
-            verbose=False,
-        )
-        self._device_name = self._resolve_device_name()
+        with self._predict_lock:
+            results = self._model.predict(
+                source=frame_bgr,
+                conf=conf,
+                iou=iou,
+                device=self.device,
+                verbose=False,
+            )
+            self._device_name = self._resolve_device_name()
         if not results:
             return None, []
         r: object = results[0]
@@ -119,6 +144,33 @@ class YoloEngine:
                     )
                 )
         return r, dets
+
+    def warmup(self) -> None:
+        """Load the model and run a dummy inference once."""
+        with self._predict_lock:
+            if self._is_warmed_up:
+                return
+            if self._is_warming_up:
+                return
+            self._is_warming_up = True
+            self._warmup_error = None
+            self.load()
+            try:
+                dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+                self._model.predict(
+                    source=dummy,
+                    conf=self.conf,
+                    iou=self.iou,
+                    device=self.device,
+                    verbose=False,
+                )
+                self._device_name = self._resolve_device_name()
+                self._is_warmed_up = True
+            except Exception as exc:
+                self._warmup_error = str(exc) or exc.__class__.__name__
+                raise
+            finally:
+                self._is_warming_up = False
 
     def _resolve_device_name(self) -> str:
         try:

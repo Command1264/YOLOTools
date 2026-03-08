@@ -95,6 +95,7 @@ class YoloServer:
         self._app.after_request(self._after_request)
         self._server: Optional[object] = None
         self._thread: Optional[threading.Thread] = None
+        self._warmup_thread: Optional[threading.Thread] = None
 
     def is_running(self) -> bool:
         return self._server is not None
@@ -103,8 +104,10 @@ class YoloServer:
         if self._server is not None:
             return
         self._server = self._create_server()
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
+        self._warmup_thread = threading.Thread(target=self._run_warmup, daemon=True)
+        self._warmup_thread.start()
         self._log_ctrl.info("Server started. host=%s port=%s", self.host, self.port)
 
     def stop(self) -> None:
@@ -116,6 +119,7 @@ class YoloServer:
         finally:
             self._server = None
             self._thread = None
+            self._warmup_thread = None
         self._log_ctrl.info("Server stopped.")
 
     def update_model(self, model_path: str) -> None:
@@ -164,8 +168,23 @@ class YoloServer:
                 request_handler=_SilentRequestHandler,
             )
 
-    def _before_request(self) -> None:
+    def _run_server(self) -> None:
+        if self._server is None:
+            return
+        self._server.serve_forever()
+
+    def _run_warmup(self) -> None:
+        try:
+            self._engine.warmup()
+            self._log_ctrl.info("Model warmup completed.")
+        except Exception:
+            self._log_ctrl.exception("Model warmup failed.")
+
+    def _before_request(self) -> Optional[Response]:
         g._request_start_time = time.perf_counter()
+        if self._engine.is_ready:
+            return None
+        return self._service_unavailable_response()
 
     def _after_request(self, response: Response) -> Response:
         try:
@@ -186,6 +205,18 @@ class YoloServer:
         except Exception:
             self._log_ctrl.exception("HTTP request logging failed.")
         return response
+
+    def _service_unavailable_response(self) -> Response:
+        error_detail = self._engine.warmup_error or "model is warming up"
+        if request.path == "/detect":
+            return self._json_response(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": f"service unavailable: {error_detail}"},
+            )
+        return self._text_response(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            f"Service unavailable: {error_detail}",
+        )
 
     def _text_response(self, status: HTTPStatus, text: str) -> Response:
         return Response(text.encode("utf-8"), status=status.value, content_type="text/plain; charset=utf-8")
