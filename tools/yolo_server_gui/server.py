@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import socket
 import threading
 import time
 from http import HTTPStatus
@@ -22,6 +23,20 @@ from yolo_engine import Detection, YoloEngine
 
 class _SilentRequestHandler(WSGIRequestHandler):
     """Disable default werkzeug request log lines."""
+
+    def setup(self) -> None:
+        super().setup()
+        owner = getattr(self.server, "http_owner", None)
+        if owner is not None:
+            owner._register_connection(self.connection)
+
+    def finish(self) -> None:
+        try:
+            owner = getattr(self.server, "http_owner", None)
+            if owner is not None:
+                owner._unregister_connection(self.connection)
+        finally:
+            super().finish()
 
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         return
@@ -96,14 +111,38 @@ class YoloServer:
         self._server: Optional[object] = None
         self._thread: Optional[threading.Thread] = None
         self._warmup_thread: Optional[threading.Thread] = None
+        self._state_lock = threading.RLock()
+        self._active_requests = 0
+        self._server_state = "stopped"
+        self._connection_lock = threading.RLock()
+        self._active_connections: set[socket.socket] = set()
+        self._rejected_requests = 0
 
     def is_running(self) -> bool:
-        return self._server is not None
+        with self._state_lock:
+            return self._server is not None and self._server_state != "stopped"
+
+    @property
+    def is_ready(self) -> bool:
+        return self._engine.is_ready
+
+    @property
+    def is_warming_up(self) -> bool:
+        return self._engine.is_warming_up
+
+    @property
+    def server_state(self) -> str:
+        with self._state_lock:
+            return self._server_state
 
     def start(self) -> None:
         if self._server is not None:
             return
         self._server = self._create_server()
+        with self._state_lock:
+            self._server_state = "warming_up"
+            self._active_requests = 0
+            self._rejected_requests = 0
         self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
         self._warmup_thread = threading.Thread(target=self._run_warmup, daemon=True)
@@ -114,12 +153,26 @@ class YoloServer:
         if self._server is None:
             return
         try:
+            with self._state_lock:
+                self._server_state = "shutting_down"
+                active_requests = self._active_requests
+            closed_connections = self._close_active_connections()
+            self._log_ctrl.warning(
+                "Server shutdown requested. active_requests=%s closed_connections=%s rejected_requests=%s",
+                active_requests,
+                closed_connections,
+                self._rejected_requests,
+            )
             self._server.shutdown()
             self._server.server_close()
         finally:
             self._server = None
             self._thread = None
             self._warmup_thread = None
+            with self._state_lock:
+                self._server_state = "stopped"
+                self._active_requests = 0
+                self._rejected_requests = 0
         self._log_ctrl.info("Server stopped.")
 
     def update_model(self, model_path: str) -> None:
@@ -145,28 +198,36 @@ class YoloServer:
         )
 
     def get_device_name(self) -> str:
-        try:
-            self._engine.load()
+        if self._engine.is_ready:
             return self._engine.device_name
-        except Exception:
-            return "unknown"
+        if self._engine.is_warming_up:
+            return "loading"
+        return self._engine.device_name
 
     def _create_server(self):
         try:
-            return make_server(
+            server = make_server(
                 self.host,
                 self.port,
                 self._app,
                 threaded=True,
                 request_handler=_SilentRequestHandler,
             )
+            setattr(server, "http_owner", self)
+            setattr(server, "daemon_threads", True)
+            setattr(server, "block_on_close", False)
+            return server
         except TypeError:
-            return make_server(
+            server = make_server(
                 self.host,
                 self.port,
                 self._app,
                 request_handler=_SilentRequestHandler,
             )
+            setattr(server, "http_owner", self)
+            setattr(server, "daemon_threads", True)
+            setattr(server, "block_on_close", False)
+            return server
 
     def _run_server(self) -> None:
         if self._server is None:
@@ -176,18 +237,31 @@ class YoloServer:
     def _run_warmup(self) -> None:
         try:
             self._engine.warmup()
+            with self._state_lock:
+                if self._server_state != "stopped":
+                    self._server_state = "running"
             self._log_ctrl.info("Model warmup completed.")
         except Exception:
+            with self._state_lock:
+                if self._server_state != "stopped":
+                    self._server_state = "warmup_failed"
             self._log_ctrl.exception("Model warmup failed.")
 
     def _before_request(self) -> Optional[Response]:
         g._request_start_time = time.perf_counter()
+        g._counted_request = False
+        with self._state_lock:
+            self._active_requests += 1
+        g._counted_request = True
+        if self._server_state == "shutting_down":
+            return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
         if self._engine.is_ready:
             return None
-        return self._service_unavailable_response()
+        return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
 
     def _after_request(self, response: Response) -> Response:
         try:
+            response.headers["Connection"] = "close"
             start = getattr(g, "_request_start_time", None)
             elapsed_sec = 0.0 if start is None else max(0.0, time.perf_counter() - float(start))
             protocol = str(request.environ.get("SERVER_PROTOCOL", "HTTP/1.1"))
@@ -204,19 +278,54 @@ class YoloServer:
             )
         except Exception:
             self._log_ctrl.exception("HTTP request logging failed.")
+        finally:
+            if getattr(g, "_counted_request", False):
+                with self._state_lock:
+                    self._active_requests = max(0, self._active_requests - 1)
         return response
 
-    def _service_unavailable_response(self) -> Response:
-        error_detail = self._engine.warmup_error or "model is warming up"
+    def _service_unavailable_response(self, status: HTTPStatus) -> Response:
+        state = self.server_state
+        if state == "shutting_down":
+            error_detail = "server is shutting down"
+        elif state == "warmup_failed":
+            error_detail = self._engine.warmup_error or "model warmup failed"
+        else:
+            error_detail = self._engine.warmup_error or "model is warming up"
         if request.path == "/detect":
             return self._json_response(
-                HTTPStatus.SERVICE_UNAVAILABLE,
+                status,
                 {"error": f"service unavailable: {error_detail}"},
             )
         return self._text_response(
-            HTTPStatus.SERVICE_UNAVAILABLE,
+            status,
             f"Service unavailable: {error_detail}",
         )
+
+    def _register_connection(self, connection: socket.socket) -> None:
+        with self._connection_lock:
+            self._active_connections.add(connection)
+
+    def _unregister_connection(self, connection: socket.socket) -> None:
+        with self._connection_lock:
+            self._active_connections.discard(connection)
+
+    def _close_active_connections(self) -> int:
+        with self._connection_lock:
+            connections = list(self._active_connections)
+            self._active_connections.clear()
+        closed_count = 0
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                conn.close()
+                closed_count += 1
+            except Exception:
+                pass
+        return closed_count
 
     def _text_response(self, status: HTTPStatus, text: str) -> Response:
         return Response(text.encode("utf-8"), status=status.value, content_type="text/plain; charset=utf-8")
@@ -243,13 +352,16 @@ class YoloServer:
         return self._text_response(HTTPStatus.NOT_FOUND, "favicon not found")
 
     def _handle_detect(self) -> Response:
+        if self.server_state == "shutting_down":
+            return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
         payload: Any = request.get_json(silent=True)
         try:
             parsed_request = parse_detect_request(payload)
         except RequestPayloadError as exc:
             self._log_ctrl.warning("Detect request invalid: %s", exc)
             return self._json_response(HTTPStatus.BAD_REQUEST, encode_error(str(exc)))
-
+        if self.server_state == "shutting_down":
+            return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
         conf = self.conf if parsed_request.conf is None else parsed_request.conf
         iou = parsed_request.iou
         results = [self._infer_single(image_b64=img, conf=conf, iou=iou) for img in parsed_request.images]
@@ -265,6 +377,8 @@ class YoloServer:
         return self._json_response(HTTPStatus.OK, encode_detect_response(response_payload))
 
     def _infer_single(self, image_b64: str, conf: float, iou: float | None) -> DetectResult:
+        if self.server_state == "shutting_down":
+            return DetectResult(classify_type="none", percentage=0.0, detections=[])
         img: Optional[np.ndarray] = _decode_base64_image(image_b64)
         if img is None:
             return DetectResult(classify_type="none", percentage=0.0, detections=[])

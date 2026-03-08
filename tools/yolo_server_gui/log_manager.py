@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import queue
 import re
 import sys
+import threading
 from dataclasses import dataclass
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, TextIO
@@ -13,6 +16,8 @@ LOGGER_NAME: str = "yolo_server_gui"
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 LOG_DATE_FORMAT: str = "%Y-%m-%d %H:%M:%S"
 WERKZEUG_TIME_PATTERN = re.compile(r"\s\[[0-9]{2}/[A-Za-z]{3}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}\]")
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 _LOG_CONTEXT: Optional["LogContext"] = None
 
@@ -23,9 +28,53 @@ class LogContext:
 
     start_time: datetime
     log_root: Path
-    log_queue: queue.Queue[str]
+    event_queue: queue.SimpleQueue[logging.LogRecord]
+    gui_broadcaster: "GuiLogBroadcaster"
     logger: logging.Logger
     file_handler: "SessionRollingFileHandler"
+    queue_listener: logging.handlers.QueueListener
+
+
+class GuiLogBroadcaster:
+    """Broadcast sanitized log lines to GUI subscribers."""
+
+    def __init__(self, history_limit: int = 500) -> None:
+        self._lock = threading.RLock()
+        self._subscribers: set[queue.SimpleQueue[tuple[int, str]]] = set()
+        self._recent_entries: deque[tuple[int, str]] = deque(maxlen=history_limit)
+        self._sequence: int = 0
+
+    def publish(self, message: str) -> None:
+        """Publish one sanitized log line to subscribers."""
+        with self._lock:
+            self._sequence += 1
+            entry = (self._sequence, message)
+            self._recent_entries.append(entry)
+            subscribers = list(self._subscribers)
+        for subscriber in subscribers:
+            subscriber.put(entry)
+
+    def register(self) -> queue.SimpleQueue[tuple[int, str]]:
+        """Register a subscriber queue for future log lines."""
+        subscriber: queue.SimpleQueue[tuple[int, str]] = queue.SimpleQueue()
+        with self._lock:
+            self._subscribers.add(subscriber)
+        return subscriber
+
+    def unregister(self, subscriber: queue.SimpleQueue[tuple[int, str]]) -> None:
+        """Unregister a subscriber queue."""
+        with self._lock:
+            self._subscribers.discard(subscriber)
+
+    def recent_entries_since(self, sequence: int) -> list[tuple[int, str]]:
+        """Return entries published after the specified sequence."""
+        with self._lock:
+            return [entry for entry in self._recent_entries if entry[0] > sequence]
+
+    def current_sequence(self) -> int:
+        """Return the latest published sequence."""
+        with self._lock:
+            return self._sequence
 
 
 class SessionRollingFileHandler(logging.Handler):
@@ -40,6 +89,7 @@ class SessionRollingFileHandler(logging.Handler):
         self._stream: Optional[TextIO] = None
         self._current_file: Optional[Path] = None
         self._current_day: str = ""
+        self._lock = threading.RLock()
         self._open_new_file(datetime.now())
 
     @property
@@ -50,19 +100,22 @@ class SessionRollingFileHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             message = self.format(record)
-            self._write(message)
+            with self._lock:
+                self._write(message)
         except Exception:
             self.handleError(record)
 
     def close(self) -> None:
-        try:
-            if self._stream is not None:
-                self._stream.flush()
-                self._stream.close()
-        finally:
-            self._stream = None
-            self._current_file = None
-            super().close()
+        with self._lock:
+            try:
+                if self._stream is not None:
+                    self._write_file_footer(datetime.now(), None)
+                    self._stream.flush()
+                    self._stream.close()
+            finally:
+                self._stream = None
+                self._current_file = None
+                super().close()
 
     def _write(self, message: str) -> None:
         if self._stream is None:
@@ -70,7 +123,7 @@ class SessionRollingFileHandler(logging.Handler):
         encoded = f"{message}\n".encode(self._encoding, errors="replace")
         now = datetime.now()
         if self._should_rollover(now, len(encoded)):
-            self._open_new_file(now)
+            self._rollover(now)
         if self._stream is None:
             return
         self._stream.write(message)
@@ -89,21 +142,45 @@ class SessionRollingFileHandler(logging.Handler):
             current_size = 0
         return current_size + incoming_size > self._max_bytes
 
+    def _rollover(self, now: datetime) -> None:
+        next_file_path = self._resolve_file_path(now)
+        self._write_file_footer(now, next_file_path.name)
+        if self._stream is not None:
+            self._stream.flush()
+            self._stream.close()
+            self._stream = None
+        self._open_file(next_file_path, now)
+
     def _open_new_file(self, now: datetime) -> None:
+        self._open_file(self._resolve_file_path(now), now)
+
+    def _open_file(self, file_path: Path, now: datetime) -> None:
         if self._stream is not None:
             self._stream.flush()
             self._stream.close()
             self._stream = None
         self._current_day = now.strftime("%Y-%m-%d")
-        day_dir = self._log_root / self._current_day
-        day_dir.mkdir(parents=True, exist_ok=True)
-        file_path = self._build_log_file_path(day_dir, now)
         self._stream = file_path.open("a", encoding=self._encoding)
         self._current_file = file_path
         if file_path.stat().st_size == 0:
             session_text = self._session_start.strftime("%Y-%m-%d %H:%M:%S")
+            file_text = now.strftime("%Y-%m-%d %H:%M:%S")
             self._stream.write(f"session_start={session_text}\n")
+            self._stream.write(f"file_start={file_text}\n")
             self._stream.flush()
+
+    def _resolve_file_path(self, now: datetime) -> Path:
+        day_dir = self._log_root / now.strftime("%Y-%m-%d")
+        day_dir.mkdir(parents=True, exist_ok=True)
+        return self._build_log_file_path(day_dir, now)
+
+    def _write_file_footer(self, now: datetime, next_file_name: Optional[str]) -> None:
+        if self._stream is None:
+            return
+        file_text = now.strftime("%Y-%m-%d %H:%M:%S")
+        next_name = next_file_name or "none"
+        self._stream.write(f"file_end={file_text}\n")
+        self._stream.write(f"next_file={next_name}\n")
 
     @staticmethod
     def _build_log_file_path(day_dir: Path, now: datetime) -> Path:
@@ -122,26 +199,16 @@ class SessionRollingFileHandler(logging.Handler):
 class GuiLogHandler(logging.Handler):
     """Push formatted log messages into a queue for GUI consumption."""
 
-    def __init__(self, log_queue: queue.Queue[str]) -> None:
+    def __init__(self, gui_broadcaster: GuiLogBroadcaster) -> None:
         super().__init__()
-        self._queue = log_queue
+        self._gui_broadcaster = gui_broadcaster
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             message = self.format(record)
         except Exception:
             return
-        try:
-            self._queue.put_nowait(message)
-        except queue.Full:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._queue.put_nowait(message)
-            except queue.Full:
-                pass
+        self._gui_broadcaster.publish(message)
 
 
 class WerkzeugCleanFilter(logging.Filter):
@@ -167,6 +234,31 @@ class MillisecondFormatter(logging.Formatter):
         return f"{base}.{millis:03d}"
 
 
+class PlainTextFormatter(MillisecondFormatter):
+    """Formatter that removes terminal-only control sequences."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        return sanitize_log_text(message)
+
+
+def sanitize_log_text(text: str) -> str:
+    """
+    Remove terminal-only escape sequences and control characters.
+
+    Args:
+        text (str): Raw formatted log text.
+
+    Returns:
+        str: Sanitized plain text safe for file and GUI logs.
+    """
+    sanitized = ANSI_ESCAPE_PATTERN.sub("", text)
+    sanitized = sanitized.replace("\r\n", "\n").replace("\r", "\n")
+    sanitized = sanitized.replace("\u2028", "\n").replace("\u2029", "\n")
+    sanitized = CONTROL_CHAR_PATTERN.sub("", sanitized)
+    return sanitized
+
+
 def setup_logging(app_dir: Path) -> LogContext:
     """
     Set up logging for console, file, and GUI.
@@ -185,13 +277,15 @@ def setup_logging(app_dir: Path) -> LogContext:
     log_root: Path = app_dir / "log"
     log_root.mkdir(parents=True, exist_ok=True)
 
-    log_queue: queue.Queue[str] = queue.Queue(maxsize=5000)
+    event_queue: queue.SimpleQueue[logging.LogRecord] = queue.SimpleQueue()
+    gui_broadcaster = GuiLogBroadcaster()
 
     logger: logging.Logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
     formatter: MillisecondFormatter = MillisecondFormatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+    plain_formatter: PlainTextFormatter = PlainTextFormatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
     file_handler: SessionRollingFileHandler = SessionRollingFileHandler(
         log_root=log_root,
@@ -200,37 +294,47 @@ def setup_logging(app_dir: Path) -> LogContext:
         encoding="utf-8",
     )
     file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(plain_formatter)
 
     console_handler: logging.StreamHandler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
-    gui_handler: GuiLogHandler = GuiLogHandler(log_queue)
+    gui_handler: GuiLogHandler = GuiLogHandler(gui_broadcaster)
     gui_handler.setLevel(logging.INFO)
-    gui_handler.setFormatter(formatter)
-
-    if logger.handlers:
-        logger.handlers.clear()
+    gui_handler.setFormatter(plain_formatter)
 
     clean_filter: WerkzeugCleanFilter = WerkzeugCleanFilter()
     file_handler.addFilter(clean_filter)
     console_handler.addFilter(clean_filter)
     gui_handler.addFilter(clean_filter)
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    logger.addHandler(gui_handler)
+    if logger.handlers:
+        logger.handlers.clear()
+    queue_handler = logging.handlers.QueueHandler(event_queue)
+    queue_handler.setLevel(logging.INFO)
+    logger.addHandler(queue_handler)
 
-    _attach_handlers("flask.app", [file_handler, console_handler, gui_handler], logging.INFO)
-    _attach_handlers("werkzeug", [file_handler, console_handler, gui_handler], logging.INFO)
+    queue_listener = logging.handlers.QueueListener(
+        event_queue,
+        file_handler,
+        console_handler,
+        gui_handler,
+        respect_handler_level=True,
+    )
+    queue_listener.start()
+
+    _attach_handlers("flask.app", [queue_handler], logging.INFO)
+    _attach_handlers("werkzeug", [queue_handler], logging.INFO)
 
     _LOG_CONTEXT = LogContext(
         start_time=start_time,
         log_root=log_root,
-        log_queue=log_queue,
+        event_queue=event_queue,
+        gui_broadcaster=gui_broadcaster,
         logger=logger,
         file_handler=file_handler,
+        queue_listener=queue_listener,
     )
     return _LOG_CONTEXT
 
@@ -330,9 +434,55 @@ def get_log_queue() -> queue.Queue[str]:
     Returns:
         queue.Queue[str]: Queue for GUI log streaming.
     """
-    if _LOG_CONTEXT is not None:
-        return _LOG_CONTEXT.log_queue
     return queue.Queue()
+
+
+def register_log_subscriber() -> queue.SimpleQueue[tuple[int, str]]:
+    """
+    Register a GUI subscriber for live log lines.
+
+    Returns:
+        queue.SimpleQueue[tuple[int, str]]: Subscriber queue receiving future log lines.
+    """
+    if _LOG_CONTEXT is None:
+        return queue.SimpleQueue()
+    return _LOG_CONTEXT.gui_broadcaster.register()
+
+
+def unregister_log_subscriber(subscriber: queue.SimpleQueue[tuple[int, str]]) -> None:
+    """
+    Unregister a GUI subscriber queue.
+
+    Args:
+        subscriber (queue.SimpleQueue[tuple[int, str]]): Subscriber queue to remove.
+    """
+    if _LOG_CONTEXT is None:
+        return
+    _LOG_CONTEXT.gui_broadcaster.unregister(subscriber)
+
+
+def get_recent_gui_logs_since(sequence: int) -> list[str]:
+    """
+    Get recent sanitized GUI log lines after the specified sequence.
+
+    Returns:
+        list[str]: Recent log lines.
+    """
+    if _LOG_CONTEXT is None:
+        return []
+    return [entry[1] for entry in _LOG_CONTEXT.gui_broadcaster.recent_entries_since(sequence)]
+
+
+def get_current_gui_log_sequence() -> int:
+    """
+    Get the latest GUI log sequence number.
+
+    Returns:
+        int: Latest published sequence.
+    """
+    if _LOG_CONTEXT is None:
+        return 0
+    return _LOG_CONTEXT.gui_broadcaster.current_sequence()
 
 
 def get_active_log_file() -> Optional[Path]:

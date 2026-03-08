@@ -190,13 +190,24 @@ class ServerController:
         self.set_dep_status("核心套件：就緒")
 
     def load_device_async(self) -> None:
-        """Query server device on background thread."""
+        """Query server device status on background thread without touching model init."""
 
         def _worker() -> None:
             device_name: str = "unknown"
             try:
                 if self.app.server:
-                    device_name = self.app.server.get_device_name()
+                    for _ in range(300):
+                        if not self.app.server:
+                            device_name = "unknown"
+                            break
+                        if self.app.server.server_state == "warmup_failed":
+                            device_name = "warmup failed"
+                            break
+                        if self.app.server.is_ready:
+                            device_name = self.app.server.get_device_name()
+                            break
+                        device_name = "loading"
+                        threading.Event().wait(0.2)
             except Exception:
                 device_name = "unknown"
             self.app._device_queue.put(device_name)
@@ -206,6 +217,13 @@ class ServerController:
     def apply_device_name(self, device_name: str) -> None:
         """Apply queried device name to UI."""
         if not self.app.server:
+            return
+        if device_name == "loading":
+            self.app.lbl_device.setText("裝置：載入中...")
+            return
+        if device_name == "warmup failed":
+            self.app.lbl_device.setText("裝置：載入失敗")
+            self.app.log_ctrl.warning("模型 warmup 失敗。")
             return
         self.app.lbl_device.setText(f"裝置：{device_name}")
         self.app.log_ctrl.info("使用裝置：%s", device_name)
