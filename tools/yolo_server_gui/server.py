@@ -68,6 +68,15 @@ def _pick_top1(dets: list[Detection]) -> Tuple[str, float]:
     best: Detection = max(dets, key=lambda d: d.conf)
     return best.class_name, float(best.conf)
 
+
+def _extract_thread_name(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "null"
+    thread_name = payload.get("threadName")
+    if thread_name is None or thread_name == "":
+        return "null"
+    return str(thread_name)
+
 def _dets_to_payload(dets: list[Detection]) -> list[DetectionItem]:
     payload: list[DetectionItem] = []
     for d in dets or []:
@@ -250,13 +259,48 @@ class YoloServer:
     def _before_request(self) -> Optional[Response]:
         g._request_start_time = time.perf_counter()
         g._counted_request = False
+        g._thread_name = "null"
+        if request.method == "POST":
+            try:
+                g._thread_name = _extract_thread_name(request.get_json(silent=True))
+            except Exception:
+                g._thread_name = "null"
+        self._log_ctrl.debug(
+            "HTTP request entered. method=%s path=%s threadName=%s state=%s",
+            request.method,
+            request.path,
+            g._thread_name,
+            self.server_state,
+        )
         with self._state_lock:
             self._active_requests += 1
         g._counted_request = True
+        try:
+            protocol = str(request.environ.get("SERVER_PROTOCOL", "HTTP/1.1"))
+            path = request.full_path[:-1] if request.full_path.endswith("?") else request.full_path
+            remote_addr = request.remote_addr or "-"
+            self._log_ctrl.info(
+                '%s - - "%s %s %s" threadName=%s started',
+                remote_addr,
+                request.method,
+                path,
+                protocol,
+                g._thread_name,
+            )
+        except Exception:
+            self._log_ctrl.exception("HTTP request start logging failed.")
         if self._server_state == "shutting_down":
+            self._log_ctrl.debug("HTTP request rejected during shutdown. path=%s", request.path)
             return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
         if self._engine.is_ready:
+            self._log_ctrl.debug("HTTP request accepted. path=%s ready=%s", request.path, self._engine.is_ready)
             return None
+        self._log_ctrl.debug(
+            "HTTP request rejected while model unavailable. path=%s warming_up=%s warmup_error=%s",
+            request.path,
+            self._engine.is_warming_up,
+            self._engine.warmup_error,
+        )
         return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
 
     def _after_request(self, response: Response) -> Response:
@@ -268,11 +312,12 @@ class YoloServer:
             path = request.full_path[:-1] if request.full_path.endswith("?") else request.full_path
             remote_addr = request.remote_addr or "-"
             self._log_ctrl.info(
-                '%s - - "%s %s %s" %s %.3fs',
+                '%s - - "%s %s %s" threadName=%s %s %.3fs',
                 remote_addr,
                 request.method,
                 path,
                 protocol,
+                getattr(g, "_thread_name", "null"),
                 response.status_code,
                 elapsed_sec,
             )
@@ -353,39 +398,87 @@ class YoloServer:
 
     def _handle_detect(self) -> Response:
         if self.server_state == "shutting_down":
+            self._log_ctrl.debug("Detect request rejected because server is shutting down.")
             return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
+        self._log_ctrl.debug("Detect request parsing started. threadName=%s", getattr(g, "_thread_name", "null"))
         payload: Any = request.get_json(silent=True)
         try:
             parsed_request = parse_detect_request(payload)
         except RequestPayloadError as exc:
             self._log_ctrl.warning("Detect request invalid: %s", exc)
             return self._json_response(HTTPStatus.BAD_REQUEST, encode_error(str(exc)))
+        self._log_ctrl.debug(
+            "Detect request parsed. threadName=%s image_count=%s is_batch=%s conf=%s iou=%s",
+            parsed_request.thread_name or "null",
+            len(parsed_request.images),
+            parsed_request.is_batch,
+            parsed_request.conf,
+            parsed_request.iou,
+        )
         if self.server_state == "shutting_down":
+            self._log_ctrl.debug("Detect request aborted after parse because server is shutting down.")
             return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
         conf = self.conf if parsed_request.conf is None else parsed_request.conf
         iou = parsed_request.iou
+        self._log_ctrl.debug(
+            "Detect inference batch started. threadName=%s image_count=%s conf=%s iou=%s",
+            parsed_request.thread_name or "null",
+            len(parsed_request.images),
+            conf,
+            iou,
+        )
         results = [self._infer_single(image_b64=img, conf=conf, iou=iou) for img in parsed_request.images]
         result_payload: DetectResult | list[DetectResult]
         if parsed_request.is_batch:
             result_payload = results
         else:
             result_payload = results[0]
+        self._log_ctrl.debug(
+            "Detect inference batch completed. threadName=%s result_count=%s",
+            parsed_request.thread_name or "null",
+            len(results),
+        )
         response_payload = DetectResponse(
             thread_name=parsed_request.thread_name,
             result=result_payload,
+        )
+        self._log_ctrl.debug(
+            "Detect response encoded. threadName=%s is_batch=%s",
+            parsed_request.thread_name or "null",
+            parsed_request.is_batch,
         )
         return self._json_response(HTTPStatus.OK, encode_detect_response(response_payload))
 
     def _infer_single(self, image_b64: str, conf: float, iou: float | None) -> DetectResult:
         if self.server_state == "shutting_down":
+            self._log_ctrl.debug("Single-image inference skipped because server is shutting down.")
             return DetectResult(classify_type="none", percentage=0.0, detections=[])
+        self._log_ctrl.debug("Single-image decode started. threadName=%s", getattr(g, "_thread_name", "null"))
         img: Optional[np.ndarray] = _decode_base64_image(image_b64)
         if img is None:
+            self._log_ctrl.debug("Single-image decode failed. threadName=%s", getattr(g, "_thread_name", "null"))
             return DetectResult(classify_type="none", percentage=0.0, detections=[])
+        self._log_ctrl.debug(
+            "Single-image decode completed. threadName=%s shape=%s",
+            getattr(g, "_thread_name", "null"),
+            getattr(img, "shape", None),
+        )
         try:
+            self._log_ctrl.debug("Single-image inference started. threadName=%s", getattr(g, "_thread_name", "null"))
             _, dets = self._engine.infer(img, conf=conf, iou=iou)
         except Exception:
             self._log_ctrl.exception("Inference failed.")
             return DetectResult(classify_type="none", percentage=0.0, detections=[])
+        self._log_ctrl.debug(
+            "Single-image inference completed. threadName=%s detection_count=%s",
+            getattr(g, "_thread_name", "null"),
+            len(dets),
+        )
         cls_name, score = _pick_top1(dets)
+        self._log_ctrl.debug(
+            "Single-image inference result prepared. threadName=%s classify_type=%s percentage=%s",
+            getattr(g, "_thread_name", "null"),
+            cls_name,
+            score,
+        )
         return DetectResult(classify_type=cls_name, percentage=score, detections=_dets_to_payload(dets))
