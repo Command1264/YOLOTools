@@ -259,7 +259,21 @@ def sanitize_log_text(text: str) -> str:
     return sanitized
 
 
-def setup_logging(app_dir: Path) -> LogContext:
+def normalize_log_level(log_level: str) -> int:
+    """
+    Normalize config log level text to logging level.
+
+    Args:
+        log_level (str): Configured log level text.
+
+    Returns:
+        int: Python logging level. Falls back to INFO for unknown values.
+    """
+    normalized = str(log_level).strip().upper()
+    return getattr(logging, normalized, logging.INFO)
+
+
+def setup_logging(app_dir: Path, log_level: str = "info") -> LogContext:
     """
     Set up logging for console, file, and GUI.
 
@@ -276,12 +290,13 @@ def setup_logging(app_dir: Path) -> LogContext:
     start_time: datetime = datetime.now()
     log_root: Path = app_dir / "log"
     log_root.mkdir(parents=True, exist_ok=True)
+    resolved_level = normalize_log_level(log_level)
 
     event_queue: queue.SimpleQueue[logging.LogRecord] = queue.SimpleQueue()
     gui_broadcaster = GuiLogBroadcaster()
 
     logger: logging.Logger = logging.getLogger(LOGGER_NAME)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(resolved_level)
     logger.propagate = False
 
     formatter: MillisecondFormatter = MillisecondFormatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
@@ -293,15 +308,15 @@ def setup_logging(app_dir: Path) -> LogContext:
         max_bytes=5 * 1024 * 1024,
         encoding="utf-8",
     )
-    file_handler.setLevel(logging.INFO)
+    file_handler.setLevel(resolved_level)
     file_handler.setFormatter(plain_formatter)
 
     console_handler: logging.StreamHandler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(resolved_level)
     console_handler.setFormatter(formatter)
 
     gui_handler: GuiLogHandler = GuiLogHandler(gui_broadcaster)
-    gui_handler.setLevel(logging.INFO)
+    gui_handler.setLevel(resolved_level)
     gui_handler.setFormatter(plain_formatter)
 
     clean_filter: WerkzeugCleanFilter = WerkzeugCleanFilter()
@@ -312,7 +327,7 @@ def setup_logging(app_dir: Path) -> LogContext:
     if logger.handlers:
         logger.handlers.clear()
     queue_handler = logging.handlers.QueueHandler(event_queue)
-    queue_handler.setLevel(logging.INFO)
+    queue_handler.setLevel(resolved_level)
     logger.addHandler(queue_handler)
 
     queue_listener = logging.handlers.QueueListener(
@@ -324,8 +339,8 @@ def setup_logging(app_dir: Path) -> LogContext:
     )
     queue_listener.start()
 
-    _attach_handlers("flask.app", [queue_handler], logging.INFO)
-    _attach_handlers("werkzeug", [queue_handler], logging.INFO)
+    _attach_handlers("flask.app", [queue_handler], resolved_level)
+    _attach_handlers("werkzeug", [queue_handler], resolved_level)
 
     _LOG_CONTEXT = LogContext(
         start_time=start_time,

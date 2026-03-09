@@ -90,7 +90,8 @@ class App(QMainWindow):
         self.resize(720, 360)
         self.setMinimumSize(640, 320)
 
-        self.log_context: LogContext = setup_logging(EXEC_DIR)
+        self.cfg: AppConfig = AppConfig.load(CONFIG_PATH)
+        self.log_context: LogContext = setup_logging(EXEC_DIR, self.cfg.log_level)
         self.logger: Logger = self.log_context.logger
         self.log_ctrl: LogController = LogController(self.logger)
         self.log_ctrl.info("GUI 啟動")
@@ -101,7 +102,6 @@ class App(QMainWindow):
         else:
             self.log_ctrl.warning("找不到應用程式圖示檔案。")
 
-        self.cfg: AppConfig = AppConfig.load(CONFIG_PATH)
         self.config_path: Path = CONFIG_PATH
         self.server: Optional[YoloServer] = None
         self._deps_ready: bool = False

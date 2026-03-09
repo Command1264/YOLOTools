@@ -13,6 +13,12 @@ CLOSE_LABELS: dict[str, str] = {
     "minimize": "縮到工具列",
     "exit": "直接關閉",
 }
+LOG_LEVELS: tuple[str, ...] = ("debug", "info", "warning", "error", "critical")
+
+
+def _normalize_log_level(value: Any, default: str = "info") -> str:
+    level = str(value).strip().lower()
+    return level if level in LOG_LEVELS else default
 
 
 @dataclass
@@ -25,6 +31,7 @@ class AppConfig:
     auto_start_server: bool = False
     launch_on_startup: bool = False
     close_behavior: str = "ask"
+    log_level: str = "info"
 
     @classmethod
     def from_dict(cls, data: Any) -> "AppConfig":
@@ -43,6 +50,7 @@ class AppConfig:
         )
         behavior = str(data.get("close_behavior", cfg.close_behavior)).strip()
         cfg.close_behavior = behavior if behavior in CLOSE_LABELS else cfg.close_behavior
+        cfg.log_level = _normalize_log_level(data.get("log_level", cfg.log_level), cfg.log_level)
         return cfg
 
     @classmethod
@@ -65,6 +73,7 @@ class AppConfig:
             "auto_start_server": bool(self.auto_start_server),
             "launch_on_startup": bool(self.launch_on_startup),
             "close_behavior": self.close_behavior,
+            "log_level": _normalize_log_level(self.log_level),
         }
 
     def save(self, path: Path) -> None:
