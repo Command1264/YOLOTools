@@ -1,6 +1,8 @@
 import importlib
 import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
@@ -69,6 +71,46 @@ class YoloEngine:
             self._colors = colors_mod.Colors()
         return self._colors
 
+    @staticmethod
+    def _format_model_size(size_bytes: int) -> str:
+        units = ["B", "KB", "MB", "GB", "TB", "PB"]
+        value = float(max(0, size_bytes))
+        unit_index = 0
+        while unit_index < len(units) - 1:
+            next_value = value / 1000.0
+            if next_value < 0.5:
+                break
+            value = next_value
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(value)}{units[unit_index]}"
+        return f"{value:.2f}{units[unit_index]}"
+
+    def _log_model_loading_start(self) -> None:
+        model_path = Path(self.model_path)
+        model_name = model_path.name or self.model_path
+        try:
+            size_bytes = model_path.stat().st_size
+            size_text = self._format_model_size(size_bytes)
+        except Exception:
+            size_text = "unknown"
+        self._log_ctrl.info(
+            "開始載入模型。name=%s path=%s size=%s",
+            model_name,
+            str(model_path),
+            size_text,
+        )
+
+    def _log_model_loading_done(self, elapsed_sec: float) -> None:
+        model_path = Path(self.model_path)
+        model_name = model_path.name or self.model_path
+        self._log_ctrl.info(
+            "模型載入完成。name=%s device=%s elapsed=%.3fs",
+            model_name,
+            self._device_name,
+            elapsed_sec,
+        )
+
     def load(self) -> None:
         with self._load_lock:
             torch_mod = self._ensure_torch()
@@ -76,6 +118,8 @@ class YoloEngine:
             if not self.device:
                 self.device = "cuda:0" if self._cuda_available else "cpu"
             if self._model is None:
+                start_time = time.perf_counter()
+                self._log_model_loading_start()
                 yolo_mod = importlib.import_module("ultralytics")
                 self._model = yolo_mod.YOLO(self.model_path)
                 self._names = self._model.model.names
@@ -86,6 +130,8 @@ class YoloEngine:
                         self._log_ctrl.exception("模型載入後切換裝置失敗。device=%s", self.device)
             # Resolve actual device after model is loaded.
             self._device_name = self._resolve_device_name()
+            if self._model is not None and "start_time" in locals():
+                self._log_model_loading_done(time.perf_counter() - start_time)
 
     @property
     def names(self) -> dict[int, str]:
