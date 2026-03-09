@@ -1,4 +1,4 @@
 @echo off
-start ..\..\YOLOToolsEnv\Scripts\pythonw.exe app.py
-echo 開啟伺服器完成！！！
-timeout 10
+..\..\YOLOToolsEnv\Scripts\python.exe app.py
+pause
+# timeout 10
