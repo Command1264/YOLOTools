@@ -233,6 +233,27 @@ class MillisecondFormatter(logging.Formatter):
         millis = int(record.msecs)
         return f"{base}.{millis:03d}"
 
+    def format(self, record: logging.LogRecord) -> str:
+        original_level_name = record.levelname
+        try:
+            record.levelname = self._normalize_level_name(original_level_name)
+            return super().format(record)
+        finally:
+            record.levelname = original_level_name
+
+    @staticmethod
+    def _normalize_level_name(level_name: str) -> str:
+        normalized = str(level_name).strip().lower()
+        level_map = {
+            "debug": "Debug",
+            "info": "Info",
+            "warning": "Warn",
+            "error": "Error",
+            "critical": "Crit",
+        }
+        title_name = level_map.get(normalized, normalized.capitalize())
+        return f"{title_name:>5}"
+
 
 class PlainTextFormatter(MillisecondFormatter):
     """Formatter that removes terminal-only control sequences."""
