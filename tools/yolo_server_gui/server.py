@@ -8,7 +8,7 @@ import threading
 import time
 from http import HTTPStatus
 from logging import Logger
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -16,10 +16,9 @@ from flask import Flask, Response, g, request
 from werkzeug.serving import WSGIRequestHandler, make_server
 
 from http_codec import RequestPayloadError, encode_detect_response, encode_error, parse_detect_request
-from http_schema import DetectResponse, DetectResult, DetectionItem
+from http_schema import DetectResponse, DetectResult
+from inference_dispatcher import InferenceDispatcher
 from log_manager import LogController, get_logger
-from yolo_engine import Detection, YoloEngine
-
 
 class _SilentRequestHandler(WSGIRequestHandler):
     """Disable default werkzeug request log lines."""
@@ -62,13 +61,6 @@ def _decode_base64_image(b64_str: str) -> Optional[np.ndarray]:
         return None
 
 
-def _pick_top1(dets: list[Detection]) -> Tuple[str, float]:
-    if not dets:
-        return "none", 0.0
-    best: Detection = max(dets, key=lambda d: d.conf)
-    return best.class_name, float(best.conf)
-
-
 def _extract_thread_name(payload: Any) -> str:
     if not isinstance(payload, dict):
         return "null"
@@ -76,19 +68,6 @@ def _extract_thread_name(payload: Any) -> str:
     if thread_name is None or thread_name == "":
         return "null"
     return str(thread_name)
-
-def _dets_to_payload(dets: list[Detection]) -> list[DetectionItem]:
-    payload: list[DetectionItem] = []
-    for d in dets or []:
-        payload.append(
-            DetectionItem(
-                class_id=int(d.class_id),
-                class_name=d.class_name,
-                conf=float(d.conf),
-                xyxy=[int(v) for v in d.xyxy],
-            )
-        )
-    return payload
 
 
 class YoloServer:
@@ -102,15 +81,17 @@ class YoloServer:
         conf: float = 0.25,
         logger: Optional[Logger] = None,
         icon_path: Optional[str] = None,
+        worker_count: int = 1,
     ) -> None:
         self.model_path: str = model_path
         self.host: str = host
         self.port: int = port
         self.conf: float = conf
+        self.worker_count: int = max(1, int(worker_count))
         self._logger: Logger = logger or get_logger()
         self._log_ctrl: LogController = LogController(self._logger)
         self._icon_path: Optional[str] = icon_path
-        self._engine: YoloEngine = YoloEngine(model_path)
+        self._dispatcher: InferenceDispatcher = self._create_dispatcher(model_path)
         self._app: Flask = Flask(__name__)
         self._app.add_url_rule("/", "index", self._handle_index, methods=["GET"])
         self._app.add_url_rule("/favicon.ico", "favicon", self._handle_favicon, methods=["GET"])
@@ -133,11 +114,11 @@ class YoloServer:
 
     @property
     def is_ready(self) -> bool:
-        return self._engine.is_ready
+        return self._dispatcher.is_ready
 
     @property
     def is_warming_up(self) -> bool:
-        return self._engine.is_warming_up
+        return self._dispatcher.is_warming_up
 
     @property
     def server_state(self) -> str:
@@ -147,7 +128,12 @@ class YoloServer:
     def start(self) -> None:
         if self._server is not None:
             return
-        self._server = self._create_server()
+        self._dispatcher.start()
+        try:
+            self._server = self._create_server()
+        except Exception:
+            self._dispatcher.stop()
+            raise
         with self._state_lock:
             self._server_state = "warming_up"
             self._active_requests = 0
@@ -174,6 +160,7 @@ class YoloServer:
             )
             self._server.shutdown()
             self._server.server_close()
+            self._dispatcher.stop()
         finally:
             self._server = None
             self._thread = None
@@ -186,7 +173,7 @@ class YoloServer:
 
     def update_model(self, model_path: str) -> None:
         self.model_path = model_path
-        self._engine.update_model_path(model_path)
+        self._dispatcher = self._create_dispatcher(model_path)
         self._log_ctrl.info("Model updated. model_path=%s", model_path)
 
     def update_settings(
@@ -201,17 +188,25 @@ class YoloServer:
         self.port = port
         if icon_path is not None:
             self._icon_path = icon_path
-        self._engine.update_model_path(model_path)
+        self._dispatcher = self._create_dispatcher(model_path)
         self._log_ctrl.info(
             "Settings updated. model_path=%s host=%s port=%s", model_path, host, port
         )
 
     def get_device_name(self) -> str:
-        if self._engine.is_ready:
-            return self._engine.device_name
-        if self._engine.is_warming_up:
+        if self._dispatcher.is_ready:
+            return self._dispatcher.device_name
+        if self._dispatcher.is_warming_up:
             return "loading"
-        return self._engine.device_name
+        return self._dispatcher.device_name
+
+    def _create_dispatcher(self, model_path: str) -> InferenceDispatcher:
+        return InferenceDispatcher(
+            model_path=model_path,
+            conf=self.conf,
+            iou=0.45,
+            worker_count=self.worker_count,
+        )
 
     def _create_server(self):
         try:
@@ -245,7 +240,8 @@ class YoloServer:
 
     def _run_warmup(self) -> None:
         try:
-            self._engine.warmup()
+            if not self._dispatcher.wait_until_ready(timeout_sec=120.0):
+                raise RuntimeError(self._dispatcher.warmup_error or "dispatcher warmup timeout")
             with self._state_lock:
                 if self._server_state != "stopped":
                     self._server_state = "running"
@@ -292,14 +288,14 @@ class YoloServer:
         if self._server_state == "shutting_down":
             self._log_ctrl.debug("HTTP request rejected during shutdown. path=%s", request.path)
             return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
-        if self._engine.is_ready:
-            self._log_ctrl.debug("HTTP request accepted. path=%s ready=%s", request.path, self._engine.is_ready)
+        if self._dispatcher.is_ready:
+            self._log_ctrl.debug("HTTP request accepted. path=%s ready=%s", request.path, self._dispatcher.is_ready)
             return None
         self._log_ctrl.debug(
             "HTTP request rejected while model unavailable. path=%s warming_up=%s warmup_error=%s",
             request.path,
-            self._engine.is_warming_up,
-            self._engine.warmup_error,
+            self._dispatcher.is_warming_up,
+            self._dispatcher.warmup_error,
         )
         return self._service_unavailable_response(HTTPStatus.SERVICE_UNAVAILABLE)
 
@@ -334,9 +330,9 @@ class YoloServer:
         if state == "shutting_down":
             error_detail = "server is shutting down"
         elif state == "warmup_failed":
-            error_detail = self._engine.warmup_error or "model warmup failed"
+            error_detail = self._dispatcher.warmup_error or "model warmup failed"
         else:
-            error_detail = self._engine.warmup_error or "model is warming up"
+            error_detail = self._dispatcher.warmup_error or "model is warming up"
         if request.path == "/detect":
             return self._json_response(
                 status,
@@ -421,11 +417,13 @@ class YoloServer:
         conf = self.conf if parsed_request.conf is None else parsed_request.conf
         iou = parsed_request.iou
         self._log_ctrl.debug(
-            "Detect inference batch started. threadName=%s image_count=%s conf=%s iou=%s",
+            "Detect inference batch started. threadName=%s image_count=%s conf=%s iou=%s queue_size=%s worker_count=%s",
             parsed_request.thread_name or "null",
             len(parsed_request.images),
             conf,
             iou,
+            self._dispatcher.queue_size,
+            self._dispatcher.worker_count,
         )
         results = [self._infer_single(image_b64=img, conf=conf, iou=iou) for img in parsed_request.images]
         result_payload: DetectResult | list[DetectResult]
@@ -453,32 +451,31 @@ class YoloServer:
         if self.server_state == "shutting_down":
             self._log_ctrl.debug("Single-image inference skipped because server is shutting down.")
             return DetectResult(classify_type="none", percentage=0.0, detections=[])
-        self._log_ctrl.debug("Single-image decode started. threadName=%s", getattr(g, "_thread_name", "null"))
-        img: Optional[np.ndarray] = _decode_base64_image(image_b64)
-        if img is None:
-            self._log_ctrl.debug("Single-image decode failed. threadName=%s", getattr(g, "_thread_name", "null"))
-            return DetectResult(classify_type="none", percentage=0.0, detections=[])
         self._log_ctrl.debug(
-            "Single-image decode completed. threadName=%s shape=%s",
+            "Single-image inference dispatch started. threadName=%s queue_size=%s",
             getattr(g, "_thread_name", "null"),
-            getattr(img, "shape", None),
+            self._dispatcher.queue_size,
         )
         try:
-            self._log_ctrl.debug("Single-image inference started. threadName=%s", getattr(g, "_thread_name", "null"))
-            _, dets = self._engine.infer(img, conf=conf, iou=iou)
+            result = self._dispatcher.submit(
+                thread_name=getattr(g, "_thread_name", "null"),
+                image_b64=image_b64,
+                conf=conf,
+                iou=iou,
+            )
         except Exception:
             self._log_ctrl.exception("Inference failed.")
             return DetectResult(classify_type="none", percentage=0.0, detections=[])
         self._log_ctrl.debug(
-            "Single-image inference completed. threadName=%s detection_count=%s",
+            "Single-image inference dispatch completed. threadName=%s detection_count=%s queue_size=%s",
             getattr(g, "_thread_name", "null"),
-            len(dets),
+            len(result.detections),
+            self._dispatcher.queue_size,
         )
-        cls_name, score = _pick_top1(dets)
         self._log_ctrl.debug(
             "Single-image inference result prepared. threadName=%s classify_type=%s percentage=%s",
             getattr(g, "_thread_name", "null"),
-            cls_name,
-            score,
+            result.classify_type,
+            result.percentage,
         )
-        return DetectResult(classify_type=cls_name, percentage=score, detections=_dets_to_payload(dets))
+        return result
