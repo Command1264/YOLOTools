@@ -169,9 +169,13 @@ class App(QMainWindow):
         self.ent_host: QLineEdit = QLineEdit(ip_row)
         self.ent_port: QLineEdit = QLineEdit(ip_row)
         self.ent_port.setMaximumWidth(120)
+        self.ent_worker: QLineEdit = QLineEdit(ip_row)
+        self.ent_worker.setMaximumWidth(80)
         ip_layout.addWidget(self.ent_host, 1)
         ip_layout.addWidget(QLabel("Port", ip_row))
         ip_layout.addWidget(self.ent_port)
+        ip_layout.addWidget(QLabel("Worker", ip_row))
+        ip_layout.addWidget(self.ent_worker)
         form.addRow("IP", ip_row)
 
         status_row: QWidget = QWidget(root)
@@ -197,11 +201,13 @@ class App(QMainWindow):
 
         self.ent_host.editingFinished.connect(lambda: self._apply_quick_settings(False))
         self.ent_port.editingFinished.connect(lambda: self._apply_quick_settings(False))
+        self.ent_worker.editingFinished.connect(lambda: self._apply_quick_settings(False))
 
     def _apply_config_to_ui(self) -> None:
         self.ent_model.setText(self.cfg.model_path)
         self.ent_host.setText(self.cfg.host)
         self.ent_port.setText(str(self.cfg.port))
+        self.ent_worker.setText(str(self.cfg.worker_count))
 
     def _pick_model(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

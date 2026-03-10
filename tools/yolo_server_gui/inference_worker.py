@@ -106,6 +106,11 @@ class InferenceWorker(threading.Thread):
             try:
                 if task is None:
                     return
+                self._log_ctrl.debug(
+                    "Inference worker task started. worker_id=%s thread_name=%s",
+                    self.worker_id,
+                    task.thread_name,
+                )
                 task.result_queue.put(self._process_task(task))
             finally:
                 self._task_queue.task_done()
@@ -119,6 +124,11 @@ class InferenceWorker(threading.Thread):
 
         image = _decode_base64_image(task.image_b64)
         if image is None:
+            self._log_ctrl.debug(
+                "Inference worker decode failed. worker_id=%s thread_name=%s",
+                self.worker_id,
+                task.thread_name,
+            )
             return InferenceTaskResult(
                 result=DetectResult(classify_type="none", percentage=0.0, detections=[]),
             )
@@ -126,6 +136,11 @@ class InferenceWorker(threading.Thread):
         try:
             _, detections = self._engine.infer(image, conf=task.conf, iou=task.iou)
         except Exception as exc:
+            self._log_ctrl.debug(
+                "Inference worker task failed. worker_id=%s thread_name=%s",
+                self.worker_id,
+                task.thread_name,
+            )
             error = RuntimeError(
                 f"Inference worker failed. worker_id={self.worker_id} thread_name={task.thread_name}"
             )
@@ -136,6 +151,12 @@ class InferenceWorker(threading.Thread):
             )
 
         classify_type, percentage = _pick_top1(detections)
+        self._log_ctrl.debug(
+            "Inference worker task completed. worker_id=%s thread_name=%s detection_count=%s",
+            self.worker_id,
+            task.thread_name,
+            len(detections),
+        )
         return InferenceTaskResult(
             result=DetectResult(
                 classify_type=classify_type,

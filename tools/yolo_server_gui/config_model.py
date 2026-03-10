@@ -32,6 +32,7 @@ class AppConfig:
     launch_on_startup: bool = False
     close_behavior: str = "ask"
     log_level: str = "info"
+    worker_count: int = 1
 
     @classmethod
     def from_dict(cls, data: Any) -> "AppConfig":
@@ -51,6 +52,7 @@ class AppConfig:
         behavior = str(data.get("close_behavior", cfg.close_behavior)).strip()
         cfg.close_behavior = behavior if behavior in CLOSE_LABELS else cfg.close_behavior
         cfg.log_level = _normalize_log_level(data.get("log_level", cfg.log_level), cfg.log_level)
+        cfg.worker_count = max(1, _coerce_int(data.get("worker_count", cfg.worker_count), cfg.worker_count))
         return cfg
 
     @classmethod
@@ -74,6 +76,7 @@ class AppConfig:
             "launch_on_startup": bool(self.launch_on_startup),
             "close_behavior": self.close_behavior,
             "log_level": _normalize_log_level(self.log_level),
+            "worker_count": max(1, int(self.worker_count)),
         }
 
     def save(self, path: Path) -> None:

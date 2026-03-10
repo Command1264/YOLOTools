@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from config_service import normalize_path, validate_host, validate_port
+from config_service import normalize_path, validate_host, validate_port, validate_worker_count
 from server import YoloServer
 from yolo_engine import YoloEngine
 
@@ -54,13 +54,21 @@ class ServerController:
             self.app.ent_port.setText(str(self.app.cfg.port))
             return False
 
+        worker_ok, worker_val, worker_msg = validate_worker_count(self.app.ent_worker.text())
+        if not worker_ok:
+            self.app._show_error("設定錯誤", worker_msg)
+            self.app.ent_worker.setText(str(self.app.cfg.worker_count))
+            return False
+
         self.app.cfg.model_path = model_path
         self.app.cfg.host = host_val
         self.app.cfg.port = int(port_val)
+        self.app.cfg.worker_count = int(worker_val)
         self.app.cfg.save(self.config_path)
         self.app.ent_model.setText(model_path)
         self.app.ent_host.setText(host_val)
         self.app.ent_port.setText(str(port_val))
+        self.app.ent_worker.setText(str(worker_val))
         return True
 
     def toggle_server(self) -> None:
@@ -77,6 +85,7 @@ class ServerController:
         host: str = self.app.cfg.host
         port: int = int(self.app.cfg.port)
         model_path: str = self.app.cfg.model_path
+        worker_count: int = int(self.app.cfg.worker_count)
         try:
             server_icon_path = self.select_icon_path()
             icon_path = str(server_icon_path) if server_icon_path else None
@@ -87,6 +96,7 @@ class ServerController:
                     port,
                     logger=self.app.logger,
                     icon_path=icon_path,
+                    worker_count=worker_count,
                 )
             else:
                 self.app.server.update_settings(
@@ -94,6 +104,7 @@ class ServerController:
                     host=host,
                     port=port,
                     icon_path=icon_path,
+                    worker_count=worker_count,
                 )
             self.app.server.start()
         except Exception as exc:
@@ -105,7 +116,7 @@ class ServerController:
         self.app.lbl_status.setText(f"狀態：執行中 http://{host}:{port}")
         self.app.lbl_device.setText("裝置：載入中...")
         self.load_device_async()
-        self.app.log_ctrl.info("伺服器已啟動。host=%s port=%s", host, port)
+        self.app.log_ctrl.info("伺服器已啟動。host=%s port=%s worker_count=%s", host, port, worker_count)
 
     def stop_server(self) -> None:
         """Stop running server."""
@@ -124,6 +135,7 @@ class ServerController:
         self.app.ent_model.setEnabled(not running)
         self.app.ent_host.setEnabled(not running)
         self.app.ent_port.setEnabled(not running)
+        self.app.ent_worker.setEnabled(not running)
         self.app.btn_pick_model.setEnabled(not running)
         self.app.btn_toggle.setText("停止伺服器" if running else "啟動伺服器")
         self.update_toggle_state()

@@ -64,6 +64,19 @@ def validate_port(value: str) -> tuple[bool, Optional[int], str]:
     return True, port, ""
 
 
+def validate_worker_count(value: str) -> tuple[bool, Optional[int], str]:
+    """Validate worker count as a positive integer."""
+    try:
+        worker_count = int(str(value).strip())
+    except Exception:
+        return False, None, "Worker 必須是整數"
+    if worker_count < 1:
+        return False, None, "Worker 必須大於等於 1"
+    if worker_count > 32:
+        return False, None, "Worker 目前限制在 32 以下"
+    return True, worker_count, ""
+
+
 def startup_cmd_path() -> Optional[Path]:
     """Resolve Windows startup script path."""
     if os.name != "nt":

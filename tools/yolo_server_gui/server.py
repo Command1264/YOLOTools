@@ -182,15 +182,22 @@ class YoloServer:
         host: str,
         port: int,
         icon_path: Optional[str] = None,
+        worker_count: Optional[int] = None,
     ) -> None:
         self.model_path = model_path
         self.host = host
         self.port = port
+        if worker_count is not None:
+            self.worker_count = max(1, int(worker_count))
         if icon_path is not None:
             self._icon_path = icon_path
         self._dispatcher = self._create_dispatcher(model_path)
         self._log_ctrl.info(
-            "Settings updated. model_path=%s host=%s port=%s", model_path, host, port
+            "Settings updated. model_path=%s host=%s port=%s worker_count=%s",
+            model_path,
+            host,
+            port,
+            self.worker_count,
         )
 
     def get_device_name(self) -> str:
