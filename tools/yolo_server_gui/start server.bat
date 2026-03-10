@@ -1,4 +1,4 @@
 @echo off
 ..\..\YOLOToolsEnv\Scripts\python.exe app.py
-pause
-# timeout 10
+# pause
+timeout 10
