@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import socket
@@ -14,7 +13,6 @@ from flask import Flask, Response, g, request
 from werkzeug.serving import WSGIRequestHandler, make_server
 
 from http_provider import HttpProvider, resolve_http_provider
-from http_schema import DetectResult
 from inference_dispatcher import InferenceDispatcher
 from log_manager import LogController, get_logger
 
@@ -418,7 +416,7 @@ class YoloServer:
             self._dispatcher.worker_count,
         )
         results = [self._infer_single(image_b64=img, conf=conf, iou=iou) for img in parsed_request.images]
-        result_payload: DetectResult | list[DetectResult]
+        result_payload: Any
         if parsed_request.is_batch:
             result_payload = results
         else:
@@ -439,10 +437,10 @@ class YoloServer:
         )
         return self._json_response(HTTPStatus.OK, self._http_provider.encode_detect_response(response_payload))
 
-    def _infer_single(self, image_b64: str, conf: float, iou: float | None) -> DetectResult:
+    def _infer_single(self, image_b64: str, conf: float, iou: float | None) -> Any:
         if self.server_state == "shutting_down":
             self._log_ctrl.debug("Single-image inference skipped because server is shutting down.")
-            return DetectResult(classify_type="none", percentage=0.0, detections=[])
+            return self._http_provider.detect_result_cls(classify_type="none", percentage=0.0, detections=[])
         self._log_ctrl.debug(
             "Single-image inference dispatch started. threadName=%s queue_size=%s",
             getattr(g, "_thread_name", "null"),
@@ -457,7 +455,7 @@ class YoloServer:
             )
         except Exception:
             self._log_ctrl.exception("Inference failed.")
-            return DetectResult(classify_type="none", percentage=0.0, detections=[])
+            return self._http_provider.detect_result_cls(classify_type="none", percentage=0.0, detections=[])
         self._log_ctrl.debug(
             "Single-image inference dispatch completed. threadName=%s detection_count=%s queue_size=%s",
             getattr(g, "_thread_name", "null"),
