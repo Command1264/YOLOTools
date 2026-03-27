@@ -14,11 +14,20 @@ CLOSE_LABELS: dict[str, str] = {
     "exit": "直接關閉",
 }
 LOG_LEVELS: tuple[str, ...] = ("debug", "info", "warning", "error", "critical")
+HTTP_PROFILE_LABELS: dict[str, str] = {
+    "default": "預設",
+    "taichung_fire": "TaichungFire",
+}
 
 
 def _normalize_log_level(value: Any, default: str = "info") -> str:
     level = str(value).strip().lower()
     return level if level in LOG_LEVELS else default
+
+
+def _normalize_http_profile(value: Any, default: str = "default") -> str:
+    profile = str(value).strip().lower()
+    return profile if profile in HTTP_PROFILE_LABELS else default
 
 
 @dataclass
@@ -33,6 +42,7 @@ class AppConfig:
     close_behavior: str = "ask"
     log_level: str = "info"
     worker_count: int = 1
+    http_profile: str = "default"
 
     @classmethod
     def from_dict(cls, data: Any) -> "AppConfig":
@@ -53,6 +63,7 @@ class AppConfig:
         cfg.close_behavior = behavior if behavior in CLOSE_LABELS else cfg.close_behavior
         cfg.log_level = _normalize_log_level(data.get("log_level", cfg.log_level), cfg.log_level)
         cfg.worker_count = max(1, _coerce_int(data.get("worker_count", cfg.worker_count), cfg.worker_count))
+        cfg.http_profile = _normalize_http_profile(data.get("http_profile", cfg.http_profile), cfg.http_profile)
         return cfg
 
     @classmethod
@@ -77,6 +88,7 @@ class AppConfig:
             "close_behavior": self.close_behavior,
             "log_level": _normalize_log_level(self.log_level),
             "worker_count": max(1, int(self.worker_count)),
+            "http_profile": _normalize_http_profile(self.http_profile),
         }
 
     def save(self, path: Path) -> None:

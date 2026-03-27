@@ -10,13 +10,11 @@ from http import HTTPStatus
 from logging import Logger
 from typing import Any, Optional
 
-import cv2
-import numpy as np
 from flask import Flask, Response, g, request
 from werkzeug.serving import WSGIRequestHandler, make_server
 
-from http_codec import RequestPayloadError, encode_detect_response, encode_error, parse_detect_request
-from http_schema import DetectResponse, DetectResult
+from http_provider import HttpProvider, resolve_http_provider
+from http_schema import DetectResult
 from inference_dispatcher import InferenceDispatcher
 from log_manager import LogController, get_logger
 
@@ -40,27 +38,6 @@ class _SilentRequestHandler(WSGIRequestHandler):
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         return
 
-
-def _strip_data_url(data: str) -> str:
-    if not data:
-        return ""
-    if "," in data:
-        return data.split(",", 1)[1]
-    return data
-
-
-def _decode_base64_image(b64_str: str) -> Optional[np.ndarray]:
-    if not b64_str:
-        return None
-    try:
-        raw = base64.b64decode(_strip_data_url(b64_str), validate=False)
-        arr = np.frombuffer(raw, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        return img
-    except Exception:
-        return None
-
-
 def _extract_thread_name(payload: Any) -> str:
     if not isinstance(payload, dict):
         return "null"
@@ -82,16 +59,19 @@ class YoloServer:
         logger: Optional[Logger] = None,
         icon_path: Optional[str] = None,
         worker_count: int = 1,
+        http_profile: str = "default",
     ) -> None:
         self.model_path: str = model_path
         self.host: str = host
         self.port: int = port
         self.conf: float = conf
         self.worker_count: int = max(1, int(worker_count))
+        self.http_profile: str = str(http_profile)
         self._logger: Logger = logger or get_logger()
         self._log_ctrl: LogController = LogController(self._logger)
         self._icon_path: Optional[str] = icon_path
         self._dispatcher: InferenceDispatcher = self._create_dispatcher(model_path)
+        self._http_provider: HttpProvider = resolve_http_provider(self.http_profile)
         self._app: Flask = Flask(__name__)
         self._app.add_url_rule("/", "index", self._handle_index, methods=["GET"])
         self._app.add_url_rule("/favicon.ico", "favicon", self._handle_favicon, methods=["GET"])
@@ -183,21 +163,26 @@ class YoloServer:
         port: int,
         icon_path: Optional[str] = None,
         worker_count: Optional[int] = None,
+        http_profile: Optional[str] = None,
     ) -> None:
         self.model_path = model_path
         self.host = host
         self.port = port
         if worker_count is not None:
             self.worker_count = max(1, int(worker_count))
+        if http_profile is not None:
+            self.http_profile = str(http_profile)
         if icon_path is not None:
             self._icon_path = icon_path
         self._dispatcher = self._create_dispatcher(model_path)
+        self._http_provider = resolve_http_provider(self.http_profile)
         self._log_ctrl.info(
-            "Settings updated. model_path=%s host=%s port=%s worker_count=%s",
+            "Settings updated. model_path=%s host=%s port=%s worker_count=%s http_profile=%s",
             model_path,
             host,
             port,
             self.worker_count,
+            self._http_provider.profile_name,
         )
 
     def get_device_name(self) -> str:
@@ -343,7 +328,7 @@ class YoloServer:
         if request.path == "/detect":
             return self._json_response(
                 status,
-                {"error": f"service unavailable: {error_detail}"},
+                self._http_provider.encode_error(f"service unavailable: {error_detail}"),
             )
         return self._text_response(
             status,
@@ -406,10 +391,10 @@ class YoloServer:
         self._log_ctrl.debug("Detect request parsing started. threadName=%s", getattr(g, "_thread_name", "null"))
         payload: Any = request.get_json(silent=True)
         try:
-            parsed_request = parse_detect_request(payload)
-        except RequestPayloadError as exc:
+            parsed_request = self._http_provider.parse_detect_request(payload)
+        except self._http_provider.request_payload_error as exc:
             self._log_ctrl.warning("Detect request invalid: %s", exc)
-            return self._json_response(HTTPStatus.BAD_REQUEST, encode_error(str(exc)))
+            return self._json_response(HTTPStatus.BAD_REQUEST, self._http_provider.encode_error(str(exc)))
         self._log_ctrl.debug(
             "Detect request parsed. threadName=%s image_count=%s is_batch=%s conf=%s iou=%s",
             parsed_request.thread_name or "null",
@@ -443,7 +428,7 @@ class YoloServer:
             parsed_request.thread_name or "null",
             len(results),
         )
-        response_payload = DetectResponse(
+        response_payload = self._http_provider.detect_response_cls(
             thread_name=parsed_request.thread_name,
             result=result_payload,
         )
@@ -452,7 +437,7 @@ class YoloServer:
             parsed_request.thread_name or "null",
             parsed_request.is_batch,
         )
-        return self._json_response(HTTPStatus.OK, encode_detect_response(response_payload))
+        return self._json_response(HTTPStatus.OK, self._http_provider.encode_detect_response(response_payload))
 
     def _infer_single(self, image_b64: str, conf: float, iou: float | None) -> DetectResult:
         if self.server_state == "shutting_down":

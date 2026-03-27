@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config_model import AppConfig, CLOSE_LABELS
+from config_model import AppConfig, CLOSE_LABELS, HTTP_PROFILE_LABELS
 from config_service import (
     normalize_path,
 )
@@ -278,6 +278,16 @@ class App(QMainWindow):
         close_layout.addWidget(cmb_close, 1)
         layout.addWidget(close_row)
 
+        profile_row: QWidget = QWidget(dialog)
+        profile_layout: QHBoxLayout = QHBoxLayout(profile_row)
+        profile_layout.setContentsMargins(0, 0, 0, 0)
+        profile_layout.addWidget(QLabel("HTTP Profile", profile_row))
+        cmb_http_profile = QComboBox(profile_row)
+        cmb_http_profile.addItems(list(HTTP_PROFILE_LABELS.values()))
+        cmb_http_profile.setCurrentText(HTTP_PROFILE_LABELS.get(self.cfg.http_profile, "預設"))
+        profile_layout.addWidget(cmb_http_profile, 1)
+        layout.addWidget(profile_row)
+
         btn_row: QWidget = QWidget(dialog)
         btn_layout: QHBoxLayout = QHBoxLayout(btn_row)
         btn_layout.setContentsMargins(0, 0, 0, 0)
@@ -294,7 +304,9 @@ class App(QMainWindow):
             self.cfg.auto_start_server = chk_auto_start.isChecked()
             self.cfg.launch_on_startup = chk_launch_startup.isChecked()
             label_to_key = {v: k for k, v in CLOSE_LABELS.items()}
+            profile_to_key = {v: k for k, v in HTTP_PROFILE_LABELS.items()}
             self.cfg.close_behavior = label_to_key.get(cmb_close.currentText(), "ask")
+            self.cfg.http_profile = profile_to_key.get(cmb_http_profile.currentText(), "default")
             self.cfg.save(CONFIG_PATH)
             self._apply_startup_setting()
             self.tray_controller.ensure_tray_visible()

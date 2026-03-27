@@ -86,6 +86,7 @@ class ServerController:
         port: int = int(self.app.cfg.port)
         model_path: str = self.app.cfg.model_path
         worker_count: int = int(self.app.cfg.worker_count)
+        http_profile: str = self.app.cfg.http_profile
         try:
             server_icon_path = self.select_icon_path()
             icon_path = str(server_icon_path) if server_icon_path else None
@@ -97,6 +98,7 @@ class ServerController:
                     logger=self.app.logger,
                     icon_path=icon_path,
                     worker_count=worker_count,
+                    http_profile=http_profile,
                 )
             else:
                 self.app.server.update_settings(
@@ -105,6 +107,7 @@ class ServerController:
                     port=port,
                     icon_path=icon_path,
                     worker_count=worker_count,
+                    http_profile=http_profile,
                 )
             self.app.server.start()
         except Exception as exc:
@@ -116,7 +119,13 @@ class ServerController:
         self.app.lbl_status.setText(f"狀態：執行中 http://{host}:{port}")
         self.app.lbl_device.setText("裝置：載入中...")
         self.load_device_async()
-        self.app.log_ctrl.info("伺服器已啟動。host=%s port=%s worker_count=%s", host, port, worker_count)
+        self.app.log_ctrl.info(
+            "伺服器已啟動。host=%s port=%s worker_count=%s http_profile=%s",
+            host,
+            port,
+            worker_count,
+            http_profile,
+        )
 
     def stop_server(self) -> None:
         """Stop running server."""

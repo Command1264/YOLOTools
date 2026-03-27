@@ -77,6 +77,14 @@ def validate_worker_count(value: str) -> tuple[bool, Optional[int], str]:
     return True, worker_count, ""
 
 
+def validate_http_profile(value: str) -> tuple[bool, str, str]:
+    """Validate HTTP profile option."""
+    profile = str(value).strip().lower()
+    if profile in {"default", "taichung_fire"}:
+        return True, profile, ""
+    return False, "default", "HTTP Profile 無效"
+
+
 def startup_cmd_path() -> Optional[Path]:
     """Resolve Windows startup script path."""
     if os.name != "nt":
