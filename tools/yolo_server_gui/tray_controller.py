@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from PySide6.QtGui import QAction, QCloseEvent, QIcon
+from PySide6.QtGui import QAction, QCloseEvent, QCursor, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from config_service import build_startup_command, startup_cmd_path
@@ -15,6 +15,9 @@ class TrayController:
 
     def __init__(self, app: Any) -> None:
         self.app = app
+        self._tray_menu: Optional[QMenu] = None
+        self._tray_action_show: Optional[QAction] = None
+        self._tray_action_exit: Optional[QAction] = None
 
     def setup_tray(self, select_icon_path: Callable[[], Optional[Path]]) -> None:
         """Initialize Qt native tray icon and context menu."""
@@ -23,14 +26,14 @@ class TrayController:
         if icon_path is not None:
             self.app.tray_icon.setIcon(QIcon(str(icon_path)))
         self.app.tray_icon.setToolTip("YOLO Server")
-        menu = QMenu(self.app)
-        action_show = QAction("顯示", self.app)
-        action_exit = QAction("關閉", self.app)
-        action_show.triggered.connect(self.restore_window)
-        action_exit.triggered.connect(self.exit_app)
-        menu.addAction(action_show)
-        menu.addAction(action_exit)
-        self.app.tray_icon.setContextMenu(menu)
+        self._tray_menu = QMenu(self.app)
+        self._tray_action_show = QAction("顯示", self.app)
+        self._tray_action_exit = QAction("關閉", self.app)
+        self._tray_action_show.triggered.connect(self.restore_window)
+        self._tray_action_exit.triggered.connect(self.exit_app)
+        self._tray_menu.addAction(self._tray_action_show)
+        self._tray_menu.addAction(self._tray_action_exit)
+        self.app.tray_icon.setContextMenu(self._tray_menu)
         self.app.tray_icon.activated.connect(self.on_tray_activated)
         self.app.tray_icon.show()
 
@@ -99,8 +102,19 @@ class TrayController:
 
     def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         """Handle tray activation events."""
+        self.app.log_ctrl.debug(
+            "Tray activated. reason=%s(%s)",
+            getattr(reason, "name", str(reason)),
+            getattr(reason, "value", "unknown"),
+        )
+        if reason == QSystemTrayIcon.Trigger:
+            self.restore_window()
+            return
         if reason == QSystemTrayIcon.DoubleClick:
             self.restore_window()
+            return
+        if reason == QSystemTrayIcon.Context:
+            self.app.log_ctrl.debug("Tray context menu requested.")
 
     def handle_close_event(self, event: QCloseEvent) -> bool:
         """Handle close event based on configured behavior.
