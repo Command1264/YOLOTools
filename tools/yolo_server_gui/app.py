@@ -298,7 +298,42 @@ class App(QMainWindow):
         btn_layout.addWidget(btn_save)
         layout.addWidget(btn_row)
 
-        btn_cancel.clicked.connect(dialog.reject)
+        initial_auto_start = bool(self.cfg.auto_start_server)
+        initial_launch_on_startup = bool(self.cfg.launch_on_startup)
+        initial_close_behavior = self.cfg.close_behavior
+        initial_http_profile = self.cfg.http_profile
+
+        def _has_unsaved_changes() -> bool:
+            label_to_key = {v: k for k, v in CLOSE_LABELS.items()}
+            profile_to_key = {v: k for k, v in HTTP_PROFILE_LABELS.items()}
+            current_close_behavior = label_to_key.get(cmb_close.currentText(), "ask")
+            current_http_profile = profile_to_key.get(cmb_http_profile.currentText(), "default")
+            return any(
+                (
+                    chk_auto_start.isChecked() != initial_auto_start,
+                    chk_launch_startup.isChecked() != initial_launch_on_startup,
+                    current_close_behavior != initial_close_behavior,
+                    current_http_profile != initial_http_profile,
+                )
+            )
+
+        def _confirm_discard_changes() -> bool:
+            if not _has_unsaved_changes():
+                return True
+            result = QMessageBox.question(
+                dialog,
+                "取消設定",
+                "目前有尚未儲存的變更，確定要取消嗎？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            return result == QMessageBox.Yes
+
+        def _cancel_and_close() -> None:
+            if _confirm_discard_changes():
+                dialog.reject()
+
+        btn_cancel.clicked.connect(_cancel_and_close)
 
         def _save_and_close() -> None:
             self.cfg.auto_start_server = chk_auto_start.isChecked()
@@ -313,6 +348,16 @@ class App(QMainWindow):
             dialog.accept()
 
         btn_save.clicked.connect(_save_and_close)
+
+        original_close_event = dialog.closeEvent
+
+        def _dialog_close_event(event: QCloseEvent) -> None:
+            if _confirm_discard_changes():
+                original_close_event(event)
+                return
+            event.ignore()
+
+        dialog.closeEvent = _dialog_close_event  # type: ignore[method-assign]
 
         self._center_dialog(dialog)
         dialog.exec()
