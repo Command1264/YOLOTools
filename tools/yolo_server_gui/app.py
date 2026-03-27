@@ -171,11 +171,17 @@ class App(QMainWindow):
         self.ent_port.setMaximumWidth(120)
         self.ent_worker: QLineEdit = QLineEdit(ip_row)
         self.ent_worker.setMaximumWidth(80)
+        self.cmb_http_profile: QComboBox = QComboBox(ip_row)
+        self.cmb_http_profile.setMinimumWidth(130)
+        for key, label in HTTP_PROFILE_LABELS.items():
+            self.cmb_http_profile.addItem(label, key)
         ip_layout.addWidget(self.ent_host, 1)
         ip_layout.addWidget(QLabel("Port", ip_row))
         ip_layout.addWidget(self.ent_port)
         ip_layout.addWidget(QLabel("Worker", ip_row))
         ip_layout.addWidget(self.ent_worker)
+        ip_layout.addWidget(QLabel("HTTP", ip_row))
+        ip_layout.addWidget(self.cmb_http_profile)
         form.addRow("IP", ip_row)
 
         status_row: QWidget = QWidget(root)
@@ -202,12 +208,17 @@ class App(QMainWindow):
         self.ent_host.editingFinished.connect(lambda: self._apply_quick_settings(False))
         self.ent_port.editingFinished.connect(lambda: self._apply_quick_settings(False))
         self.ent_worker.editingFinished.connect(lambda: self._apply_quick_settings(False))
+        self.cmb_http_profile.currentIndexChanged.connect(lambda: self._apply_quick_settings(False))
 
     def _apply_config_to_ui(self) -> None:
         self.ent_model.setText(self.cfg.model_path)
         self.ent_host.setText(self.cfg.host)
         self.ent_port.setText(str(self.cfg.port))
         self.ent_worker.setText(str(self.cfg.worker_count))
+        idx = self.cmb_http_profile.findData(self.cfg.http_profile)
+        self.cmb_http_profile.blockSignals(True)
+        self.cmb_http_profile.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cmb_http_profile.blockSignals(False)
 
     def _pick_model(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -278,16 +289,6 @@ class App(QMainWindow):
         close_layout.addWidget(cmb_close, 1)
         layout.addWidget(close_row)
 
-        profile_row: QWidget = QWidget(dialog)
-        profile_layout: QHBoxLayout = QHBoxLayout(profile_row)
-        profile_layout.setContentsMargins(0, 0, 0, 0)
-        profile_layout.addWidget(QLabel("HTTP Profile", profile_row))
-        cmb_http_profile = QComboBox(profile_row)
-        cmb_http_profile.addItems(list(HTTP_PROFILE_LABELS.values()))
-        cmb_http_profile.setCurrentText(HTTP_PROFILE_LABELS.get(self.cfg.http_profile, "預設"))
-        profile_layout.addWidget(cmb_http_profile, 1)
-        layout.addWidget(profile_row)
-
         btn_row: QWidget = QWidget(dialog)
         btn_layout: QHBoxLayout = QHBoxLayout(btn_row)
         btn_layout.setContentsMargins(0, 0, 0, 0)
@@ -301,19 +302,14 @@ class App(QMainWindow):
         initial_auto_start = bool(self.cfg.auto_start_server)
         initial_launch_on_startup = bool(self.cfg.launch_on_startup)
         initial_close_behavior = self.cfg.close_behavior
-        initial_http_profile = self.cfg.http_profile
-
         def _has_unsaved_changes() -> bool:
             label_to_key = {v: k for k, v in CLOSE_LABELS.items()}
-            profile_to_key = {v: k for k, v in HTTP_PROFILE_LABELS.items()}
             current_close_behavior = label_to_key.get(cmb_close.currentText(), "ask")
-            current_http_profile = profile_to_key.get(cmb_http_profile.currentText(), "default")
             return any(
                 (
                     chk_auto_start.isChecked() != initial_auto_start,
                     chk_launch_startup.isChecked() != initial_launch_on_startup,
                     current_close_behavior != initial_close_behavior,
-                    current_http_profile != initial_http_profile,
                 )
             )
 
@@ -339,9 +335,7 @@ class App(QMainWindow):
             self.cfg.auto_start_server = chk_auto_start.isChecked()
             self.cfg.launch_on_startup = chk_launch_startup.isChecked()
             label_to_key = {v: k for k, v in CLOSE_LABELS.items()}
-            profile_to_key = {v: k for k, v in HTTP_PROFILE_LABELS.items()}
             self.cfg.close_behavior = label_to_key.get(cmb_close.currentText(), "ask")
-            self.cfg.http_profile = profile_to_key.get(cmb_http_profile.currentText(), "default")
             self.cfg.save(CONFIG_PATH)
             self._apply_startup_setting()
             self.tray_controller.ensure_tray_visible()

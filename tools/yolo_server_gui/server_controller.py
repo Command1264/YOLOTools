@@ -64,11 +64,16 @@ class ServerController:
         self.app.cfg.host = host_val
         self.app.cfg.port = int(port_val)
         self.app.cfg.worker_count = int(worker_val)
+        self.app.cfg.http_profile = str(self.app.cmb_http_profile.currentData() or "default")
         self.app.cfg.save(self.config_path)
         self.app.ent_model.setText(model_path)
         self.app.ent_host.setText(host_val)
         self.app.ent_port.setText(str(port_val))
         self.app.ent_worker.setText(str(worker_val))
+        idx = self.app.cmb_http_profile.findData(self.app.cfg.http_profile)
+        self.app.cmb_http_profile.blockSignals(True)
+        self.app.cmb_http_profile.setCurrentIndex(idx if idx >= 0 else 0)
+        self.app.cmb_http_profile.blockSignals(False)
         return True
 
     def toggle_server(self) -> None:
@@ -145,6 +150,7 @@ class ServerController:
         self.app.ent_host.setEnabled(not running)
         self.app.ent_port.setEnabled(not running)
         self.app.ent_worker.setEnabled(not running)
+        self.app.cmb_http_profile.setEnabled(not running)
         self.app.btn_pick_model.setEnabled(not running)
         self.app.btn_toggle.setText("停止伺服器" if running else "啟動伺服器")
         self.update_toggle_state()
