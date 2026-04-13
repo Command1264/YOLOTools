@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from config_service import normalize_path, validate_host, validate_port, validate_worker_count
-from server import YoloServer
+from server import ServerStartupError, YoloServer
 from yolo_engine import YoloEngine
 
 
@@ -115,8 +115,24 @@ class ServerController:
                     http_profile=http_profile,
                 )
             self.app.server.start()
+        except ServerStartupError as exc:
+            self.app.server = None
+            self.set_running_state(False)
+            self.app.lbl_status.setText("狀態：啟動失敗")
+            self.app.lbl_device.setText("裝置：未啟動")
+            self.app.log_ctrl.error(
+                "伺服器啟動失敗。host=%s port=%s detail=%s",
+                host,
+                port,
+                exc.detail,
+            )
+            self.app._show_error("啟動失敗", exc.user_message)
+            return
         except Exception as exc:
             self.app.server = None
+            self.set_running_state(False)
+            self.app.lbl_status.setText("狀態：啟動失敗")
+            self.app.lbl_device.setText("裝置：未啟動")
             self.app.log_ctrl.exception("啟動伺服器失敗。")
             self.app._show_error("啟動失敗", f"無法啟動伺服器：\n{exc}")
             return

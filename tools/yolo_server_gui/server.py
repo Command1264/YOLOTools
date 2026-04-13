@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import socket
@@ -10,11 +12,63 @@ from logging import Logger
 from typing import Any, Optional
 
 from flask import Flask, Response, g, request
-from werkzeug.serving import WSGIRequestHandler, make_server
+from werkzeug.serving import WSGIRequestHandler, get_sockaddr, make_server, select_address_family
 
 from http_provider import HttpProvider, resolve_http_provider
 from inference_dispatcher import InferenceDispatcher
 from log_manager import LogController, get_logger
+
+ACCESS_DENIED_HINTS: tuple[str, ...] = (
+    "permission denied",
+    "access denied",
+    "存取通訊端被拒絕",
+    "存取權限不足",
+)
+ADDRESS_IN_USE_HINTS: tuple[str, ...] = (
+    "address already in use",
+    "port is in use",
+    "only one usage of each socket address",
+    "位址已在使用中",
+    "已被其他程式使用",
+    "只能以一種用法",
+)
+
+
+class ServerStartupError(Exception):
+    """Raised when the HTTP server cannot start safely."""
+
+    def __init__(self, user_message: str, detail: str) -> None:
+        super().__init__(detail)
+        self.user_message = user_message
+        self.detail = detail
+
+
+def _contains_hint(text: str, hints: tuple[str, ...]) -> bool:
+    normalized = str(text).casefold()
+    return any(hint.casefold() in normalized for hint in hints)
+
+
+def _build_bind_error_message(host: str, port: int, detail: str) -> str:
+    address_text = f"{host}:{port}"
+    normalized_detail = str(detail).strip() or "無法綁定指定的通訊埠。"
+    if _contains_hint(normalized_detail, ACCESS_DENIED_HINTS):
+        summary = (
+            f"無法啟動伺服器，因為系統拒絕綁定 {address_text}。\n"
+            "可能是該 Port 需要較高權限、已被系統保留，或被安全性軟體封鎖。\n"
+            "建議改用其他 Port（例如 60922）後再試一次。"
+        )
+    elif _contains_hint(normalized_detail, ADDRESS_IN_USE_HINTS):
+        summary = (
+            f"無法啟動伺服器，因為 {address_text} 已被其他程式使用。\n"
+            "請改用其他 Port（例如 60922），或先停止占用該 Port 的程式。"
+        )
+    else:
+        summary = (
+            f"無法啟動伺服器，因為 {address_text} 無法綁定。\n"
+            "請確認 IP/Port 設定正確，且該 Port 沒有被系統或其他程式占用。\n"
+            "可先改用其他 Port（例如 60922）後再試一次。"
+        )
+    return f"{summary}\n\n系統訊息：{normalized_detail}"
 
 class _SilentRequestHandler(WSGIRequestHandler):
     """Disable default werkzeug request log lines."""
@@ -106,20 +160,21 @@ class YoloServer:
     def start(self) -> None:
         if self._server is not None:
             return
-        self._dispatcher.start()
         try:
+            self._validate_bind_target()
             self._server = self._create_server()
+            self._dispatcher.start()
+            with self._state_lock:
+                self._server_state = "warming_up"
+                self._active_requests = 0
+                self._rejected_requests = 0
+            self._thread = threading.Thread(target=self._run_server, daemon=True)
+            self._thread.start()
+            self._warmup_thread = threading.Thread(target=self._run_warmup, daemon=True)
+            self._warmup_thread.start()
         except Exception:
-            self._dispatcher.stop()
+            self._cleanup_failed_start()
             raise
-        with self._state_lock:
-            self._server_state = "warming_up"
-            self._active_requests = 0
-            self._rejected_requests = 0
-        self._thread = threading.Thread(target=self._run_server, daemon=True)
-        self._thread.start()
-        self._warmup_thread = threading.Thread(target=self._run_warmup, daemon=True)
-        self._warmup_thread.start()
         self._log_ctrl.info("Server started. host=%s port=%s", self.host, self.port)
 
     def stop(self) -> None:
@@ -198,30 +253,65 @@ class YoloServer:
             worker_count=self.worker_count,
         )
 
-    def _create_server(self):
+    def _validate_bind_target(self) -> None:
+        address_family = select_address_family(self.host, self.port)
+        server_address = get_sockaddr(self.host, int(self.port), address_family)
+        probe_socket = socket.socket(address_family, socket.SOCK_STREAM)
         try:
-            server = make_server(
-                self.host,
-                self.port,
-                self._app,
-                threaded=True,
-                request_handler=_SilentRequestHandler,
-            )
-            setattr(server, "http_owner", self)
-            setattr(server, "daemon_threads", True)
-            setattr(server, "block_on_close", False)
-            return server
-        except TypeError:
-            server = make_server(
-                self.host,
-                self.port,
-                self._app,
-                request_handler=_SilentRequestHandler,
-            )
-            setattr(server, "http_owner", self)
-            setattr(server, "daemon_threads", True)
-            setattr(server, "block_on_close", False)
-            return server
+            probe_socket.bind(server_address)
+        except OSError as exc:
+            detail = str(exc).strip() or getattr(exc, "strerror", "") or "socket bind failed"
+            raise ServerStartupError(_build_bind_error_message(self.host, self.port, detail), detail) from exc
+        finally:
+            probe_socket.close()
+
+    def _cleanup_failed_start(self) -> None:
+        try:
+            self._dispatcher.stop()
+        except Exception:
+            self._log_ctrl.exception("Dispatcher cleanup failed after startup error.")
+        try:
+            if self._server is not None:
+                self._server.server_close()
+        except Exception:
+            self._log_ctrl.exception("HTTP server cleanup failed after startup error.")
+        finally:
+            self._server = None
+            self._thread = None
+            self._warmup_thread = None
+            with self._state_lock:
+                self._server_state = "stopped"
+                self._active_requests = 0
+                self._rejected_requests = 0
+
+    def _create_server(self):
+        stderr_buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr_buffer):
+                try:
+                    server = make_server(
+                        self.host,
+                        self.port,
+                        self._app,
+                        threaded=True,
+                        request_handler=_SilentRequestHandler,
+                    )
+                except TypeError:
+                    server = make_server(
+                        self.host,
+                        self.port,
+                        self._app,
+                        request_handler=_SilentRequestHandler,
+                    )
+        except SystemExit as exc:
+            detail = stderr_buffer.getvalue().strip()
+            if not detail:
+                detail = f"Werkzeug terminated during startup. exit_code={exc.code}"
+            raise ServerStartupError(_build_bind_error_message(self.host, self.port, detail), detail) from exc
+        setattr(server, "http_owner", self)
+        setattr(server, "daemon_threads", True)
+        setattr(server, "block_on_close", False)
+        return server
 
     def _run_server(self) -> None:
         if self._server is None:
