@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from config_service import normalize_path, validate_host, validate_port, validate_worker_count
+from config_service import normalize_path, validate_gpu_replica_count, validate_host, validate_port
 from server import ServerStartupError, YoloServer
 from yolo_engine import YoloEngine
 
@@ -54,22 +54,22 @@ class ServerController:
             self.app.ent_port.setText(str(self.app.cfg.port))
             return False
 
-        worker_ok, worker_val, worker_msg = validate_worker_count(self.app.ent_worker.text())
-        if not worker_ok:
-            self.app._show_error("設定錯誤", worker_msg)
-            self.app.ent_worker.setText(str(self.app.cfg.worker_count))
+        gpu_ok, gpu_val, gpu_msg = validate_gpu_replica_count(self.app.ent_worker.text())
+        if not gpu_ok:
+            self.app._show_error("設定錯誤", gpu_msg)
+            self.app.ent_worker.setText(str(self.app.cfg.gpu_replica_count))
             return False
 
         self.app.cfg.model_path = model_path
         self.app.cfg.host = host_val
         self.app.cfg.port = int(port_val)
-        self.app.cfg.worker_count = int(worker_val)
+        self.app.cfg.gpu_replica_count = int(gpu_val)
         self.app.cfg.http_profile = str(self.app.cmb_http_profile.currentData() or "default")
         self.app.cfg.save(self.config_path)
         self.app.ent_model.setText(model_path)
         self.app.ent_host.setText(host_val)
         self.app.ent_port.setText(str(port_val))
-        self.app.ent_worker.setText(str(worker_val))
+        self.app.ent_worker.setText(str(gpu_val))
         idx = self.app.cmb_http_profile.findData(self.app.cfg.http_profile)
         self.app.cmb_http_profile.blockSignals(True)
         self.app.cmb_http_profile.setCurrentIndex(idx if idx >= 0 else 0)
@@ -90,7 +90,7 @@ class ServerController:
         host: str = self.app.cfg.host
         port: int = int(self.app.cfg.port)
         model_path: str = self.app.cfg.model_path
-        worker_count: int = int(self.app.cfg.worker_count)
+        gpu_replica_count: int = int(self.app.cfg.gpu_replica_count)
         http_profile: str = self.app.cfg.http_profile
         try:
             server_icon_path = self.select_icon_path()
@@ -102,7 +102,7 @@ class ServerController:
                     port,
                     logger=self.app.logger,
                     icon_path=icon_path,
-                    worker_count=worker_count,
+                    gpu_replica_count=gpu_replica_count,
                     http_profile=http_profile,
                 )
             else:
@@ -111,7 +111,7 @@ class ServerController:
                     host=host,
                     port=port,
                     icon_path=icon_path,
-                    worker_count=worker_count,
+                    gpu_replica_count=gpu_replica_count,
                     http_profile=http_profile,
                 )
             self.app.server.start()
@@ -141,10 +141,10 @@ class ServerController:
         self.app.lbl_device.setText("裝置：載入中...")
         self.load_device_async()
         self.app.log_ctrl.info(
-            "伺服器已啟動。host=%s port=%s worker_count=%s http_profile=%s",
+            "伺服器已啟動。host=%s port=%s gpu_replica_count=%s http_profile=%s",
             host,
             port,
-            worker_count,
+            gpu_replica_count,
             http_profile,
         )
 

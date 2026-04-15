@@ -110,14 +110,14 @@ class YoloServer:
         conf: float = 0.25,
         logger: Optional[Logger] = None,
         icon_path: Optional[str] = None,
-        worker_count: int = 1,
+        gpu_replica_count: int = 1,
         http_profile: str = "default",
     ) -> None:
         self.model_path: str = model_path
         self.host: str = host
         self.port: int = port
         self.conf: float = conf
-        self.worker_count: int = max(1, int(worker_count))
+        self.gpu_replica_count: int = max(1, int(gpu_replica_count))
         self.http_profile: str = str(http_profile)
         self._logger: Logger = logger or get_logger()
         self._log_ctrl: LogController = LogController(self._logger)
@@ -133,6 +133,7 @@ class YoloServer:
         self._server: Optional[object] = None
         self._thread: Optional[threading.Thread] = None
         self._warmup_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
         self._state_lock = threading.RLock()
         self._active_requests = 0
         self._server_state = "stopped"
@@ -161,6 +162,7 @@ class YoloServer:
         if self._server is not None:
             return
         try:
+            self._stop_event.clear()
             self._validate_bind_target()
             self._server = self._create_server()
             self._dispatcher.start()
@@ -180,6 +182,9 @@ class YoloServer:
     def stop(self) -> None:
         if self._server is None:
             return
+        server_thread = self._thread
+        warmup_thread = self._warmup_thread
+        self._stop_event.set()
         try:
             with self._state_lock:
                 self._server_state = "shutting_down"
@@ -193,7 +198,17 @@ class YoloServer:
             )
             self._server.shutdown()
             self._server.server_close()
-            self._dispatcher.stop()
+            workers_stopped = self._dispatcher.stop()
+            if not workers_stopped:
+                self._log_ctrl.warning("Inference dispatcher left worker threads running after shutdown request.")
+            if server_thread is not None:
+                server_thread.join(timeout=2.0)
+                if server_thread.is_alive():
+                    self._log_ctrl.warning("HTTP server thread did not stop within timeout.")
+            if warmup_thread is not None:
+                warmup_thread.join(timeout=2.0)
+                if warmup_thread.is_alive():
+                    self._log_ctrl.warning("Warmup thread did not stop within timeout.")
         finally:
             self._server = None
             self._thread = None
@@ -215,14 +230,14 @@ class YoloServer:
         host: str,
         port: int,
         icon_path: Optional[str] = None,
-        worker_count: Optional[int] = None,
+        gpu_replica_count: Optional[int] = None,
         http_profile: Optional[str] = None,
     ) -> None:
         self.model_path = model_path
         self.host = host
         self.port = port
-        if worker_count is not None:
-            self.worker_count = max(1, int(worker_count))
+        if gpu_replica_count is not None:
+            self.gpu_replica_count = max(1, int(gpu_replica_count))
         if http_profile is not None:
             self.http_profile = str(http_profile)
         if icon_path is not None:
@@ -230,11 +245,11 @@ class YoloServer:
         self._dispatcher = self._create_dispatcher(model_path)
         self._http_provider = resolve_http_provider(self.http_profile)
         self._log_ctrl.info(
-            "Settings updated. model_path=%s host=%s port=%s worker_count=%s http_profile=%s",
+            "Settings updated. model_path=%s host=%s port=%s gpu_replica_count=%s http_profile=%s",
             model_path,
             host,
             port,
-            self.worker_count,
+            self.gpu_replica_count,
             self._http_provider.profile_name,
         )
 
@@ -250,7 +265,7 @@ class YoloServer:
             model_path=model_path,
             conf=self.conf,
             iou=0.45,
-            worker_count=self.worker_count,
+            gpu_replica_count=self.gpu_replica_count,
         )
 
     def _validate_bind_target(self) -> None:
@@ -266,6 +281,7 @@ class YoloServer:
             probe_socket.close()
 
     def _cleanup_failed_start(self) -> None:
+        self._stop_event.set()
         try:
             self._dispatcher.stop()
         except Exception:
@@ -320,7 +336,10 @@ class YoloServer:
 
     def _run_warmup(self) -> None:
         try:
-            if not self._dispatcher.wait_until_ready(timeout_sec=120.0):
+            if not self._dispatcher.wait_until_ready(timeout_sec=120.0, cancel_event=self._stop_event):
+                if self._stop_event.is_set():
+                    self._log_ctrl.info("Model warmup cancelled during shutdown.")
+                    return
                 raise RuntimeError(self._dispatcher.warmup_error or "dispatcher warmup timeout")
             with self._state_lock:
                 if self._server_state != "stopped":
@@ -497,15 +516,15 @@ class YoloServer:
         conf = self.conf if parsed_request.conf is None else parsed_request.conf
         iou = parsed_request.iou
         self._log_ctrl.debug(
-            "Detect inference batch started. threadName=%s image_count=%s conf=%s iou=%s queue_size=%s worker_count=%s",
+            "Detect inference batch started. threadName=%s image_count=%s conf=%s iou=%s queue_size=%s gpu_replica_count=%s",
             parsed_request.thread_name or "null",
             len(parsed_request.images),
             conf,
             iou,
             self._dispatcher.queue_size,
-            self._dispatcher.worker_count,
+            self._dispatcher.gpu_replica_count,
         )
-        results = [self._infer_single(image_b64=img, conf=conf, iou=iou) for img in parsed_request.images]
+        results = self._infer_many(images_b64=parsed_request.images, conf=conf, iou=iou)
         result_payload: Any
         if parsed_request.is_batch:
             result_payload = results
@@ -528,34 +547,42 @@ class YoloServer:
         return self._json_response(HTTPStatus.OK, self._http_provider.encode_detect_response(response_payload))
 
     def _infer_single(self, image_b64: str, conf: float, iou: float | None) -> Any:
-        if self.server_state == "shutting_down":
-            self._log_ctrl.debug("Single-image inference skipped because server is shutting down.")
+        results = self._infer_many(images_b64=[image_b64], conf=conf, iou=iou)
+        if not results:
             return self._http_provider.detect_result_cls(classify_type="none", percentage=0.0, detections=[])
+        return results[0]
+
+    def _infer_many(self, images_b64: list[str], conf: float, iou: float | None) -> list[Any]:
+        """Dispatch batch inference while preserving response order."""
+        if self.server_state == "shutting_down":
+            self._log_ctrl.debug("Batch inference skipped because server is shutting down.")
+            return [
+                self._http_provider.detect_result_cls(classify_type="none", percentage=0.0, detections=[])
+                for _ in images_b64
+            ]
         self._log_ctrl.debug(
-            "Single-image inference dispatch started. threadName=%s queue_size=%s",
+            "Batch inference dispatch started. threadName=%s image_count=%s queue_size=%s",
             getattr(g, "_thread_name", "null"),
+            len(images_b64),
             self._dispatcher.queue_size,
         )
         try:
-            result = self._dispatcher.submit(
+            results = self._dispatcher.submit_many(
                 thread_name=getattr(g, "_thread_name", "null"),
-                image_b64=image_b64,
+                images_b64=images_b64,
                 conf=conf,
                 iou=iou,
             )
         except Exception:
-            self._log_ctrl.exception("Inference failed.")
-            return self._http_provider.detect_result_cls(classify_type="none", percentage=0.0, detections=[])
+            self._log_ctrl.exception("Batch inference failed.")
+            return [
+                self._http_provider.detect_result_cls(classify_type="none", percentage=0.0, detections=[])
+                for _ in images_b64
+            ]
         self._log_ctrl.debug(
-            "Single-image inference dispatch completed. threadName=%s detection_count=%s queue_size=%s",
+            "Batch inference dispatch completed. threadName=%s image_count=%s queue_size=%s",
             getattr(g, "_thread_name", "null"),
-            len(result.detections),
+            len(results),
             self._dispatcher.queue_size,
         )
-        self._log_ctrl.debug(
-            "Single-image inference result prepared. threadName=%s classify_type=%s percentage=%s",
-            getattr(g, "_thread_name", "null"),
-            result.classify_type,
-            result.percentage,
-        )
-        return result
+        return results

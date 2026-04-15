@@ -28,7 +28,7 @@ class DummyDispatcher:
         self.warmup_error = None
         self.device_name = "unknown"
         self.queue_size = 0
-        self.worker_count = 1
+        self.gpu_replica_count = 1
 
     def start(self) -> None:
         self.start_calls += 1
@@ -123,7 +123,7 @@ class ServerStartupTests(unittest.TestCase):
                 host="127.0.0.1",
                 port=3000,
                 model_path="dummy.pt",
-                worker_count=4,
+                gpu_replica_count=4,
                 http_profile="default",
             ),
             server=None,

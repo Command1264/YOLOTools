@@ -64,17 +64,22 @@ def validate_port(value: str) -> tuple[bool, Optional[int], str]:
     return True, port, ""
 
 
-def validate_worker_count(value: str) -> tuple[bool, Optional[int], str]:
-    """Validate worker count as a positive integer."""
+def validate_gpu_replica_count(value: str) -> tuple[bool, Optional[int], str]:
+    """Validate GPU replica count as a positive integer."""
     try:
-        worker_count = int(str(value).strip())
+        gpu_replica_count = int(str(value).strip())
     except Exception:
-        return False, None, "Worker 必須是整數"
-    if worker_count < 1:
-        return False, None, "Worker 必須大於等於 1"
-    if worker_count > 32:
-        return False, None, "Worker 目前限制在 32 以下"
-    return True, worker_count, ""
+        return False, None, "GPU 副本數必須是整數"
+    if gpu_replica_count < 1:
+        return False, None, "GPU 副本數必須大於等於 1"
+    if gpu_replica_count > 32:
+        return False, None, "GPU 副本數目前限制在 32 以下"
+    return True, gpu_replica_count, ""
+
+
+def validate_worker_count(value: str) -> tuple[bool, Optional[int], str]:
+    """Backward-compatible wrapper for legacy worker count validation."""
+    return validate_gpu_replica_count(value)
 
 
 def validate_http_profile(value: str) -> tuple[bool, str, str]:

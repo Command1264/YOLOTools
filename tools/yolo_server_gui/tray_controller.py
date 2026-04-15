@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QIcon
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from config_service import build_startup_command, startup_cmd_path
@@ -18,9 +19,16 @@ class TrayController:
         self._tray_menu: Optional[QMenu] = None
         self._tray_action_show: Optional[QAction] = None
         self._tray_action_exit: Optional[QAction] = None
+        self._tray_available: bool = False
 
     def setup_tray(self, select_icon_path: Callable[[], Optional[Path]]) -> None:
         """Initialize Qt native tray icon and context menu."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_available = False
+            self.app.tray_icon = None
+            self.app.log_ctrl.warning("系統工具列不可用，停用 tray 功能。")
+            return
+        self._tray_available = True
         self.app.tray_icon = QSystemTrayIcon(self.app)
         icon_path = select_icon_path()
         if icon_path is not None:
@@ -30,7 +38,7 @@ class TrayController:
         self._tray_action_show = QAction("顯示", self.app)
         self._tray_action_exit = QAction("關閉", self.app)
         self._tray_action_show.triggered.connect(self.restore_window)
-        self._tray_action_exit.triggered.connect(self.exit_app)
+        self._tray_action_exit.triggered.connect(self.request_exit_from_tray)
         self._tray_menu.addAction(self._tray_action_show)
         self._tray_menu.addAction(self._tray_action_exit)
         self.app.tray_icon.setContextMenu(self._tray_menu)
@@ -39,7 +47,7 @@ class TrayController:
 
     def ensure_tray_visible(self) -> None:
         """Ensure tray icon is visible."""
-        if self.app.tray_icon is not None:
+        if self._tray_available and self.app.tray_icon is not None:
             self.app.tray_icon.show()
 
     def apply_startup_setting(self) -> None:
@@ -61,18 +69,27 @@ class TrayController:
 
     def minimize_to_tray(self) -> None:
         """Hide app window to tray on Windows, otherwise exit."""
-        if os.name != "nt":
+        if os.name != "nt" or not self._tray_available or self.app.tray_icon is None:
+            if os.name == "nt" and not self._tray_available:
+                self.app.log_ctrl.warning("系統工具列不可用，改為直接關閉程式。")
             self.exit_app()
             return
         self.app.hide()
-        if self.app.tray_icon is not None:
-            self.app.tray_icon.show()
+        self.app.tray_icon.show()
 
     def restore_window(self) -> None:
         """Restore app window from tray."""
         self.app.showNormal()
         self.app.raise_()
         self.app.activateWindow()
+
+    def request_exit_from_tray(self) -> None:
+        """Close the tray menu first, then start the application shutdown flow."""
+        if self.app._quitting:
+            return
+        if self._tray_action_exit is not None:
+            self._tray_action_exit.setEnabled(False)
+        QTimer.singleShot(0, self.exit_app)
 
     def exit_app(self) -> None:
         """Exit app and release runtime resources."""

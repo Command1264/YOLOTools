@@ -11,7 +11,7 @@ from http_schema import DetectResult
 class InferenceTaskResult:
     """Carry one inference result or one execution error."""
 
-    result: Optional[DetectResult] = None
+    results: Optional[list[DetectResult]] = None
     error: Optional[Exception] = None
 
 
@@ -20,7 +20,7 @@ class InferenceTask:
     """Represent one queued inference request."""
 
     thread_name: str
-    image_b64: str
+    images_b64: list[str]
     conf: float
     iou: float | None
     result_queue: queue.Queue[InferenceTaskResult] = field(

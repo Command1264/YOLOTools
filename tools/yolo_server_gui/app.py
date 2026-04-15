@@ -178,7 +178,7 @@ class App(QMainWindow):
         ip_layout.addWidget(self.ent_host, 1)
         ip_layout.addWidget(QLabel("Port", ip_row))
         ip_layout.addWidget(self.ent_port)
-        ip_layout.addWidget(QLabel("Worker", ip_row))
+        ip_layout.addWidget(QLabel("GPU", ip_row))
         ip_layout.addWidget(self.ent_worker)
         ip_layout.addWidget(QLabel("HTTP", ip_row))
         ip_layout.addWidget(self.cmb_http_profile)
@@ -214,7 +214,7 @@ class App(QMainWindow):
         self.ent_model.setText(self.cfg.model_path)
         self.ent_host.setText(self.cfg.host)
         self.ent_port.setText(str(self.cfg.port))
-        self.ent_worker.setText(str(self.cfg.worker_count))
+        self.ent_worker.setText(str(self.cfg.gpu_replica_count))
         idx = self.cmb_http_profile.findData(self.cfg.http_profile)
         self.cmb_http_profile.blockSignals(True)
         self.cmb_http_profile.setCurrentIndex(idx if idx >= 0 else 0)
@@ -412,6 +412,7 @@ class App(QMainWindow):
 
 if __name__ == "__main__":
     qt_app = QApplication(sys.argv)
+    qt_app.setQuitOnLastWindowClosed(False)
     icon_path = _select_icon_path()
     if icon_path is not None:
         qt_app.setWindowIcon(QIcon(str(icon_path)))

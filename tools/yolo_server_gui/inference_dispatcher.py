@@ -19,13 +19,13 @@ class InferenceDispatcher:
         model_path: str,
         conf: float,
         iou: float,
-        worker_count: int = 1,
+        gpu_replica_count: int = 1,
         queue_size: int = 0,
     ) -> None:
         self._model_path = model_path
         self._conf = conf
         self._iou = iou
-        self._worker_count = max(1, int(worker_count))
+        self._gpu_replica_count = max(1, int(gpu_replica_count))
         self._task_queue: queue.Queue[TaskQueueItem] = queue.Queue(maxsize=max(0, int(queue_size)))
         self._workers: list[InferenceWorker] = []
         self._started = False
@@ -60,8 +60,8 @@ class InferenceDispatcher:
         return self._task_queue.qsize()
 
     @property
-    def worker_count(self) -> int:
-        return self._worker_count
+    def gpu_replica_count(self) -> int:
+        return self._gpu_replica_count
 
     def start(self) -> None:
         """Start worker threads once."""
@@ -76,37 +76,57 @@ class InferenceDispatcher:
                     iou=self._iou,
                     task_queue=self._task_queue,
                 )
-                for index in range(self._worker_count)
+                for index in range(self._gpu_replica_count)
             ]
             for worker in self._workers:
                 worker.start()
             self._started = True
             self._stopped = False
             self._log_ctrl.info(
-                "Inference dispatcher started. worker_count=%s queue_size=%s",
-                self._worker_count,
+                "Inference dispatcher started. gpu_replica_count=%s queue_size=%s",
+                self._gpu_replica_count,
                 self._task_queue.maxsize,
             )
 
-    def stop(self) -> None:
-        """Stop workers and fail remaining queued tasks."""
+    def stop(self) -> bool:
+        """Stop workers and fail remaining queued tasks.
+
+        Returns:
+            bool: True if all workers stopped within the join timeout.
+        """
         with self._start_lock:
             if not self._started or self._stopped:
-                return
+                return True
             self._stopped = True
             self._fail_pending_tasks()
             for _ in self._workers:
                 self._task_queue.put(None)
+            alive_worker_names: list[str] = []
             for worker in self._workers:
                 worker.join(timeout=2.0)
+                if worker.is_alive():
+                    alive_worker_names.append(worker.name)
+            all_workers_stopped = not alive_worker_names
+            if alive_worker_names:
+                self._log_ctrl.warning(
+                    "Inference dispatcher workers did not stop within timeout. workers=%s",
+                    ", ".join(alive_worker_names),
+                )
             self._workers = []
             self._started = False
             self._log_ctrl.info("Inference dispatcher stopped.")
+            return all_workers_stopped
 
-    def wait_until_ready(self, timeout_sec: float | None = None) -> bool:
+    def wait_until_ready(
+        self,
+        timeout_sec: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
         """Wait until all workers are warmed up or one fails."""
         deadline = None if timeout_sec is None else time.perf_counter() + timeout_sec
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
             if self.is_ready:
                 return True
             if self.warmup_error:
@@ -117,11 +137,26 @@ class InferenceDispatcher:
 
     def submit(self, thread_name: str, image_b64: str, conf: float, iou: float | None) -> DetectResult:
         """Submit one inference task and block until the worker finishes it."""
+        results = self.submit_many(thread_name=thread_name, images_b64=[image_b64], conf=conf, iou=iou)
+        if not results:
+            raise RuntimeError("Inference dispatcher returned an empty batch.")
+        return results[0]
+
+    def submit_many(
+        self,
+        thread_name: str,
+        images_b64: list[str],
+        conf: float,
+        iou: float | None,
+    ) -> list[DetectResult]:
+        """Submit a batch inference task and block until the worker finishes it."""
         if not self._started or self._stopped:
             raise RuntimeError("Inference dispatcher is not running.")
+        if not images_b64:
+            return []
         task = InferenceTask(
             thread_name=thread_name,
-            image_b64=image_b64,
+            images_b64=list(images_b64),
             conf=conf,
             iou=iou,
         )
@@ -129,9 +164,9 @@ class InferenceDispatcher:
         outcome = task.result_queue.get()
         if outcome.error is not None:
             raise outcome.error
-        if outcome.result is None:
+        if outcome.results is None:
             raise RuntimeError("Inference dispatcher returned an empty result.")
-        return outcome.result
+        return outcome.results
 
     def _fail_pending_tasks(self) -> None:
         pending: list[InferenceTask] = []

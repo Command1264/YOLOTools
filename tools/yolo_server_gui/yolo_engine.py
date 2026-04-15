@@ -160,12 +160,28 @@ class YoloEngine:
     def infer(
         self, frame_bgr: object, conf: Optional[float] = None, iou: Optional[float] = None
     ) -> Tuple[Optional[object], List[Detection]]:
+        """Run inference for a single image."""
+        batch_results = self.infer_many([frame_bgr], conf=conf, iou=iou)
+        if not batch_results:
+            return None, []
+        return batch_results[0]
+
+    def infer_many(
+        self,
+        frames_bgr: List[object],
+        conf: Optional[float] = None,
+        iou: Optional[float] = None,
+    ) -> List[Tuple[Optional[object], List[Detection]]]:
+        """Run inference for multiple images in one model call when possible."""
+        if not frames_bgr:
+            return []
         self.load()
         conf = self.conf if conf is None else conf
         iou = self.iou if iou is None else iou
+        sources: object = frames_bgr[0] if len(frames_bgr) == 1 else frames_bgr
         with self._predict_lock:
             results = self._model.predict(
-                source=frame_bgr,
+                source=sources,
                 conf=conf,
                 iou=iou,
                 device=self.device,
@@ -173,11 +189,21 @@ class YoloEngine:
             )
             self._device_name = self._resolve_device_name()
         if not results:
+            return [(None, []) for _ in frames_bgr]
+        parsed_results: List[Tuple[Optional[object], List[Detection]]] = [
+            self._parse_inference_result(result_item) for result_item in list(results)[: len(frames_bgr)]
+        ]
+        while len(parsed_results) < len(frames_bgr):
+            parsed_results.append((None, []))
+        return parsed_results
+
+    def _parse_inference_result(self, result_item: object) -> Tuple[Optional[object], List[Detection]]:
+        """Convert one Ultralytics result object into internal detection models."""
+        if result_item is None:
             return None, []
-        r: object = results[0]
         dets: List[Detection] = []
-        if r.boxes is not None:
-            for b in r.boxes:
+        if result_item.boxes is not None:
+            for b in result_item.boxes:
                 cls_id: int = int(b.cls.item())
                 conf = float(b.conf.item())
                 xyxy: list[int] = b.xyxy[0].cpu().numpy().astype(int).tolist()
@@ -189,7 +215,7 @@ class YoloEngine:
                         xyxy=(xyxy[0], xyxy[1], xyxy[2], xyxy[3]),
                     )
                 )
-        return r, dets
+        return result_item, dets
 
     def warmup(self) -> None:
         """Load the model and run a dummy inference once."""
