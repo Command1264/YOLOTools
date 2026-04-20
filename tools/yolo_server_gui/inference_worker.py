@@ -1,38 +1,16 @@
 from __future__ import annotations
 
-import base64
 import queue
 import threading
+import time
 from typing import Optional
 
-import cv2
-import numpy as np
-
 from http_schema import DetectResult, DetectionItem
-from inference_job import InferenceTask, InferenceTaskResult, TaskQueueItem
+from inference_job import DecodedInferenceTask, DecodedTaskQueueItem, InferenceTaskResult
 from log_manager import LogController, get_logger
 from yolo_engine import Detection, YoloEngine
 
 MAX_BATCH_IMAGES_PER_TASK = 8
-
-
-def _strip_data_url(data: str) -> str:
-    if not data:
-        return ""
-    if "," in data:
-        return data.split(",", 1)[1]
-    return data
-
-
-def _decode_base64_image(b64_str: str) -> Optional[np.ndarray]:
-    if not b64_str:
-        return None
-    try:
-        raw = base64.b64decode(_strip_data_url(b64_str), validate=False)
-        arr = np.frombuffer(raw, dtype=np.uint8)
-        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    except Exception:
-        return None
 
 
 def _pick_top1(dets: list[Detection]) -> tuple[str, float]:
@@ -56,12 +34,8 @@ def _dets_to_payload(dets: list[Detection]) -> list[DetectionItem]:
     return payload
 
 
-def _build_empty_detect_result() -> DetectResult:
-    return DetectResult(classify_type="none", percentage=0.0, detections=[])
-
-
 class InferenceWorker(threading.Thread):
-    """Consume queued inference tasks with one dedicated model instance."""
+    """Consume decoded inference tasks with one dedicated model instance."""
 
     def __init__(
         self,
@@ -69,7 +43,7 @@ class InferenceWorker(threading.Thread):
         model_path: str,
         conf: float,
         iou: float,
-        task_queue: queue.Queue[TaskQueueItem],
+        task_queue: queue.Queue[DecodedTaskQueueItem],
     ) -> None:
         super().__init__(daemon=True, name=f"inference-worker-{worker_id}")
         self.worker_id = worker_id
@@ -108,52 +82,39 @@ class InferenceWorker(threading.Thread):
             self._warming_up = False
 
         while True:
-            task = self._task_queue.get()
+            decoded_task = self._task_queue.get()
             try:
-                if task is None:
+                if decoded_task is None:
                     return
                 self._log_ctrl.debug(
                     "Inference worker task started. worker_id=%s thread_name=%s",
                     self.worker_id,
-                    task.thread_name,
+                    decoded_task.task.thread_name,
                 )
-                task.result_queue.put(self._process_task(task))
+                decoded_task.task.result_queue.put(self._process_task(decoded_task))
             finally:
                 self._task_queue.task_done()
 
-    def _process_task(self, task: InferenceTask) -> InferenceTaskResult:
-        empty_results = [_build_empty_detect_result() for _ in task.images_b64]
+    def _process_task(self, decoded_task: DecodedInferenceTask) -> InferenceTaskResult:
+        results = list(decoded_task.empty_results)
+        task = decoded_task.task
         if not self._ready:
             return InferenceTaskResult(
-                results=empty_results,
+                results=results,
                 error=RuntimeError(f"Inference worker not ready. worker_id={self.worker_id}"),
             )
 
-        decoded_images: list[np.ndarray] = []
-        decoded_indices: list[int] = []
-        for index, image_b64 in enumerate(task.images_b64):
-            image = _decode_base64_image(image_b64)
-            if image is None:
-                self._log_ctrl.debug(
-                    "Inference worker decode failed. worker_id=%s thread_name=%s image_index=%s",
-                    self.worker_id,
-                    task.thread_name,
-                    index,
-                )
-                continue
-            decoded_indices.append(index)
-            decoded_images.append(image)
-
-        if not decoded_images:
+        if not decoded_task.decoded_images:
             return InferenceTaskResult(
-                results=empty_results,
+                results=results,
             )
 
+        infer_start = time.perf_counter()
         try:
-            for start in range(0, len(decoded_images), MAX_BATCH_IMAGES_PER_TASK):
+            for start in range(0, len(decoded_task.decoded_images), MAX_BATCH_IMAGES_PER_TASK):
                 end = start + MAX_BATCH_IMAGES_PER_TASK
-                chunk_images = decoded_images[start:end]
-                chunk_indices = decoded_indices[start:end]
+                chunk_images = decoded_task.decoded_images[start:end]
+                chunk_indices = decoded_task.decoded_indices[start:end]
                 chunk_outputs = self._engine.infer_many(chunk_images, conf=task.conf, iou=task.iou)
                 if len(chunk_outputs) != len(chunk_indices):
                     raise RuntimeError(
@@ -162,7 +123,7 @@ class InferenceWorker(threading.Thread):
                     )
                 for output_index, (_, detections) in enumerate(chunk_outputs):
                     classify_type, percentage = _pick_top1(detections)
-                    empty_results[chunk_indices[output_index]] = DetectResult(
+                    results[chunk_indices[output_index]] = DetectResult(
                         classify_type=classify_type,
                         percentage=percentage,
                         detections=_dets_to_payload(detections),
@@ -179,16 +140,19 @@ class InferenceWorker(threading.Thread):
             )
             error.__cause__ = exc
             return InferenceTaskResult(
-                results=empty_results,
+                results=results,
                 error=error,
             )
 
+        infer_elapsed_ms = max(0.0, (time.perf_counter() - infer_start) * 1000.0)
         self._log_ctrl.debug(
-            "Inference worker task completed. worker_id=%s thread_name=%s image_count=%s",
+            "Inference worker task completed. worker_id=%s thread_name=%s image_count=%s decode_ms=%.2f infer_ms=%.2f",
             self.worker_id,
             task.thread_name,
             len(task.images_b64),
+            decoded_task.decode_elapsed_ms,
+            infer_elapsed_ms,
         )
         return InferenceTaskResult(
-            results=empty_results
+            results=results
         )

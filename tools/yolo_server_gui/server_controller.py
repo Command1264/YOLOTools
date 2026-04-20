@@ -5,7 +5,13 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from config_service import normalize_path, validate_gpu_replica_count, validate_host, validate_port
+from config_service import (
+    normalize_path,
+    validate_decode_worker_count,
+    validate_gpu_replica_count,
+    validate_host,
+    validate_port,
+)
 from server import ServerStartupError, YoloServer
 from yolo_engine import YoloEngine
 
@@ -60,16 +66,32 @@ class ServerController:
             self.app.ent_worker.setText(str(self.app.cfg.gpu_replica_count))
             return False
 
+        decode_ok, decode_val, decode_msg = validate_decode_worker_count(self.app.ent_decode.text())
+        if not decode_ok:
+            self.app._show_error("設定錯誤", decode_msg)
+            self.app.ent_decode.setText(str(self.app.cfg.decode_worker_count))
+            return False
+
+        if int(decode_val) != int(gpu_val):
+            if not require_model:
+                return False
+            self.app._show_error("設定錯誤", "目前 Decode Worker 數必須與 GPU 副本數相同")
+            self.app.ent_worker.setText(str(self.app.cfg.gpu_replica_count))
+            self.app.ent_decode.setText(str(self.app.cfg.decode_worker_count))
+            return False
+
         self.app.cfg.model_path = model_path
         self.app.cfg.host = host_val
         self.app.cfg.port = int(port_val)
         self.app.cfg.gpu_replica_count = int(gpu_val)
+        self.app.cfg.decode_worker_count = int(decode_val)
         self.app.cfg.http_profile = str(self.app.cmb_http_profile.currentData() or "default")
         self.app.cfg.save(self.config_path)
         self.app.ent_model.setText(model_path)
         self.app.ent_host.setText(host_val)
         self.app.ent_port.setText(str(port_val))
         self.app.ent_worker.setText(str(gpu_val))
+        self.app.ent_decode.setText(str(decode_val))
         idx = self.app.cmb_http_profile.findData(self.app.cfg.http_profile)
         self.app.cmb_http_profile.blockSignals(True)
         self.app.cmb_http_profile.setCurrentIndex(idx if idx >= 0 else 0)
@@ -91,6 +113,7 @@ class ServerController:
         port: int = int(self.app.cfg.port)
         model_path: str = self.app.cfg.model_path
         gpu_replica_count: int = int(self.app.cfg.gpu_replica_count)
+        decode_worker_count: int = int(self.app.cfg.decode_worker_count)
         http_profile: str = self.app.cfg.http_profile
         try:
             server_icon_path = self.select_icon_path()
@@ -103,6 +126,7 @@ class ServerController:
                     logger=self.app.logger,
                     icon_path=icon_path,
                     gpu_replica_count=gpu_replica_count,
+                    decode_worker_count=decode_worker_count,
                     http_profile=http_profile,
                 )
             else:
@@ -112,6 +136,7 @@ class ServerController:
                     port=port,
                     icon_path=icon_path,
                     gpu_replica_count=gpu_replica_count,
+                    decode_worker_count=decode_worker_count,
                     http_profile=http_profile,
                 )
             self.app.server.start()
@@ -141,10 +166,11 @@ class ServerController:
         self.app.lbl_device.setText("裝置：載入中...")
         self.load_device_async()
         self.app.log_ctrl.info(
-            "伺服器已啟動。host=%s port=%s gpu_replica_count=%s http_profile=%s",
+            "伺服器已啟動。host=%s port=%s gpu_replica_count=%s decode_worker_count=%s http_profile=%s",
             host,
             port,
             gpu_replica_count,
+            decode_worker_count,
             http_profile,
         )
 
@@ -166,6 +192,7 @@ class ServerController:
         self.app.ent_host.setEnabled(not running)
         self.app.ent_port.setEnabled(not running)
         self.app.ent_worker.setEnabled(not running)
+        self.app.ent_decode.setEnabled(not running)
         self.app.cmb_http_profile.setEnabled(not running)
         self.app.btn_pick_model.setEnabled(not running)
         self.app.btn_toggle.setText("停止伺服器" if running else "啟動伺服器")

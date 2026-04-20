@@ -15,6 +15,7 @@ from typing import Any, List, Optional, TextIO
 LOGGER_NAME: str = "yolo_server_gui"
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 LOG_DATE_FORMAT: str = "%Y-%m-%d %H:%M:%S"
+LOG_FOLDER_NAME: str = "YOLOServerLogs"
 WERKZEUG_TIME_PATTERN = re.compile(r"\s\[[0-9]{2}/[A-Za-z]{3}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}\]")
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
@@ -31,7 +32,10 @@ class LogContext:
     event_queue: queue.SimpleQueue[logging.LogRecord]
     gui_broadcaster: "GuiLogBroadcaster"
     logger: logging.Logger
+    queue_handler: logging.handlers.QueueHandler
     file_handler: "SessionRollingFileHandler"
+    console_handler: logging.StreamHandler
+    gui_handler: "GuiLogHandler"
     queue_listener: logging.handlers.QueueListener
 
 
@@ -294,12 +298,79 @@ def normalize_log_level(log_level: str) -> int:
     return getattr(logging, normalized, logging.INFO)
 
 
-def setup_logging(app_dir: Path, log_level: str = "info") -> LogContext:
+def resolve_log_root(log_base_dir: Path) -> Path:
+    """
+    Resolve the log root directory under the configured base directory.
+
+    Args:
+        log_base_dir (Path): User-selected base directory.
+
+    Returns:
+        Path: Final log root directory.
+    """
+    return Path(log_base_dir) / LOG_FOLDER_NAME
+
+
+def shutdown_logging() -> None:
+    """Stop the active logging pipeline and release attached handlers."""
+    global _LOG_CONTEXT
+    if _LOG_CONTEXT is None:
+        return
+
+    context = _LOG_CONTEXT
+    _LOG_CONTEXT = None
+
+    try:
+        context.queue_listener.stop()
+    except Exception:
+        pass
+
+    try:
+        context.logger.removeHandler(context.queue_handler)
+    except Exception:
+        pass
+
+    for logger_name in (LOGGER_NAME, "flask.app", "werkzeug"):
+        try:
+            logger = logging.getLogger(logger_name)
+            logger.handlers.clear()
+        except Exception:
+            continue
+
+    for handler in (
+        context.queue_handler,
+        context.file_handler,
+        context.console_handler,
+        context.gui_handler,
+    ):
+        try:
+            handler.close()
+        except Exception:
+            continue
+
+
+def reconfigure_logging(log_base_dir: Path, log_level: str = "info") -> LogContext:
+    """
+    Recreate the logging pipeline with a new base directory or level.
+
+    Args:
+        log_base_dir (Path): User-selected base directory.
+        log_level (str): Configured log level text.
+
+    Returns:
+        LogContext: Reinitialized logging context.
+    """
+    shutdown_logging()
+    return setup_logging(log_base_dir, log_level)
+
+
+def setup_logging(log_base_dir: Path, log_level: str = "info") -> LogContext:
     """
     Set up logging for console, file, and GUI.
 
     Args:
-        app_dir (Path): Base directory for log folder creation.
+        log_base_dir (Path): Base directory selected for log storage.
+        log_level (str): Configured log level text.
 
     Returns:
         LogContext: Initialized logging context.
@@ -309,7 +380,7 @@ def setup_logging(app_dir: Path, log_level: str = "info") -> LogContext:
         return _LOG_CONTEXT
 
     start_time: datetime = datetime.now()
-    log_root: Path = app_dir / "log"
+    log_root: Path = resolve_log_root(log_base_dir)
     log_root.mkdir(parents=True, exist_ok=True)
     resolved_level = normalize_log_level(log_level)
 
@@ -369,7 +440,10 @@ def setup_logging(app_dir: Path, log_level: str = "info") -> LogContext:
         event_queue=event_queue,
         gui_broadcaster=gui_broadcaster,
         logger=logger,
+        queue_handler=queue_handler,
         file_handler=file_handler,
+        console_handler=console_handler,
+        gui_handler=gui_handler,
         queue_listener=queue_listener,
     )
     return _LOG_CONTEXT

@@ -28,4 +28,16 @@ class InferenceTask:
     )
 
 
+@dataclass
+class DecodedInferenceTask:
+    """Carry decoded images for one inference request."""
+
+    task: InferenceTask
+    decoded_images: list[object]
+    decoded_indices: list[int]
+    empty_results: list[DetectResult]
+    decode_elapsed_ms: float = 0.0
+
+
 TaskQueueItem = InferenceTask | None
+DecodedTaskQueueItem = DecodedInferenceTask | None

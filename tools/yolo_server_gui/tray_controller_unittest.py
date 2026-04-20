@@ -6,13 +6,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QAction, QMouseEvent
+from PySide6.QtWidgets import QApplication
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 GUI_DIR = PROJECT_ROOT / "tools" / "yolo_server_gui"
 if str(GUI_DIR) not in sys.path:
     sys.path.insert(0, str(GUI_DIR))
 
 import tray_controller as tray_controller_module
-from tray_controller import TrayController
+from tray_controller import LeftClickOnlyMenu, TrayController
+
+
+QT_APP = QApplication.instance() or QApplication([])
 
 
 class DummyLogController:
@@ -54,13 +61,20 @@ class DummyMenu:
         self.allow_trigger = allow_trigger
         self.seen_actions: list[object] = []
         self.popup_positions: list[object] = []
+        self.reset_calls: int = 0
 
     def consume_left_click_trigger(self, action: object) -> bool:
         self.seen_actions.append(action)
-        return self.allow_trigger
+        allowed = self.allow_trigger
+        self.allow_trigger = False
+        return allowed
 
     def popup(self, position: object) -> None:
         self.popup_positions.append(position)
+
+    def reset_pending_trigger(self) -> None:
+        self.reset_calls += 1
+        self.allow_trigger = False
 
 
 class TrayControllerTests(unittest.TestCase):
@@ -126,7 +140,8 @@ class TrayControllerTests(unittest.TestCase):
         restore_calls: list[str] = []
         controller.restore_window = lambda: restore_calls.append("restore")  # type: ignore[method-assign]
 
-        controller._handle_tray_menu_triggered(controller._tray_action_show)  # type: ignore[arg-type]
+        with patch.object(tray_controller_module.time, "monotonic", return_value=10.0):
+            controller._handle_tray_menu_triggered(controller._tray_action_show)  # type: ignore[arg-type]
 
         self.assertEqual(restore_calls, ["restore"])
         self.assertEqual(controller._tray_menu.seen_actions, [controller._tray_action_show])
@@ -136,14 +151,179 @@ class TrayControllerTests(unittest.TestCase):
         app = SimpleNamespace(_quitting=False, log_ctrl=DummyLogController())
         controller = TrayController(app)
         controller._tray_menu = DummyMenu(allow_trigger=False)
-        fake_point = SimpleNamespace(x=lambda: 100, y=lambda: 200)
+        fake_point = QPoint(100, 200)
 
-        with patch.object(tray_controller_module.QCursor, "pos", return_value=fake_point):
+        with (
+            patch.object(tray_controller_module.QCursor, "pos", return_value=fake_point),
+            patch.object(tray_controller_module.time, "monotonic", return_value=1.0),
+        ):
             controller.on_tray_activated(tray_controller_module.QSystemTrayIcon.Context)
 
-        self.assertEqual(controller._tray_menu.popup_positions, [fake_point])
+        self.assertEqual(
+            controller._tray_menu.popup_positions,
+            [fake_point + QPoint(0, tray_controller_module.TRAY_MENU_CURSOR_OFFSET_PX)],
+        )
         self.assertTrue(any("Tray context menu requested." in msg for msg in app.log_ctrl.debug_messages))
         self.assertTrue(any("Tray menu popup requested." in msg for msg in app.log_ctrl.debug_messages))
+        self.assertEqual(controller._tray_menu.reset_calls, 1)
+
+    def test_show_tray_menu_debounces_rapid_popup_requests(self) -> None:
+        """Rapid repeated popup requests should be ignored while the debounce window is active."""
+        app = SimpleNamespace(_quitting=False, log_ctrl=DummyLogController())
+        controller = TrayController(app)
+        controller._tray_menu = DummyMenu(allow_trigger=False)
+        fake_point = QPoint(50, 60)
+
+        with (
+            patch.object(tray_controller_module.QCursor, "pos", return_value=fake_point),
+            patch.object(tray_controller_module.time, "monotonic", side_effect=[1.0, 1.1]),
+        ):
+            controller.show_tray_menu("context")
+            controller.show_tray_menu("context")
+
+        self.assertEqual(len(controller._tray_menu.popup_positions), 1)
+        self.assertTrue(any("忽略過快的 tray menu 顯示要求" in msg for msg in app.log_ctrl.debug_messages))
+
+    def test_handle_tray_menu_triggered_runs_left_click_action_inside_guard_window(self) -> None:
+        """A valid left-click should still work even if it happens immediately after popup."""
+        app = SimpleNamespace(_quitting=False, log_ctrl=DummyLogController())
+        controller = TrayController(app)
+        controller._tray_menu = DummyMenu(allow_trigger=True)
+        controller._tray_action_show = DummyAction("顯示")
+        controller._tray_menu_guard_until = 5.5
+        restore_calls: list[str] = []
+        controller.restore_window = lambda: restore_calls.append("restore")  # type: ignore[method-assign]
+
+        with patch.object(tray_controller_module.time, "monotonic", return_value=5.2):
+            controller._handle_tray_menu_triggered(controller._tray_action_show)  # type: ignore[arg-type]
+
+        self.assertEqual(restore_calls, ["restore"])
+        self.assertTrue(any("Tray menu 左鍵觸發" in msg for msg in app.log_ctrl.debug_messages))
+
+    def test_about_to_hide_defers_reset_until_after_left_click_trigger_dispatch(self) -> None:
+        """Menu hide should not clear a valid pending left-click before the action is dispatched."""
+        app = SimpleNamespace(_quitting=False, log_ctrl=DummyLogController())
+        controller = TrayController(app)
+        controller._tray_menu = DummyMenu(allow_trigger=True)
+        controller._tray_action_show = DummyAction("顯示")
+        restore_calls: list[str] = []
+        scheduled_calls: list[tuple[int, object]] = []
+        controller.restore_window = lambda: restore_calls.append("restore")  # type: ignore[method-assign]
+
+        with patch.object(
+            tray_controller_module.QTimer,
+            "singleShot",
+            side_effect=lambda msec, callback: scheduled_calls.append((msec, callback)),
+        ):
+            controller._on_tray_menu_about_to_hide()
+
+        self.assertEqual(scheduled_calls[0][0], 0)
+
+        with patch.object(tray_controller_module.time, "monotonic", return_value=10.0):
+            controller._handle_tray_menu_triggered(controller._tray_action_show)  # type: ignore[arg-type]
+
+        self.assertEqual(restore_calls, ["restore"])
+        scheduled_calls[0][1]()
+        self.assertEqual(controller._tray_menu.reset_calls, 1)
+
+    def test_on_tray_activated_ignores_reentry_while_menu_visible(self) -> None:
+        """Tray activation should not reopen or reroute while the menu is already visible."""
+        app = SimpleNamespace(_quitting=False, log_ctrl=DummyLogController())
+        controller = TrayController(app)
+        controller._tray_menu = DummyMenu(allow_trigger=False)
+        controller._tray_menu_visible = True
+
+        controller.on_tray_activated(tray_controller_module.QSystemTrayIcon.Context)
+
+        self.assertEqual(controller._tray_menu.popup_positions, [])
+        self.assertTrue(any("menu 已顯示" in msg for msg in app.log_ctrl.debug_messages))
+
+
+class LeftClickOnlyMenuTests(unittest.TestCase):
+    """Cover the actual tray menu click gesture rules."""
+
+    def _build_mouse_event(
+        self,
+        event_type: QEvent.Type,
+        button: Qt.MouseButton,
+        buttons: Qt.MouseButton,
+    ) -> QMouseEvent:
+        return QMouseEvent(
+            event_type,
+            QPointF(1.0, 1.0),
+            button,
+            buttons,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+    def test_release_without_matching_left_press_does_not_trigger(self) -> None:
+        """A release-only sequence must not be treated as a valid left-click action."""
+        menu = LeftClickOnlyMenu()
+        action = QAction("關閉", menu)
+        release_event = self._build_mouse_event(
+            QEvent.Type.MouseButtonRelease,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+        )
+
+        with (
+            patch.object(tray_controller_module.QMenu, "mouseReleaseEvent", autospec=True),
+            patch.object(menu, "actionAt", return_value=action),
+        ):
+            menu.mouseReleaseEvent(release_event)
+
+        self.assertFalse(menu.consume_left_click_trigger(action))
+
+    def test_left_press_and_release_on_same_action_triggers(self) -> None:
+        """A complete left-click on the same action should still be accepted."""
+        menu = LeftClickOnlyMenu()
+        action = QAction("顯示", menu)
+        press_event = self._build_mouse_event(
+            QEvent.Type.MouseButtonPress,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+        )
+        release_event = self._build_mouse_event(
+            QEvent.Type.MouseButtonRelease,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+        )
+
+        with (
+            patch.object(tray_controller_module.QMenu, "mousePressEvent", autospec=True),
+            patch.object(tray_controller_module.QMenu, "mouseReleaseEvent", autospec=True),
+            patch.object(menu, "actionAt", side_effect=[action, action]),
+        ):
+            menu.mousePressEvent(press_event)
+            menu.mouseReleaseEvent(release_event)
+
+        self.assertTrue(menu.consume_left_click_trigger(action))
+
+    def test_left_press_and_release_on_different_actions_does_not_trigger(self) -> None:
+        """The click should be rejected when press and release land on different actions."""
+        menu = LeftClickOnlyMenu()
+        press_action = QAction("顯示", menu)
+        release_action = QAction("關閉", menu)
+        press_event = self._build_mouse_event(
+            QEvent.Type.MouseButtonPress,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+        )
+        release_event = self._build_mouse_event(
+            QEvent.Type.MouseButtonRelease,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+        )
+
+        with (
+            patch.object(tray_controller_module.QMenu, "mousePressEvent", autospec=True),
+            patch.object(tray_controller_module.QMenu, "mouseReleaseEvent", autospec=True),
+            patch.object(menu, "actionAt", side_effect=[press_action, release_action]),
+        ):
+            menu.mousePressEvent(press_event)
+            menu.mouseReleaseEvent(release_event)
+
+        self.assertFalse(menu.consume_left_click_trigger(release_action))
 
 
 if __name__ == "__main__":

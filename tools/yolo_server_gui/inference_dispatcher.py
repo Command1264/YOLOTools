@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import queue
 import threading
 import time
 from typing import Optional
 
+from decode_worker import DecodeWorker
 from http_schema import DetectResult
-from inference_job import InferenceTask, InferenceTaskResult, TaskQueueItem
+from inference_job import DecodedTaskQueueItem, InferenceTask, InferenceTaskResult, TaskQueueItem
 from inference_worker import InferenceWorker
 from log_manager import LogController, get_logger
+
+
+@dataclass
+class WorkerPipeline:
+    """Hold one decode worker and one paired GPU worker."""
+
+    decode_queue: queue.Queue[TaskQueueItem]
+    gpu_queue: queue.Queue[DecodedTaskQueueItem]
+    decode_worker: DecodeWorker
+    gpu_worker: InferenceWorker
 
 
 class InferenceDispatcher:
@@ -20,72 +32,104 @@ class InferenceDispatcher:
         conf: float,
         iou: float,
         gpu_replica_count: int = 1,
+        decode_worker_count: Optional[int] = None,
         queue_size: int = 0,
     ) -> None:
         self._model_path = model_path
         self._conf = conf
         self._iou = iou
         self._gpu_replica_count = max(1, int(gpu_replica_count))
-        self._task_queue: queue.Queue[TaskQueueItem] = queue.Queue(maxsize=max(0, int(queue_size)))
-        self._workers: list[InferenceWorker] = []
+        self._decode_worker_count = self._gpu_replica_count if decode_worker_count is None else max(
+            1, int(decode_worker_count)
+        )
+        if self._decode_worker_count != self._gpu_replica_count:
+            raise ValueError("decode_worker_count must equal gpu_replica_count for 1:1 worker mapping.")
+        self._queue_size = max(0, int(queue_size))
+        self._pipelines: list[WorkerPipeline] = []
         self._started = False
         self._stopped = False
         self._start_lock = threading.RLock()
+        self._submit_lock = threading.Lock()
+        self._next_pipeline_index = 0
         self._log_ctrl = LogController(get_logger())
 
     @property
     def is_ready(self) -> bool:
-        return bool(self._workers) and all(worker.is_ready for worker in self._workers)
+        return bool(self._pipelines) and all(pipeline.gpu_worker.is_ready for pipeline in self._pipelines)
 
     @property
     def is_warming_up(self) -> bool:
-        return bool(self._workers) and any(worker.is_warming_up for worker in self._workers) and not self.is_ready
+        return (
+            bool(self._pipelines)
+            and any(pipeline.gpu_worker.is_warming_up for pipeline in self._pipelines)
+            and not self.is_ready
+        )
 
     @property
     def warmup_error(self) -> Optional[str]:
-        for worker in self._workers:
-            if worker.warmup_error:
-                return worker.warmup_error
+        for pipeline in self._pipelines:
+            if pipeline.gpu_worker.warmup_error:
+                return pipeline.gpu_worker.warmup_error
         return None
 
     @property
     def device_name(self) -> str:
-        for worker in self._workers:
-            if worker.device_name != "unknown":
-                return worker.device_name
+        for pipeline in self._pipelines:
+            if pipeline.gpu_worker.device_name != "unknown":
+                return pipeline.gpu_worker.device_name
         return "unknown"
 
     @property
     def queue_size(self) -> int:
-        return self._task_queue.qsize()
+        return sum(pipeline.decode_queue.qsize() + pipeline.gpu_queue.qsize() for pipeline in self._pipelines)
 
     @property
     def gpu_replica_count(self) -> int:
         return self._gpu_replica_count
+
+    @property
+    def decode_worker_count(self) -> int:
+        return self._decode_worker_count
 
     def start(self) -> None:
         """Start worker threads once."""
         with self._start_lock:
             if self._started:
                 return
-            self._workers = [
-                InferenceWorker(
+            self._pipelines = []
+            for index in range(self._gpu_replica_count):
+                decode_queue: queue.Queue[TaskQueueItem] = queue.Queue(maxsize=self._queue_size)
+                gpu_queue: queue.Queue[DecodedTaskQueueItem] = queue.Queue(maxsize=self._queue_size)
+                decode_worker = DecodeWorker(
+                    worker_id=index,
+                    task_queue=decode_queue,
+                    decoded_task_queue=gpu_queue,
+                )
+                gpu_worker = InferenceWorker(
                     worker_id=index,
                     model_path=self._model_path,
                     conf=self._conf,
                     iou=self._iou,
-                    task_queue=self._task_queue,
+                    task_queue=gpu_queue,
                 )
-                for index in range(self._gpu_replica_count)
-            ]
-            for worker in self._workers:
-                worker.start()
+                gpu_worker.start()
+                decode_worker.start()
+                self._pipelines.append(
+                    WorkerPipeline(
+                        decode_queue=decode_queue,
+                        gpu_queue=gpu_queue,
+                        decode_worker=decode_worker,
+                        gpu_worker=gpu_worker,
+                    )
+                )
             self._started = True
             self._stopped = False
+            self._next_pipeline_index = 0
             self._log_ctrl.info(
-                "Inference dispatcher started. gpu_replica_count=%s queue_size=%s",
+                "Inference dispatcher started. gpu_replica_count=%s decode_worker_count=%s queue_size=%s",
                 self._gpu_replica_count,
-                self._task_queue.maxsize,
+                self._decode_worker_count,
+                self._queue_size,
             )
 
     def stop(self) -> bool:
@@ -99,20 +143,26 @@ class InferenceDispatcher:
                 return True
             self._stopped = True
             self._fail_pending_tasks()
-            for _ in self._workers:
-                self._task_queue.put(None)
+            for pipeline in self._pipelines:
+                pipeline.decode_queue.put(None)
             alive_worker_names: list[str] = []
-            for worker in self._workers:
-                worker.join(timeout=2.0)
-                if worker.is_alive():
-                    alive_worker_names.append(worker.name)
+            for pipeline in self._pipelines:
+                pipeline.decode_worker.join(timeout=2.0)
+                if pipeline.decode_worker.is_alive():
+                    alive_worker_names.append(pipeline.decode_worker.name)
+            for pipeline in self._pipelines:
+                pipeline.gpu_queue.put(None)
+            for pipeline in self._pipelines:
+                pipeline.gpu_worker.join(timeout=2.0)
+                if pipeline.gpu_worker.is_alive():
+                    alive_worker_names.append(pipeline.gpu_worker.name)
             all_workers_stopped = not alive_worker_names
             if alive_worker_names:
                 self._log_ctrl.warning(
                     "Inference dispatcher workers did not stop within timeout. workers=%s",
                     ", ".join(alive_worker_names),
                 )
-            self._workers = []
+            self._pipelines = []
             self._started = False
             self._log_ctrl.info("Inference dispatcher stopped.")
             return all_workers_stopped
@@ -160,7 +210,8 @@ class InferenceDispatcher:
             conf=conf,
             iou=iou,
         )
-        self._task_queue.put(task)
+        pipeline = self._select_pipeline()
+        pipeline.decode_queue.put(task)
         outcome = task.result_queue.get()
         if outcome.error is not None:
             raise outcome.error
@@ -168,18 +219,37 @@ class InferenceDispatcher:
             raise RuntimeError("Inference dispatcher returned an empty result.")
         return outcome.results
 
+    def _select_pipeline(self) -> WorkerPipeline:
+        with self._submit_lock:
+            if not self._pipelines:
+                raise RuntimeError("Inference dispatcher has no active worker pipelines.")
+            pipeline_index = self._next_pipeline_index
+            self._next_pipeline_index = (self._next_pipeline_index + 1) % len(self._pipelines)
+            return self._pipelines[pipeline_index]
+
     def _fail_pending_tasks(self) -> None:
         pending: list[InferenceTask] = []
-        while True:
-            try:
-                item = self._task_queue.get_nowait()
-            except queue.Empty:
-                break
-            if item is None:
-                self._task_queue.task_done()
-                continue
-            pending.append(item)
-            self._task_queue.task_done()
+        for pipeline in self._pipelines:
+            while True:
+                try:
+                    item = pipeline.decode_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    pipeline.decode_queue.task_done()
+                    continue
+                pending.append(item)
+                pipeline.decode_queue.task_done()
+            while True:
+                try:
+                    decoded_item = pipeline.gpu_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if decoded_item is None:
+                    pipeline.gpu_queue.task_done()
+                    continue
+                pending.append(decoded_item.task)
+                pipeline.gpu_queue.task_done()
 
         for task in pending:
             task.result_queue.put(

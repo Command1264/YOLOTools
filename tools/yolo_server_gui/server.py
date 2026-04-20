@@ -111,6 +111,7 @@ class YoloServer:
         logger: Optional[Logger] = None,
         icon_path: Optional[str] = None,
         gpu_replica_count: int = 1,
+        decode_worker_count: Optional[int] = None,
         http_profile: str = "default",
     ) -> None:
         self.model_path: str = model_path
@@ -118,6 +119,9 @@ class YoloServer:
         self.port: int = port
         self.conf: float = conf
         self.gpu_replica_count: int = max(1, int(gpu_replica_count))
+        self.decode_worker_count: int = (
+            self.gpu_replica_count if decode_worker_count is None else max(1, int(decode_worker_count))
+        )
         self.http_profile: str = str(http_profile)
         self._logger: Logger = logger or get_logger()
         self._log_ctrl: LogController = LogController(self._logger)
@@ -231,6 +235,7 @@ class YoloServer:
         port: int,
         icon_path: Optional[str] = None,
         gpu_replica_count: Optional[int] = None,
+        decode_worker_count: Optional[int] = None,
         http_profile: Optional[str] = None,
     ) -> None:
         self.model_path = model_path
@@ -238,6 +243,10 @@ class YoloServer:
         self.port = port
         if gpu_replica_count is not None:
             self.gpu_replica_count = max(1, int(gpu_replica_count))
+        if decode_worker_count is not None:
+            self.decode_worker_count = max(1, int(decode_worker_count))
+        elif gpu_replica_count is not None:
+            self.decode_worker_count = self.gpu_replica_count
         if http_profile is not None:
             self.http_profile = str(http_profile)
         if icon_path is not None:
@@ -245,11 +254,12 @@ class YoloServer:
         self._dispatcher = self._create_dispatcher(model_path)
         self._http_provider = resolve_http_provider(self.http_profile)
         self._log_ctrl.info(
-            "Settings updated. model_path=%s host=%s port=%s gpu_replica_count=%s http_profile=%s",
+            "Settings updated. model_path=%s host=%s port=%s gpu_replica_count=%s decode_worker_count=%s http_profile=%s",
             model_path,
             host,
             port,
             self.gpu_replica_count,
+            self.decode_worker_count,
             self._http_provider.profile_name,
         )
 
@@ -266,6 +276,7 @@ class YoloServer:
             conf=self.conf,
             iou=0.45,
             gpu_replica_count=self.gpu_replica_count,
+            decode_worker_count=self.decode_worker_count,
         )
 
     def _validate_bind_target(self) -> None:
@@ -516,13 +527,14 @@ class YoloServer:
         conf = self.conf if parsed_request.conf is None else parsed_request.conf
         iou = parsed_request.iou
         self._log_ctrl.debug(
-            "Detect inference batch started. threadName=%s image_count=%s conf=%s iou=%s queue_size=%s gpu_replica_count=%s",
+            "Detect inference batch started. threadName=%s image_count=%s conf=%s iou=%s queue_size=%s gpu_replica_count=%s decode_worker_count=%s",
             parsed_request.thread_name or "null",
             len(parsed_request.images),
             conf,
             iou,
             self._dispatcher.queue_size,
             self._dispatcher.gpu_replica_count,
+            self._dispatcher.decode_worker_count,
         )
         results = self._infer_many(images_b64=parsed_request.images, conf=conf, iou=iou)
         result_payload: Any

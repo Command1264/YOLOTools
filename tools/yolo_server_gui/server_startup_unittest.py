@@ -29,14 +29,20 @@ class DummyDispatcher:
         self.device_name = "unknown"
         self.queue_size = 0
         self.gpu_replica_count = 1
+        self.decode_worker_count = 1
 
     def start(self) -> None:
         self.start_calls += 1
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self.stop_calls += 1
+        return True
 
-    def wait_until_ready(self, timeout_sec: float | None = None) -> bool:
+    def wait_until_ready(
+        self,
+        timeout_sec: float | None = None,
+        cancel_event=None,
+    ) -> bool:
         return True
 
 
@@ -48,6 +54,19 @@ class DummyLabel:
 
     def setText(self, text: str) -> None:
         self.text = text
+
+
+class DummyLineEdit:
+    """Minimal line edit stub for controller validation tests."""
+
+    def __init__(self, value: str = "") -> None:
+        self._value = value
+
+    def text(self) -> str:
+        return self._value
+
+    def setText(self, value: str) -> None:
+        self._value = value
 
 
 class DummyLogController:
@@ -124,6 +143,7 @@ class ServerStartupTests(unittest.TestCase):
                 port=3000,
                 model_path="dummy.pt",
                 gpu_replica_count=4,
+                decode_worker_count=4,
                 http_profile="default",
             ),
             server=None,
@@ -153,6 +173,41 @@ class ServerStartupTests(unittest.TestCase):
         self.assertEqual(app.lbl_device.text, "裝置：未啟動")
         self.assertEqual(shown_errors, [("啟動失敗", expected_message)])
         self.assertTrue(any("host=127.0.0.1 port=3000" in message for message in app.log_ctrl.error_messages))
+
+    def test_apply_quick_settings_allows_temporary_worker_mismatch_during_editing(self) -> None:
+        """Editing GPU/decode counts should allow a temporary mismatch before startup validation."""
+        shown_errors: list[tuple[str, str]] = []
+        app = SimpleNamespace(
+            cfg=SimpleNamespace(
+                host="127.0.0.1",
+                port=10274,
+                model_path="",
+                gpu_replica_count=1,
+                decode_worker_count=1,
+                http_profile="default",
+                save=lambda path: None,
+            ),
+            ent_model=DummyLineEdit(""),
+            ent_host=DummyLineEdit("127.0.0.1"),
+            ent_port=DummyLineEdit("10274"),
+            ent_worker=DummyLineEdit("2"),
+            ent_decode=DummyLineEdit("1"),
+            cmb_http_profile=SimpleNamespace(currentData=lambda: "default"),
+            _show_error=lambda title, text: shown_errors.append((title, text)),
+        )
+        controller = ServerController(
+            app=app,
+            config_path=Path("dummy.yml"),
+            exec_dir=Path("."),
+            select_icon_path=lambda: None,
+        )
+
+        result = controller.apply_quick_settings(require_model=False)
+
+        self.assertFalse(result)
+        self.assertEqual(shown_errors, [])
+        self.assertEqual(app.ent_worker.text(), "2")
+        self.assertEqual(app.ent_decode.text(), "1")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ class RecordingDispatcher:
     def __init__(self) -> None:
         self.queue_size = 0
         self.gpu_replica_count = 1
+        self.decode_worker_count = 1
         self.is_ready = True
         self.is_warming_up = False
         self.warmup_error = None
@@ -60,6 +61,7 @@ class BlockingDispatcher:
     def __init__(self) -> None:
         self.queue_size = 0
         self.gpu_replica_count = 1
+        self.decode_worker_count = 1
         self.is_ready = False
         self.is_warming_up = True
         self.warmup_error = None
@@ -106,6 +108,18 @@ class ServerRuntimeTests(unittest.TestCase):
         """Older configs should still hydrate the renamed GPU replica setting."""
         cfg = AppConfig.from_dict({"worker_count": 3})
         self.assertEqual(cfg.gpu_replica_count, 3)
+
+    def test_app_config_defaults_decode_worker_count_to_gpu_replica_count(self) -> None:
+        """Decode worker count should default to the GPU replica count when omitted."""
+        cfg = AppConfig.from_dict({"gpu_replica_count": 4})
+        self.assertEqual(cfg.gpu_replica_count, 4)
+        self.assertEqual(cfg.decode_worker_count, 4)
+
+    def test_app_config_preserves_custom_log_base_dir(self) -> None:
+        """Custom log base directory should round-trip through config payloads."""
+        cfg = AppConfig.from_dict({"log_base_dir": "D:/Logs/Base"})
+        self.assertEqual(cfg.log_base_dir, "D:/Logs/Base")
+        self.assertEqual(cfg.to_dict()["log_base_dir"], "D:/Logs/Base")
 
     def test_infer_many_submits_whole_batch_once(self) -> None:
         """Batch requests should be forwarded to the dispatcher in one call."""

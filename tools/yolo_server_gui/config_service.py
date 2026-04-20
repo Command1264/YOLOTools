@@ -77,6 +77,19 @@ def validate_gpu_replica_count(value: str) -> tuple[bool, Optional[int], str]:
     return True, gpu_replica_count, ""
 
 
+def validate_decode_worker_count(value: str) -> tuple[bool, Optional[int], str]:
+    """Validate decode worker count as a positive integer."""
+    try:
+        decode_worker_count = int(str(value).strip())
+    except Exception:
+        return False, None, "Decode Worker 數必須是整數"
+    if decode_worker_count < 1:
+        return False, None, "Decode Worker 數必須大於等於 1"
+    if decode_worker_count > 32:
+        return False, None, "Decode Worker 數目前限制在 32 以下"
+    return True, decode_worker_count, ""
+
+
 def validate_worker_count(value: str) -> tuple[bool, Optional[int], str]:
     """Backward-compatible wrapper for legacy worker count validation."""
     return validate_gpu_replica_count(value)

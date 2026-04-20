@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QPoint, QTimer, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QCursor, QIcon, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
@@ -20,6 +21,9 @@ TRAY_MENU_TRIGGER_KEYS: frozenset[int] = frozenset(
         int(Qt.Key.Key_Select),
     }
 )
+TRAY_MENU_POPUP_DEBOUNCE_SEC: float = 0.25
+TRAY_MENU_TRIGGER_GUARD_SEC: float = 0.20
+TRAY_MENU_CURSOR_OFFSET_PX: int = 8
 
 
 class LeftClickOnlyMenu(QMenu):
@@ -27,39 +31,56 @@ class LeftClickOnlyMenu(QMenu):
 
     def __init__(self, parent: Optional[Any] = None) -> None:
         super().__init__(parent)
+        self._pressed_left_click_action: Optional[QAction] = None
         self._pending_left_click_action: Optional[QAction] = None
 
     def consume_left_click_trigger(self, action: Optional[QAction]) -> bool:
         """Return whether the action was triggered by a left-click release."""
         allowed = action is not None and action is self._pending_left_click_action
-        self._pending_left_click_action = None
+        self._clear_left_click_state()
         return allowed
+
+    def reset_pending_trigger(self) -> None:
+        """Clear any action remembered from a previous mouse sequence."""
+        self._clear_left_click_state()
+
+    def _clear_left_click_state(self) -> None:
+        """Forget any in-flight or completed left-click gesture state."""
+        self._pressed_left_click_action = None
+        self._pending_left_click_action = None
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
-            self._pending_left_click_action = None
+            self._clear_left_click_state()
             event.ignore()
             return
+        self._pending_left_click_action = None
+        self._pressed_left_click_action = self.actionAt(event.position().toPoint())
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
-            self._pending_left_click_action = None
+            self._clear_left_click_state()
             event.ignore()
             return
-        self._pending_left_click_action = self.actionAt(event.pos())
+        released_action = self.actionAt(event.position().toPoint())
+        if released_action is not None and released_action is self._pressed_left_click_action:
+            self._pending_left_click_action = released_action
+        else:
+            self._pending_left_click_action = None
+        self._pressed_left_click_action = None
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if int(event.key()) in TRAY_MENU_TRIGGER_KEYS:
-            self._pending_left_click_action = None
+            self._clear_left_click_state()
             event.ignore()
             return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:
         if int(event.key()) in TRAY_MENU_TRIGGER_KEYS:
-            self._pending_left_click_action = None
+            self._clear_left_click_state()
             event.ignore()
             return
         super().keyReleaseEvent(event)
@@ -74,6 +95,9 @@ class TrayController:
         self._tray_action_show: Optional[QAction] = None
         self._tray_action_exit: Optional[QAction] = None
         self._tray_available: bool = False
+        self._tray_menu_visible: bool = False
+        self._tray_menu_guard_until: float = 0.0
+        self._last_tray_menu_popup_at: float = 0.0
 
     def setup_tray(self, select_icon_path: Callable[[], Optional[Path]]) -> None:
         """Initialize Qt native tray icon and context menu."""
@@ -93,6 +117,8 @@ class TrayController:
         self._tray_action_exit = QAction("關閉", self.app)
         self._tray_menu.addAction(self._tray_action_show)
         self._tray_menu.addAction(self._tray_action_exit)
+        self._tray_menu.aboutToShow.connect(self._on_tray_menu_about_to_show)
+        self._tray_menu.aboutToHide.connect(self._on_tray_menu_about_to_hide)
         self._tray_menu.triggered.connect(self._handle_tray_menu_triggered)
         self.app.tray_icon.activated.connect(self.on_tray_activated)
         self.app.tray_icon.show()
@@ -140,7 +166,20 @@ class TrayController:
         if self._tray_menu is None:
             self.app.log_ctrl.warning("Tray menu 尚未建立，無法顯示。source=%s", source)
             return
-        cursor_pos = QCursor.pos()
+        if self.app._quitting:
+            self.app.log_ctrl.debug("忽略 tray menu 顯示要求，因為程式正在結束。source=%s", source)
+            return
+        now = time.monotonic()
+        if self._tray_menu_visible:
+            self.app.log_ctrl.debug("忽略重複的 tray menu 顯示要求，因為 menu 已顯示。source=%s", source)
+            return
+        if now - self._last_tray_menu_popup_at < TRAY_MENU_POPUP_DEBOUNCE_SEC:
+            self.app.log_ctrl.debug("忽略過快的 tray menu 顯示要求。source=%s", source)
+            return
+        self._last_tray_menu_popup_at = now
+        self._tray_menu_guard_until = now + TRAY_MENU_TRIGGER_GUARD_SEC
+        self._tray_menu.reset_pending_trigger()
+        cursor_pos = QCursor.pos() + QPoint(0, TRAY_MENU_CURSOR_OFFSET_PX)
         self.app.log_ctrl.debug(
             "Tray menu popup requested. source=%s x=%s y=%s",
             source,
@@ -148,6 +187,27 @@ class TrayController:
             cursor_pos.y(),
         )
         self._tray_menu.popup(cursor_pos)
+
+    def _on_tray_menu_about_to_show(self) -> None:
+        """Arm menu guard rails as soon as the popup becomes visible."""
+        self._tray_menu_visible = True
+        self._tray_menu_guard_until = max(
+            self._tray_menu_guard_until,
+            time.monotonic() + TRAY_MENU_TRIGGER_GUARD_SEC,
+        )
+        if self._tray_menu is not None:
+            self._tray_menu.reset_pending_trigger()
+
+    def _on_tray_menu_about_to_hide(self) -> None:
+        """Clear transient menu state after the popup closes."""
+        self._tray_menu_visible = False
+        QTimer.singleShot(0, self._clear_tray_menu_pending_trigger)
+
+    def _clear_tray_menu_pending_trigger(self) -> None:
+        """Clear stale menu trigger state after queued action dispatch completes."""
+        if self._tray_menu is None or self._tray_menu_visible:
+            return
+        self._tray_menu.reset_pending_trigger()
 
     def request_exit_from_tray(self, origin: str = "tray_menu_exit") -> None:
         """Close the tray menu first, then start the application shutdown flow."""
@@ -160,11 +220,16 @@ class TrayController:
 
     def _handle_tray_menu_triggered(self, action: QAction) -> None:
         """Dispatch tray actions only when they come from a left-click."""
-        if self._tray_menu is None or not self._tray_menu.consume_left_click_trigger(action):
+        if self._tray_menu is None:
+            return
+        if not self._tray_menu.consume_left_click_trigger(action):
             self.app.log_ctrl.debug(
                 "忽略非左鍵觸發的 tray menu 動作。action=%s",
                 action.text() if action is not None else "unknown",
             )
+            return
+        if self.app._quitting:
+            self.app.log_ctrl.debug("忽略 tray menu 動作，因為程式正在結束。action=%s", action.text())
             return
         self.app.log_ctrl.debug("Tray menu 左鍵觸發。action=%s", action.text())
         if action is self._tray_action_show:
@@ -207,6 +272,12 @@ class TrayController:
             getattr(reason, "name", str(reason)),
             getattr(reason, "value", "unknown"),
         )
+        if self._tray_menu_visible:
+            self.app.log_ctrl.debug(
+                "忽略 tray activation，因為 menu 已顯示。reason=%s",
+                getattr(reason, "name", str(reason)),
+            )
+            return
         if reason == QSystemTrayIcon.Trigger:
             self.restore_window()
             return

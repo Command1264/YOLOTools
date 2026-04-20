@@ -34,7 +34,7 @@ from config_model import AppConfig, CLOSE_LABELS, HTTP_PROFILE_LABELS
 from config_service import (
     normalize_path,
 )
-from log_manager import LogContext, LogController, setup_logging
+from log_manager import LogContext, LogController, reconfigure_logging, resolve_log_root, setup_logging
 from log_viewer import LogViewer
 from server_controller import ServerController
 from server import YoloServer
@@ -64,6 +64,13 @@ APP_LOG_CTRL: LogController = LogController()
 LOCK_FILE_NAME: str = "yolo_server_gui.lock"
 
 
+def _resolve_log_base_dir(configured_path: str) -> Path:
+    normalized = normalize_path(str(configured_path).strip())
+    if not normalized:
+        return EXEC_DIR
+    return Path(normalized)
+
+
 def _select_icon_path() -> Optional[Path]:
     if os.name == "nt":
         primary, secondary = ICON_ICO_PATH, ICON_PNG_PATH
@@ -87,11 +94,11 @@ class App(QMainWindow):
     def __init__(self, instance_lock: Optional[SingleInstanceLock] = None) -> None:
         super().__init__()
         self.setWindowTitle("YOLO Server")
-        self.resize(720, 360)
-        self.setMinimumSize(640, 320)
+        self.resize(760, 360)
+        self.setMinimumSize(700, 320)
 
         self.cfg: AppConfig = AppConfig.load(CONFIG_PATH)
-        self.log_context: LogContext = setup_logging(EXEC_DIR, self.cfg.log_level)
+        self.log_context: LogContext = setup_logging(_resolve_log_base_dir(self.cfg.log_base_dir), self.cfg.log_level)
         self.logger: Logger = self.log_context.logger
         self.log_ctrl: LogController = LogController(self.logger)
         self.log_ctrl.info("GUI 啟動")
@@ -166,20 +173,37 @@ class App(QMainWindow):
         ip_row: QWidget = QWidget(root)
         ip_layout: QHBoxLayout = QHBoxLayout(ip_row)
         ip_layout.setContentsMargins(0, 0, 0, 0)
+        ip_layout.setSpacing(6)
         self.ent_host: QLineEdit = QLineEdit(ip_row)
+        host_field_width = self.ent_host.fontMetrics().horizontalAdvance("0" * 14) + 24
+        self.ent_host.setMinimumWidth(host_field_width)
         self.ent_port: QLineEdit = QLineEdit(ip_row)
-        self.ent_port.setMaximumWidth(120)
+        compact_field_width = self.ent_port.fontMetrics().horizontalAdvance("0" * 7) + 24
+        self.ent_port.setFixedWidth(compact_field_width)
         self.ent_worker: QLineEdit = QLineEdit(ip_row)
-        self.ent_worker.setMaximumWidth(80)
+        self.ent_worker.setFixedWidth(compact_field_width)
+        self.ent_decode: QLineEdit = QLineEdit(ip_row)
+        self.ent_decode.setFixedWidth(compact_field_width)
         self.cmb_http_profile: QComboBox = QComboBox(ip_row)
-        self.cmb_http_profile.setMinimumWidth(130)
+        self.cmb_http_profile.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         for key, label in HTTP_PROFILE_LABELS.items():
             self.cmb_http_profile.addItem(label, key)
+        http_profile_width = max(
+            96,
+            max(
+                self.cmb_http_profile.fontMetrics().horizontalAdvance(label)
+                for label in HTTP_PROFILE_LABELS.values()
+            )
+            + 48,
+        )
+        self.cmb_http_profile.setFixedWidth(http_profile_width)
         ip_layout.addWidget(self.ent_host, 1)
         ip_layout.addWidget(QLabel("Port", ip_row))
         ip_layout.addWidget(self.ent_port)
         ip_layout.addWidget(QLabel("GPU", ip_row))
         ip_layout.addWidget(self.ent_worker)
+        ip_layout.addWidget(QLabel("Decode", ip_row))
+        ip_layout.addWidget(self.ent_decode)
         ip_layout.addWidget(QLabel("HTTP", ip_row))
         ip_layout.addWidget(self.cmb_http_profile)
         form.addRow("IP", ip_row)
@@ -208,13 +232,24 @@ class App(QMainWindow):
         self.ent_host.editingFinished.connect(lambda: self._apply_quick_settings(False))
         self.ent_port.editingFinished.connect(lambda: self._apply_quick_settings(False))
         self.ent_worker.editingFinished.connect(lambda: self._apply_quick_settings(False))
+        self.ent_decode.editingFinished.connect(lambda: self._apply_quick_settings(False))
         self.cmb_http_profile.currentIndexChanged.connect(lambda: self._apply_quick_settings(False))
+        self._apply_window_width_constraints()
+
+    def _apply_window_width_constraints(self) -> None:
+        """Ensure the main window cannot be resized narrower than its current controls support."""
+        required_width = max(700, self.minimumSizeHint().width())
+        self.setMinimumSize(required_width, 320)
+        preferred_width = max(760, required_width)
+        if self.width() < preferred_width:
+            self.resize(preferred_width, self.height())
 
     def _apply_config_to_ui(self) -> None:
         self.ent_model.setText(self.cfg.model_path)
         self.ent_host.setText(self.cfg.host)
         self.ent_port.setText(str(self.cfg.port))
         self.ent_worker.setText(str(self.cfg.gpu_replica_count))
+        self.ent_decode.setText(str(self.cfg.decode_worker_count))
         idx = self.cmb_http_profile.findData(self.cfg.http_profile)
         self.cmb_http_profile.blockSignals(True)
         self.cmb_http_profile.setCurrentIndex(idx if idx >= 0 else 0)
@@ -270,8 +305,11 @@ class App(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("設定")
         dialog.setModal(True)
+        dialog.setMinimumWidth(760)
 
         layout: QVBoxLayout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
         chk_auto_start = QCheckBox("啟動時自動開啟伺服器", dialog)
         chk_auto_start.setChecked(bool(self.cfg.auto_start_server))
         chk_launch_startup = QCheckBox("開機自動啟動應用程式", dialog)
@@ -279,22 +317,45 @@ class App(QMainWindow):
         layout.addWidget(chk_auto_start)
         layout.addWidget(chk_launch_startup)
 
+        log_row: QWidget = QWidget(dialog)
+        log_layout: QHBoxLayout = QHBoxLayout(log_row)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.setSpacing(8)
+        log_layout.addWidget(QLabel("Log 位置", log_row))
+        ent_log_base = QLineEdit(log_row)
+        ent_log_base.setText(normalize_path(str(_resolve_log_base_dir(self.cfg.log_base_dir))))
+        ent_log_base.setMinimumWidth(460)
+        btn_pick_log_base = QPushButton("瀏覽...", log_row)
+        btn_pick_log_base.setFixedWidth(96)
+        log_layout.addWidget(ent_log_base, 1)
+        log_layout.addWidget(btn_pick_log_base)
+        layout.addWidget(log_row)
+
+        lbl_log_target = QLabel(dialog)
+        lbl_log_target.setWordWrap(True)
+        layout.addWidget(lbl_log_target)
+
         close_row: QWidget = QWidget(dialog)
         close_layout: QHBoxLayout = QHBoxLayout(close_row)
         close_layout.setContentsMargins(0, 0, 0, 0)
+        close_layout.setSpacing(8)
         close_layout.addWidget(QLabel("關閉按鈕行為", close_row))
         cmb_close = QComboBox(close_row)
         cmb_close.addItems(list(CLOSE_LABELS.values()))
         cmb_close.setCurrentText(CLOSE_LABELS.get(self.cfg.close_behavior, "詢問"))
+        cmb_close.setMinimumWidth(180)
         close_layout.addWidget(cmb_close, 1)
         layout.addWidget(close_row)
 
         btn_row: QWidget = QWidget(dialog)
         btn_layout: QHBoxLayout = QHBoxLayout(btn_row)
         btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(8)
         btn_layout.addStretch(1)
         btn_cancel = QPushButton("取消", btn_row)
         btn_save = QPushButton("儲存", btn_row)
+        btn_cancel.setFixedWidth(96)
+        btn_save.setFixedWidth(96)
         btn_layout.addWidget(btn_cancel)
         btn_layout.addWidget(btn_save)
         layout.addWidget(btn_row)
@@ -302,6 +363,28 @@ class App(QMainWindow):
         initial_auto_start = bool(self.cfg.auto_start_server)
         initial_launch_on_startup = bool(self.cfg.launch_on_startup)
         initial_close_behavior = self.cfg.close_behavior
+        initial_log_base_dir = normalize_path(str(_resolve_log_base_dir(self.cfg.log_base_dir)))
+
+        def _selected_log_base_dir() -> Path:
+            return _resolve_log_base_dir(ent_log_base.text())
+
+        def _update_log_target_label() -> None:
+            log_root = resolve_log_root(_selected_log_base_dir())
+            lbl_log_target.setText(f"實際儲存位置：{normalize_path(str(log_root))}")
+
+        def _pick_log_base_dir() -> None:
+            selected_dir = QFileDialog.getExistingDirectory(
+                dialog,
+                "選擇 Log 資料夾",
+                str(_selected_log_base_dir()),
+            )
+            if selected_dir:
+                ent_log_base.setText(normalize_path(selected_dir))
+
+        ent_log_base.textChanged.connect(_update_log_target_label)
+        btn_pick_log_base.clicked.connect(_pick_log_base_dir)
+        _update_log_target_label()
+
         def _has_unsaved_changes() -> bool:
             label_to_key = {v: k for k, v in CLOSE_LABELS.items()}
             current_close_behavior = label_to_key.get(cmb_close.currentText(), "ask")
@@ -310,6 +393,7 @@ class App(QMainWindow):
                     chk_auto_start.isChecked() != initial_auto_start,
                     chk_launch_startup.isChecked() != initial_launch_on_startup,
                     current_close_behavior != initial_close_behavior,
+                    normalize_path(str(_selected_log_base_dir())) != initial_log_base_dir,
                 )
             )
 
@@ -332,11 +416,25 @@ class App(QMainWindow):
         btn_cancel.clicked.connect(_cancel_and_close)
 
         def _save_and_close() -> None:
+            log_base_dir = normalize_path(str(_selected_log_base_dir()))
+            log_root = resolve_log_root(Path(log_base_dir))
+            try:
+                log_root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self._show_error("設定錯誤", f"無法建立 Log 資料夾：\n{exc}")
+                return
             self.cfg.auto_start_server = chk_auto_start.isChecked()
             self.cfg.launch_on_startup = chk_launch_startup.isChecked()
+            self.cfg.log_base_dir = log_base_dir
             label_to_key = {v: k for k, v in CLOSE_LABELS.items()}
             self.cfg.close_behavior = label_to_key.get(cmb_close.currentText(), "ask")
-            self.cfg.save(CONFIG_PATH)
+            self.cfg.save(self.config_path)
+            self.log_context = reconfigure_logging(Path(log_base_dir), self.cfg.log_level)
+            self.logger = self.log_context.logger
+            self.log_ctrl = LogController(self.logger)
+            if self._log_viewer is not None and self._log_viewer.isVisible():
+                self._log_viewer._refresh_files(select_latest=True)
+            self.log_ctrl.info("Log 位置已更新。log_root=%s", str(self.log_context.log_root))
             self._apply_startup_setting()
             self.tray_controller.ensure_tray_visible()
             dialog.accept()
