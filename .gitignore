@@ -44,3 +44,14 @@ test*
 
 # 暫存
 *tmp
+
+# 本機 Python 版本紀錄
+PythonVersion.md
+
+# Python 快取
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 本機驗證資料與大型資料集
+valData/
