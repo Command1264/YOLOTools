@@ -25,6 +25,7 @@ output_zips
 
 # 各種設定檔
 *config.*
+!tools/yolo_batch_detector_gui/main_window_config.py
 # 避免將可生成的資料上傳
 *.json*
 
