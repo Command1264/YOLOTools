@@ -40,15 +40,13 @@ pip install -r requirements.txt
 ```
 
 ## 工具清單 / Tools
-常用工具位於 `tools/`，包含：
-- `change_image_resolution.py`：影像解析度調整
-- `video_frame_extractor_gui.py`：影片擷取影格 GUI
-- `yolo_v4_to_v12_gui.py`：模型版本轉換 GUI
-- `yolo_zip_relabel_gui_v3.py`：資料集重標註 GUI
-- `yolo_trainer_gui/`：訓練 GUI
-- `yolo_trainer_colab/`：Colab 訓練輔助
-- `yolo_validator_gui/`：驗證 GUI
-- `yolo_server_gui/`：推論/伺服器 GUI
+完整工具說明、啟動指令與操作流程請見 [`tools/README.md`](tools/README.md)。
+
+常用分類包含：
+- 資料集整理：影像解析度調整、影片抽幀、YOLO zip 重標註、資料集合併、YOLO 版本轉換。
+- 模型訓練：本機訓練 GUI、Google Colab 訓練流程。
+- 模型驗證與推論：單次驗證 GUI、自動批次驗證 GUI、批次圖片辨識檢視器、YOLO HTTP server GUI。
+- 打包與部署：Python 打包 GUI、打包需求偵測 CLI。
 
 ## 打包 / Packaging
 根目錄下的 `*.spec` 為 PyInstaller 設定檔，打包輸出會放在 `dist/`。
