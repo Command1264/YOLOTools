@@ -1,6 +1,6 @@
 # YOLOTools
 
-YOLOTools 是一套以 Python 建立的 YOLO 訓練、資料集整理、模型驗證與推論服務工具集。專案主要用於火焰與煙霧物件偵測流程，涵蓋資料前處理、模型訓練、批次驗證、HTTP 推論服務與 Windows GUI 工具化。
+YOLOTools 是一套以 Python 建立的 YOLO 訓練、資料集整理、模型驗證與推論服務工具集。專案主要用於 2 類特定場景物件偵測流程，涵蓋資料前處理、模型訓練、批次驗證、HTTP 推論服務與 Windows GUI 工具化。
 
 ## 專案重點
 
@@ -50,7 +50,7 @@ YOLOTools 是一套以 Python 建立的 YOLO 訓練、資料集整理、模型�
 
 本專案保留了部分模型訓練輸出，包含 `results.csv`、PR/F1/Precision/Recall 曲線、confusion matrix、validation prediction 圖與 `weights/best.pt`。
 
-其中一組 YOLO detection 訓練結果：
+其中一組 2 類物件偵測 YOLO detection 訓練結果：
 
 - 訓練設定：120 epochs、batch 6、image size 640。
 - 標註實例：約 20,362 筆。
