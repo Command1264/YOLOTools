@@ -1,60 +1,118 @@
 # YOLOTools
 
-## 專案簡介 / Overview
-YOLOTools 是一套用於訓練與驗證 YOLO 模型的工具集合，專注於火焰與煙霧偵測。  
-本專案提供資料集整理與驗證、訓練與推論輔助、以及多個 GUI 小工具，方便快速建立與迭代模型。
+YOLOTools 是一套以 Python 建立的 YOLO 訓練、資料集整理、模型驗證與推論服務工具集。專案主要用於火焰與煙霧物件偵測流程，涵蓋資料前處理、模型訓練、批次驗證、HTTP 推論服務與 Windows GUI 工具化。
 
-## 功能概覽 / Features
-- 資料集驗證與處理（解析、重標註、影像轉換）
-- YOLO 訓練與驗證輔助
-- GUI 工具（訓練/驗證/推論/轉換等）
-- 模型下載與版本轉換
-- PyInstaller 打包設定（spec）
+## 專案重點
 
-## 技術棧 / Tech Stack
-- Python 3.12.10
-- ultralytics 8.4.7
-- torch 2.9.1+cu126
-- 其他依賴請見 `requirements.txt`
+- 整合資料集整理、YOLO 訓練、模型驗證與推論服務流程。
+- 提供多個 PySide6 GUI 工具，降低重複命令列操作成本。
+- 提供 YOLO HTTP 推論服務，讓外部工具可透過 API 共用同一個模型程序。
+- 支援批次推論、worker pipeline、model warmup、server state 與 logging。
+- 保留訓練輸出、metrics 圖表、confusion matrix 與模型權重，方便追蹤實驗結果。
 
-## 目錄結構 / Directory Layout
-- `tools/`：資料集驗證與訓練輔助工具
-- `models/`：訓練權重與模型產物
-- `trainingData/`：資料集（若更名需同步更新設定檔）
-- `dist/`：打包輸出
-- `workflow/`：行為規範與工作流程
-- `*.spec`：PyInstaller 打包設定
+## 主要功能
 
-## 資料集規範 / Dataset Notes
-- 使用 Ultralytics YAML 格式
-- class 順序必須在 train/val/test 一致
-- 建議保留可重現的 split 與設定檔
+### 資料處理與訓練輔助
 
-## 快速開始 / Quick Start
-以下為一般使用流程（Windows PowerShell）：
+- 影片抽幀與圖片解析度調整。
+- YOLO label / zip 資料集整理與重標註。
+- YOLO 模型版本轉換與權重下載。
+- GUI 化訓練流程，降低手動維護訓練參數的成本。
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+### 模型驗證與推論
+
+- 單次圖片驗證與批次圖片驗證。
+- 批次圖片辨識結果檢視。
+- YOLO HTTP server GUI，支援外部程式透過 HTTP 傳入圖片並取得偵測結果。
+
+### 打包與部署輔助
+
+- PyInstaller spec 與打包工具。
+- Windows GUI 工具啟動與封裝流程。
+- 推論服務可在系統托盤背景執行。
+
+## YOLO HTTP 推論服務
+
+`tools/yolo_server_gui` 是本專案中最完整的推論服務工具。它用 GUI 管理 Flask-based YOLO HTTP server，讓其他桌面程式、批次工具或服務共用同一個模型程序。
+
+功能包含：
+
+- 載入 `.pt` YOLO 模型。
+- 設定 host、port、GPU worker、decode worker 與 HTTP worker。
+- 提供 `/detect` API。
+- 回傳 class、confidence、bounding box 等結構化偵測結果。
+- 支援批次推論，並將大型請求切分到多個 worker pipeline。
+- 支援 model warmup、server state、啟動錯誤處理與 logging。
+
+詳細說明請見 [`tools/yolo_server_gui/README.md`](tools/yolo_server_gui/README.md)。
+
+## 訓練成果範例
+
+本專案保留了部分模型訓練輸出，包含 `results.csv`、PR/F1/Precision/Recall 曲線、confusion matrix、validation prediction 圖與 `weights/best.pt`。
+
+其中一組 YOLO detection 訓練結果：
+
+- 訓練設定：120 epochs、batch 6、image size 640。
+- 標註實例：約 20,362 筆。
+- 驗證結果：precision 約 0.823、recall 約 0.747、mAP50 約 0.813、mAP50-95 約 0.513。
+
+## 技術棧
+
+- Python 3.12
+- PySide6
+- Flask
+- OpenCV
+- Ultralytics YOLO
+- PyTorch
+- NumPy
+- pytest
+- PyInstaller
+
+完整依賴請見 [`requirements.txt`](requirements.txt)。
+
+## 目錄結構
+
+```text
+tools/          主要 GUI / CLI 工具
+models/         模型權重與訓練輸出
+trainingData/   訓練資料
+valData/        驗證資料
+testData/       測試資料
+workflow/       專案工作流程文件
+docs/           補充文件
+install/        安裝與輔助資源
 ```
 
-## 工具清單 / Tools
-完整工具說明、啟動指令與操作流程請見 [`tools/README.md`](tools/README.md)。
+完整工具清單請見 [`tools/README.md`](tools/README.md)。
 
-常用分類包含：
-- 資料集整理：影像解析度調整、影片抽幀、YOLO zip 重標註、資料集合併、YOLO 版本轉換。
-- 模型訓練：本機訓練 GUI、Google Colab 訓練流程。
-- 模型驗證與推論：單次驗證 GUI、自動批次驗證 GUI、批次圖片辨識檢視器、YOLO HTTP server GUI。
-- 打包與部署：Python 打包 GUI、打包需求偵測 CLI。
+## 快速開始
 
-## 打包 / Packaging
-根目錄下的 `*.spec` 為 PyInstaller 設定檔，打包輸出會放在 `dist/`。
+Windows PowerShell：
 
-## 輸出與紀錄 / Outputs & Tracking
-- metrics / logs / plots 請放在清楚的實驗資料夾
-- 權重命名維持一致（best/last），並標註匯出格式
+```powershell
+py -3.12 -m venv YOLOToolsEnv
+.\YOLOToolsEnv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
 
-## 注意事項 / Notes
-- 檔名與類別命名請遵循專案規範（見 `AGENTS.md`）
-- 公開函式需具備型別註記與 Google-style docstring
+啟動 YOLO HTTP server GUI：
+
+```powershell
+.\YOLOToolsEnv\Scripts\python tools\yolo_server_gui\app.py
+```
+
+## 開發與測試
+
+執行 unit tests：
+
+```powershell
+.\YOLOToolsEnv\Scripts\python -m pytest
+```
+
+部分 GUI 或 GPU 推論流程需要本機 CUDA / PyTorch 環境與 `.pt` 模型檔。
+
+## 注意事項
+
+- `models/`、`trainingData/`、`valData/`、`testData/` 可能包含大型資料或模型檔，更新前請確認是否適合提交。
+- 若 HTTP server 綁定 `0.0.0.0`，請確認網路環境與防火牆設定。
+- 公開資料與模型前，請確認資料來源、授權與專案公開範圍。
