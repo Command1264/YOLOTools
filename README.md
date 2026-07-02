@@ -10,6 +10,20 @@ YOLOTools 是一套以 Python 建立的 YOLO 訓練、資料集整理、模型�
 - 支援批次推論、worker pipeline、model warmup、server state 與 logging。
 - 保留訓練輸出、metrics 圖表、confusion matrix 與模型權重，方便追蹤實驗結果。
 
+## 工作流程
+
+```mermaid
+flowchart LR
+    A["原始影像 / 影片"] --> B["資料整理與標註轉換"]
+    B --> C["YOLO 訓練"]
+    C --> D["模型驗證與 metrics 檢查"]
+    D --> E[".pt 模型權重"]
+    E --> F["YOLO HTTP 推論服務"]
+    F --> G["外部工具 / 批次流程 / 桌面程式"]
+```
+
+本專案將資料整理、模型訓練、驗證與推論服務拆成多個工具，讓模型實驗與後續系統整合可以分階段處理。訓練完成的 `.pt` 模型可由 HTTP 推論服務載入，其他工具不需要重複初始化模型即可取得偵測結果。
+
 ## 主要功能
 
 ### 資料處理與訓練輔助
@@ -45,6 +59,28 @@ YOLOTools 是一套以 Python 建立的 YOLO 訓練、資料集整理、模型�
 - 支援 model warmup、server state、啟動錯誤處理與 logging。
 
 詳細說明請見 [`tools/yolo_server_gui/README.md`](tools/yolo_server_gui/README.md)。
+
+### `/detect` 資料流
+
+```mermaid
+sequenceDiagram
+    participant Client as 外部工具
+    participant API as Flask /detect
+    participant Dispatcher as Inference Dispatcher
+    participant Model as YOLO Model
+    participant Worker as Worker Pipeline
+
+    Client->>API: 傳入圖片或批次圖片
+    API->>Dispatcher: 解析 request 並建立推論任務
+    Dispatcher->>Worker: 分派 decode / inference 工作
+    Worker->>Model: 執行 YOLO 推論
+    Model-->>Worker: 回傳 boxes / classes / confidence
+    Worker-->>Dispatcher: 合併批次結果並保留順序
+    Dispatcher-->>API: 轉換為 JSON response
+    API-->>Client: 回傳 class、confidence、bounding box
+```
+
+推論服務的設計重點是讓多個外部工具共用同一個模型程序，減少重複載入 `.pt` 模型造成的 GPU 記憶體使用。批次請求會由 worker pipeline 切分處理，最後再合併為固定格式的 JSON 結果。
 
 ## 訓練成果範例
 
