@@ -48,6 +48,58 @@ tools\yolo_server_gui\start server.bat
 - 給其他桌面程式、批次程式或服務共用同一個 YOLO 推論程序。
 - 避免每個工具各自載入模型造成 GPU 記憶體浪費。
 
+## `/detect` API 範例
+
+單張圖片 request：
+
+```json
+{
+  "threadName": "demo-single",
+  "image": "<base64-image>",
+  "conf": 0.25,
+  "iou": 0.45
+}
+```
+
+批次圖片 request：
+
+```json
+{
+  "threadName": "demo-batch",
+  "images": ["<base64-image-1>", "<base64-image-2>"],
+  "conf": 0.25,
+  "iou": 0.45
+}
+```
+
+Response schema：
+
+```json
+{
+  "threadName": "demo-single",
+  "result": {
+    "classifyType": "object_a",
+    "percentage": 0.93,
+    "detections": [
+      {
+        "classId": 0,
+        "className": "object_a",
+        "conf": 0.93,
+        "xyxy": [120, 80, 360, 260]
+      }
+    ]
+  }
+}
+```
+
+欄位說明：
+
+- `threadName`：呼叫端自訂識別值，方便 log 追蹤。
+- `image` / `images`：base64 image；兩者擇一。
+- `conf` / `iou`：可選門檻值，未提供時使用 server 預設。
+- `detections`：每個 bounding box 的 class、confidence 與 `xyxy` 座標。
+- 批次 request 會以 list 回傳 `result`，順序與輸入圖片一致。
+
 ## 設定建議
 
 - 單 GPU 通常先從 `GPU=1` 開始。

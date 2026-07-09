@@ -82,6 +82,52 @@ sequenceDiagram
 
 推論服務的設計重點是讓多個外部工具共用同一個模型程序，減少重複載入 `.pt` 模型造成的 GPU 記憶體使用。批次請求會由 worker pipeline 切分處理，最後再合併為固定格式的 JSON 結果。
 
+### API demo
+
+單張圖片 request：
+
+```json
+{
+  "threadName": "demo-single",
+  "image": "<base64-image>",
+  "conf": 0.25,
+  "iou": 0.45
+}
+```
+
+批次圖片 request：
+
+```json
+{
+  "threadName": "demo-batch",
+  "images": ["<base64-image-1>", "<base64-image-2>"],
+  "conf": 0.25,
+  "iou": 0.45
+}
+```
+
+Response 會保留輸入順序，並回傳結構化偵測結果：
+
+```json
+{
+  "threadName": "demo-single",
+  "result": {
+    "classifyType": "object_a",
+    "percentage": 0.93,
+    "detections": [
+      {
+        "classId": 0,
+        "className": "object_a",
+        "conf": 0.93,
+        "xyxy": [120, 80, 360, 260]
+      }
+    ]
+  }
+}
+```
+
+相關行為由 `tools/yolo_server_gui/inference_dispatcher_unittest.py`、`server_runtime_unittest.py`、`server_startup_unittest.py` 與 `tray_controller_unittest.py` 覆蓋。
+
 ## 訓練成果範例
 
 本專案保留了部分模型訓練輸出，包含 `results.csv`、PR/F1/Precision/Recall 曲線、confusion matrix、validation prediction 圖與 `weights/best.pt`。
