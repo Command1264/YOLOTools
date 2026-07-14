@@ -126,7 +126,7 @@ Response 會保留輸入順序，並回傳結構化偵測結果：
 }
 ```
 
-相關行為由 `tools/yolo_server_gui/inference_dispatcher_unittest.py`、`server_runtime_unittest.py`、`server_startup_unittest.py` 與 `tray_controller_unittest.py` 覆蓋。
+相關行為由 `tools/yolo_server_gui/inference_dispatcher_unittest.py`、`log_manager_unittest.py`、`server_runtime_unittest.py`、`server_startup_unittest.py` 與 `tray_controller_unittest.py` 覆蓋，共 31 個 `unittest` 測試案例。
 
 ## 訓練成果範例
 
@@ -136,7 +136,7 @@ Response 會保留輸入順序，並回傳結構化偵測結果：
 
 - 訓練設定：120 epochs、batch 6、image size 640。
 - 標註實例：約 20,362 筆。
-- 驗證結果：precision 約 0.823、recall 約 0.747、mAP50 約 0.813、mAP50-95 約 0.513。
+- 驗證結果：precision 約 0.823、recall 約 0.747、mAP@50 約 0.813、mAP@50:95 約 0.513。
 
 ## 技術棧
 
@@ -147,7 +147,7 @@ Response 會保留輸入順序，並回傳結構化偵測結果：
 - Ultralytics YOLO
 - PyTorch
 - NumPy
-- pytest
+- unittest（Python 標準函式庫）
 - PyInstaller
 
 完整依賴請見 [`requirements.txt`](requirements.txt)。
@@ -188,7 +188,7 @@ python -m pip install -r requirements.txt
 執行 unit tests：
 
 ```powershell
-.\YOLOToolsEnv\Scripts\python -m pytest
+.\YOLOToolsEnv\Scripts\python -m unittest discover -s tools\yolo_server_gui -p "*_unittest.py"
 ```
 
 部分 GUI 或 GPU 推論流程需要本機 CUDA / PyTorch 環境與 `.pt` 模型檔。
